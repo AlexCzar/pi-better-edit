@@ -7,12 +7,24 @@ import {
   busyBackoffMs,
   busyBudgetMs,
   loadHashStore,
+  resolveBusyBudget,
   shutdownHashStore,
   type BusyBudget,
 } from "../../src/hash-store";
 import { HASH_STORE_BUSY_TIMEOUT } from "../../src/constants";
 import { initHasher } from "../../src/hashline/hasher";
 import { getWritableTempRoot } from "../support/fixtures";
+import vitestConfig from "../../vitest.config";
+
+/**
+ * The harness ceilings, READ from vitest.config.ts rather than restated, so this file follows the
+ * configuration instead of drifting from it. The contention measurements below assert against them:
+ * the budget is a fraction of the ceiling, so a regression that inflates the budget has to surface as
+ * a failure of a test that measures a real held lock.
+ */
+const harnessTestTimeoutMs = vitestConfig.test?.testTimeout ?? 0;
+const harnessHookTimeoutMs = vitestConfig.test?.hookTimeout ?? 0;
+const harnessCeilingMs = Math.min(harnessTestTimeoutMs, harnessHookTimeoutMs) / 3;
 
 /**
  * #87b — the hash store's contention budget.
@@ -23,6 +35,10 @@ import { getWritableTempRoot } from "../support/fixtures";
  * spelling. What is held here is the reframed defect — an implicit, oversized, UNIFORM budget (a 1s
  * blocked silence per attempt, four attempts, one fixed delay, so every writer woke at the same
  * instants) — now explicit, bounded and decorrelated.
+ *
+ * One wiring test below spends the PRODUCTION budget with NOTHING injected — the shape every production
+ * call site has — and derives its bound from the same constants the episode spends, so a constants
+ * regression reddens a test that measures a real held lock rather than only the arithmetic pin below.
  *
  * These tests need a REAL second connection holding a real RESERVED lock, so they open the store
  * under a temp HOME (the shape `test/core/hash-store.test.ts` uses) and opt out of the worker-wide
@@ -93,13 +109,19 @@ describe("hash store busy wiring (#87b)", () => {
   it("spends a bounded, explicitly stated budget on a lock no attempt can outwait", async () => {
     await withTempHome(async (home) => {
       await withLockedStore(home, async (rival) => {
+        // The draw is counted, not declared: with a budgeted draw the loop sleeps once per retry, so
+        // the draw count IS the retry count (attempts = draws + 1 — the last failure throws, no draw).
+        let draws = 0;
         const budget: BusyBudget = {
           timeoutMs: 25,
           maxAttempts: 4,
           backoffBaseMs: 10,
           backoffCapMs: 20,
           backoffJitterMs: 0,
-          random: () => 0,
+          random: () => {
+            draws++;
+            return 0;
+          },
         };
         const cap = busyBudgetMs(budget);
         expect(cap).toBe(150); // 4 x 25 + (10 + 20 + 20)
@@ -118,7 +140,7 @@ describe("hash store busy wiring (#87b)", () => {
           elapsed,
           cap,
           rivalStillHolds: true,
-          attempts: 4,
+          attempts: draws + 1,
         };
 
         // The ORIGINAL busy error object, still the shape every classifier matches (errcode 5/6 or
@@ -126,14 +148,85 @@ describe("hash store busy wiring (#87b)", () => {
         expect(error, JSON.stringify(locked)).toBeInstanceOf(Error);
         expect((error as Error).message).toMatch(/busy|locked/i);
         expect((error as { errcode?: number }).errcode).toBe(5);
-        // Inside the stated cap, and never a hang. This is the DISCRIMINATING assertion: the old
-        // fixed budget (1000ms x 4 + 3 x 100ms) spends ~4600ms on this same lock and fails here.
-        expect(elapsed, JSON.stringify(locked)).toBeLessThan(cap + 600);
-        expect(elapsed, JSON.stringify(locked)).toBeLessThan(1000);
+        // MEASURED attempt count, not a declaration: it cannot stay 4 if the loop spends one more.
+        expect(draws + 1, JSON.stringify(locked)).toBe(budget.maxAttempts);
+        // The DISCRIMINATOR here is that the INJECTED budget was the one spent, and only this can hold
+        // if it was: the episode measures 199-214ms (3 runs) against the production model of 4300ms, so
+        // an episode that ignored the injection spends the production 4595-4811ms and fails here. The
+        // former `elapsed < cap + 600` was deleted rather than re-tightened: at 750ms it discriminated
+        // neither shape — the old 4 x 1000 shape passes it too (4850 < 4900).
+        expect(elapsed, JSON.stringify(locked)).toBeLessThan(busyBudgetMs());
         expect(rival.isOpen).toBe(true);
       });
     });
   });
+
+  /**
+   * The production budget, NOTHING injected — the shape every production call site uses — which is what
+   * makes this test refutable by the constants: a budget injected here would override every constant it
+   * is meant to guard, so no injected contention test can redden for a constants regression. The bound
+   * is derived from `resolveBusyBudget()` and the attempt count is measured, so raising
+   * BUSY_MAX_ATTEMPTS (or HASH_STORE_BUSY_TIMEOUT) reddens a test that holds a real lock. Cost: one
+   * exhausted production budget, ~5s, because a permanently held lock must exhaust it.
+   */
+  it("spends the production budget on a held lock, with the attempt count measured", async () => {
+    await withTempHome(async (home) => {
+      await withLockedStore(home, async (rival) => {
+        const production = resolveBusyBudget();
+
+        // One attempt's cost on THIS host, at the production timeout and with no retry: the model counts
+        // only the internal wait per attempt, so a bound for a measured episode needs this measurement.
+        const singleStarted = Date.now();
+        let singleError: unknown;
+        try {
+          await loadHashStore({ maxAttempts: 1, backoffJitterMs: 0 });
+        } catch (caught) {
+          singleError = caught;
+        }
+        const singleAttempt = Date.now() - singleStarted;
+        expect((singleError as { errcode?: number }).errcode).toBe(5);
+
+        // MEASURED attempt count: every retry draws its jitter from `Math.random` (nothing else in the
+        // store open calls it), and the last failure throws without drawing, so attempts = draws + 1.
+        let draws = 0;
+        const random = vi.spyOn(Math, "random").mockImplementation(() => {
+          draws++;
+          return 0.5;
+        });
+        const started = Date.now();
+        let error: unknown;
+        try {
+          await loadHashStore();
+        } catch (caught) {
+          error = caught;
+        }
+        const elapsed = Date.now() - started;
+        random.mockRestore();
+        const attempts = draws + 1;
+
+        // Derived from the production constants: the model counts one internal wait per attempt, so the
+        // bound charges every attempt its MEASURED cost, and allows the one capped sleep an episode the
+        // deadline ends can overshoot by. A bound derived from the constants alone moves with them, so
+        // the harness ceiling below is what catches a constants increase.
+        const model = busyBudgetMs();
+        const sleepsMax = model - production.timeoutMs * production.maxAttempts;
+        const bound =
+          production.maxAttempts * singleAttempt +
+          sleepsMax +
+          production.backoffCapMs +
+          production.backoffJitterMs;
+        const measured = { attempts, elapsed, model, bound, harnessCeilingMs, singleAttempt };
+
+        expect(error, JSON.stringify(measured)).toBeInstanceOf(Error);
+        expect((error as Error).message).toMatch(/busy|locked/i);
+        expect((error as { errcode?: number }).errcode).toBe(5);
+        expect(attempts, JSON.stringify(measured)).toBe(production.maxAttempts);
+        expect(elapsed, JSON.stringify(measured)).toBeLessThan(bound);
+        expect(elapsed, JSON.stringify(measured)).toBeLessThan(harnessCeilingMs);
+        expect(rival.isOpen).toBe(true);
+      });
+    });
+  }, 30_000);
 
   it("recovers through the retry loop when a rival releases past the internal wait", async () => {
     await withTempHome(async (home) => {
@@ -176,25 +269,26 @@ describe("busyBackoffMs (#87b)", () => {
     backoffCapMs: 400,
     backoffJitterMs: 50,
   };
+  /** The schedule with one fixed jitter draw — the single channel `busyBackoffMs` reads it from. */
+  const draw = (value: number): BusyBudget => ({ ...schedule, random: () => value });
 
   it("grows exponentially from the base up to the hard cap", () => {
-    const waits = [0, 1, 2, 3, 4, 5].map((attempt) => busyBackoffMs(attempt, () => 0, schedule));
+    const waits = [0, 1, 2, 3, 4, 5].map((attempt) => busyBackoffMs(attempt, draw(0)));
     expect(waits).toEqual([50, 100, 200, 400, 400, 400]);
   });
 
   it("keeps every draw inside [BASE, CAP + JITTER)", () => {
-    expect(busyBackoffMs(3, () => 0, schedule)).toBe(400);
-    expect(busyBackoffMs(3, () => 1, schedule)).toBe(450);
+    expect(busyBackoffMs(3, draw(0))).toBe(400);
+    expect(busyBackoffMs(3, draw(1))).toBe(450);
     for (let attempt = 0; attempt < 6; attempt++) {
-      const wait = busyBackoffMs(attempt, () => 0.999, schedule);
+      const wait = busyBackoffMs(attempt, draw(0.999));
       expect(wait).toBeGreaterThanOrEqual(50);
       expect(wait).toBeLessThanOrEqual(450);
     }
   });
 
   it("differs between consecutive attempts for one fixed draw, so lockstep writers spread", () => {
-    const fixed = () => 0.5;
-    const waits = [0, 1, 2, 3, 4].map((attempt) => busyBackoffMs(attempt, fixed, schedule));
+    const waits = [0, 1, 2, 3, 4].map((attempt) => busyBackoffMs(attempt, draw(0.5)));
     expect(waits).toEqual([75, 125, 225, 425, 425]);
     for (let i = 1; i < waits.length; i++) expect(waits[i]).toBeGreaterThanOrEqual(waits[i - 1]);
     // Below the cap no two attempts wake at the same instant — the uniform-budget defect.
@@ -204,15 +298,30 @@ describe("busyBackoffMs (#87b)", () => {
   it("keeps the production budget inside the harness ceilings", () => {
     // Stated arithmetic: 8 x 250 + (50+100+200+400+400+400+400) + 7 x 50 = 4300ms.
     expect(busyBudgetMs()).toBe(4_300);
-    // vitest.config.ts: testTimeout 20000ms, hookTimeout 30000ms. Even the three budgets the
-    // corrupt-store rebuild path can spend stay inside the test ceiling, so contention surfaces as
-    // a content error (busy) rather than as a killed test.
-    expect(busyBudgetMs() * 3).toBeLessThan(20_000);
+    // vitest.config.ts: testTimeout 20000ms, hookTimeout 30000ms — read from the config, not restated.
+    // Even the three budgets the corrupt-store rebuild path can spend stay inside the test ceiling, so
+    // contention surfaces as a content error (busy) rather than as a killed test.
+    expect(busyBudgetMs() * 3).toBeLessThan(harnessTestTimeoutMs);
   });
 
   it("fills the unspecified budget fields from the production constants", () => {
     const overridden = busyBudgetMs({ timeoutMs: 25, maxAttempts: 4 });
     // 4 x 25 + (100 + 150 + 250): the production backoff schedule at its maximum jitter draw.
     expect(overridden).toBe(600);
+  });
+
+  it("reads the jitter from ONE channel: the budget's `random`, else Math.random", () => {
+    const injected = vi.fn(() => 1);
+    const mathRandom = vi.spyOn(Math, "random").mockReturnValue(0.5);
+    // An injected draw wins, and is taken exactly once per backoff...
+    expect(busyBackoffMs(0, { ...schedule, random: injected })).toBe(100);
+    expect(injected).toHaveBeenCalledTimes(1);
+    expect(mathRandom).not.toHaveBeenCalled();
+    // ...and with nothing injected the SAME channel falls through to Math.random. There is no second,
+    // positional draw argument for `withBusyRetry` to disagree with, which is the defect this pins: an
+    // injected draw can no longer be silently ignored in favour of the other channel (or the reverse).
+    expect(busyBackoffMs(0, schedule)).toBe(75);
+    expect(mathRandom).toHaveBeenCalledTimes(1);
+    mathRandom.mockRestore();
   });
 });

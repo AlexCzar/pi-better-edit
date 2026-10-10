@@ -92,7 +92,7 @@ function sleepSync(ms: number): void {
 // WHY: that started together woke together and re-collided. The replacement is EXPLICIT (these
 // WHY: constants), BOUNDED (the deadline busyBudgetMs computes from them) and DECORRELATED
 // WHY: (jittered exponential backoff instead of one fixed delay).
-// WHY: these numbers — the budget as arithmetic, attempts x internal wait + sleeps = worst case:
+// WHY: these numbers — the model as arithmetic, attempts x internal wait + sleeps:
 // WHY:   internal wait  250ms x 8 attempts                     = 2000ms
 // WHY:   backoff sleeps 50+100+200+400+400+400+400 (cap 400)   = 1950ms
 // WHY:   jitter         7 sleeps x <= 50ms                     =  350ms
@@ -101,16 +101,27 @@ function sleepSync(ms: number): void {
 // WHY: 250ms rather than the previous 1000ms: the contended critical section is one short WAL write
 // WHY: transaction, so a second of blocked silence was roughly a hundred times the thing being
 // WHY: waited for, and four such silences made a contended open indistinguishable from a hang.
-// WHY: Eight samples at 250ms buy back exactly the patience the old 4 x 1000 + 3 x 100 model had
-// WHY: (4300ms) while every stall is four times shorter and there are eight samples, not four.
-// WHY: the deadline as well as the count: a decision already inside SQLite cannot be interrupted, so
-// WHY: the attempt count alone cannot bound the episode. The deadline is read before each attempt, so
-// WHY: an episode overshoots by at most the attempt that began before it plus one capped sleep.
-// WHY: Measured against a permanently held lock: 4642ms for this budget (model 4300ms; per-attempt
-// WHY: block 285-330ms at timeout 250, one attempt 705ms because a single attempt waits once per
-// WHY: lock-taking statement it runs) against 4756ms for the old 4 x 1000 + 3 x 100 shape, whose
-// WHY: per-attempt block was ~1114ms and whose pathological ceiling — ~20 statements each waiting out
-// WHY: a full second — was >= 21s.
+// WHY: Eight samples at 250ms buy back the patience the old 4 x 1000 + 3 x 100 shape had — the SAME
+// WHY: 4300ms model — so the two shapes cannot be told apart by aggregate duration; the tests below
+// WHY: separate them by attempt count and by per-attempt stall, which the shapes DO differ in.
+// WHY: the model is what the constants were chosen against, not what an attempt costs. Measured
+// WHY: against a permanently held lock at timeout 250, ONE attempt spends 303-325ms idle (3 samples)
+// WHY: and 299-334ms under load (8 runs, 8 CPU hogs on 10 cores, load average 46): the 250ms internal
+// WHY: wait plus 53-84ms of connection-open and statement work. A retry pays that ONCE, not once per
+// WHY: lock-taking statement — measured at timeouts 25/50/100/250/500/1000, one attempt costs 33/69/131/
+// WHY: 1116ms (one sample each), ~1.1-1.3x the timeout and linear in it — so the old 4 x 1000 shape's
+// WHY: real ceiling was 4719ms (4 x 1116 + 3 x 100), not the >= 21s a per-statement reading suggests.
+// WHY: the deadline is the backstop, not the usual terminator: it is checked AFTER each attempt, so it
+// WHY: can only end an episode between attempts — one capped sleep plus one already-running attempt past
+// WHY: it. At these constants the COUNT ends the episode first: 8 attempts on every run — 4595-4662ms
+// WHY: with no budget injected, idle (6 runs), and 4650-4811ms under load (8 runs) — i.e. +295..+511ms
+// WHY: OVER the 4300ms model, because each attempt costs ~303-334ms rather than its modelled 250ms.
+// WHY: a budget injected with exactly these values measures the same episode (4621-4815ms, 11 runs),
+// WHY: which is why the contention test below injects nothing: an injected budget replaces every
+// WHY: constant it would be guarding.
+// WHY: scoped to THESE constants: an injected budget carries its own, larger model — maxAttempts 100
+// WHY: models 68.7s and measured 68.9s over 95 attempts (the DEADLINE, not the count, ended that one)
+// WHY: — so what is bounded is the episode's own model, never 'one episode is capped at 4300ms'.
 // WHY: 4300ms is 21.5% of the harness `testTimeout` (20000ms) and 14% of `hookTimeout` (30000ms), so
 // WHY: contention surfaces as the busy error rather than as a killed test. The corrupt-store rebuild
 // WHY: path can spend three budgets (3 x 4300 = 12.9s), but only immediately after quarantine
@@ -142,7 +153,13 @@ export interface BusyBudget {
   random?: () => number;
 }
 
-function resolveBusyBudget(overrides?: BusyBudget): Required<BusyBudget> {
+/**
+ * `overrides` filled in field by field from the production constants above — the one place those
+ * constants acquire meaning. Exported because it is the only honest source for an assertion: a test
+ * derives the production timeout, attempt count and model here instead of restating 250/8/4300 as
+ * literals, which would keep passing if the constants moved.
+ */
+export function resolveBusyBudget(overrides?: BusyBudget): Required<BusyBudget> {
   return {
     timeoutMs: overrides?.timeoutMs ?? HASH_STORE_BUSY_TIMEOUT,
     // SAFETY: at least one attempt, so the loop always runs once and can never spin on 0 or -1.
@@ -157,16 +174,15 @@ function resolveBusyBudget(overrides?: BusyBudget): Required<BusyBudget> {
 /**
  * The wait before retry `attempt` (0-based): exponential from `backoffBaseMs`, doubled per attempt
  * and capped at `backoffCapMs`, plus a draw in [0, backoffJitterMs). The jitter is the point — it is
- * what stops writers that started together from waking together again on every attempt.
+ * what stops writers that started together from waking together again on every attempt. The draw comes
+ * from `budget.random` and from NOWHERE else: one injection channel, so a caller that sets `random`
+ * cannot have it silently ignored in favour of `Math.random`, and a caller that does not gets
+ * `Math.random` — never a positional argument that `withBusyRetry` would have had to agree about.
  */
-export function busyBackoffMs(
-  attempt: number,
-  random: () => number,
-  overrides?: BusyBudget,
-): number {
+export function busyBackoffMs(attempt: number, overrides?: BusyBudget): number {
   const budget = resolveBusyBudget(overrides);
   const exponential = budget.backoffBaseMs * 2 ** Math.max(0, attempt);
-  return Math.min(budget.backoffCapMs, exponential) + random() * budget.backoffJitterMs;
+  return Math.min(budget.backoffCapMs, exponential) + budget.random() * budget.backoffJitterMs;
 }
 
 /**
@@ -178,7 +194,8 @@ export function busyBudgetMs(overrides?: BusyBudget): number {
   const budget = resolveBusyBudget(overrides);
   let total = budget.timeoutMs * budget.maxAttempts;
   for (let attempt = 0; attempt < budget.maxAttempts - 1; attempt++) {
-    total += busyBackoffMs(attempt, () => 1, budget);
+    // WHY: the model takes every backoff at the MAXIMUM jitter draw, whatever `random` would return.
+    total += busyBackoffMs(attempt, { ...budget, random: () => 1 });
   }
   return total;
 }
@@ -194,6 +211,8 @@ export function withBusyRetry<T>(fn: () => T, overrides?: BusyBudget): T {
   const budget = resolveBusyBudget(overrides);
   // SAFETY: a deadline, not only an attempt count — an attempt already inside SQLite cannot be
   // SAFETY: interrupted, so the count alone would let one slow attempt extend the episode without bound.
+  // SAFETY: The check runs AFTER the attempt that failed, so a deadline-ended episode stops between
+  // SAFETY: attempts: at most one capped sleep plus one already-running attempt past the deadline.
   const deadline = Date.now() + busyBudgetMs(budget);
   for (let attempt = 0; ; attempt++) {
     try {
@@ -202,7 +221,7 @@ export function withBusyRetry<T>(fn: () => T, overrides?: BusyBudget): T {
       if (!isBusyError(error) || attempt >= budget.maxAttempts - 1 || Date.now() >= deadline) {
         throw error;
       }
-      sleepSync(busyBackoffMs(attempt, budget.random, budget));
+      sleepSync(busyBackoffMs(attempt, budget));
     }
   }
 }
