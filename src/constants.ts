@@ -46,7 +46,12 @@ export const MAX_READ_FILES = 10;
 // WHY: cannot express a file fan-out and cannot outrun this cap.
 export const MAX_READ_FILES_MESSAGE = `Read request accepts at most ${MAX_READ_FILES} files.`;
 
-export const HASH_STORE_BUSY_TIMEOUT = 1000;
+// WHY: (#87b) the per-attempt wait inside SQLite, passed as the `timeout` constructor option — in
+// WHY: node:sqlite that option IS the busy handler, so `PRAGMA busy_timeout` reports this value back.
+// WHY: 250ms rather than 1000ms because the contended section is one short WAL write: the budget,
+// WHY: its arithmetic and the deadline that enforces it live beside the retry loop in
+// WHY: `src/hash-store.ts` (`BUSY_MAX_ATTEMPTS` and its WHY block).
+export const HASH_STORE_BUSY_TIMEOUT = 250;
 // WHY: v9 renames the persisted anchor-generation column (`canon_version` → `anchor_generation`
 // WHY: on `file_snapshots` and `file_undo`, guarded rename preserving stamped values) — pre-generation
 // WHY: rows (0) are never current. Mixed-version note: a concurrently open pre-rename process naming

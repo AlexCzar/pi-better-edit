@@ -83,21 +83,128 @@ function sleepSync(ms: number): void {
   Atomics.wait(sab, 0, 0, ms);
 }
 
-const BUSY_RETRIES = 3;
-const BUSY_RETRY_DELAY_MS = 100;
+// WHY: (#87b) the retry policy below REFRAMES the defect, which was never a missing timeout.
+// WHY: `node:sqlite`'s `timeout` constructor option IS SQLite's busy handler — `PRAGMA busy_timeout`
+// WHY: reports it back verbatim ({ timeout: 250 } reads 250, no option at all reads 0) — so no pragma was
+// WHY: absent here and adding one would install a second, competing budget. The real defect was an
+// WHY: IMPLICIT, OVERSIZED, UNIFORM one: every attempt could sit blocked and silent for a full
+// WHY: second, there were four of them, and the gap between them was one fixed 100ms, so writers
+// WHY: that started together woke together and re-collided. The replacement is EXPLICIT (these
+// WHY: constants), BOUNDED (the deadline busyBudgetMs computes from them) and DECORRELATED
+// WHY: (jittered exponential backoff instead of one fixed delay).
+// WHY: these numbers — the budget as arithmetic, attempts x internal wait + sleeps = worst case:
+// WHY:   internal wait  250ms x 8 attempts                     = 2000ms
+// WHY:   backoff sleeps 50+100+200+400+400+400+400 (cap 400)   = 1950ms
+// WHY:   jitter         7 sleeps x <= 50ms                     =  350ms
+// WHY:   ---------------------------------------------------------------
+// WHY:   modelled episode (busyBudgetMs)                       = 4300ms
+// WHY: 250ms rather than the previous 1000ms: the contended critical section is one short WAL write
+// WHY: transaction, so a second of blocked silence was roughly a hundred times the thing being
+// WHY: waited for, and four such silences made a contended open indistinguishable from a hang.
+// WHY: Eight samples at 250ms buy back exactly the patience the old 4 x 1000 + 3 x 100 model had
+// WHY: (4300ms) while every stall is four times shorter and there are eight samples, not four.
+// WHY: the deadline as well as the count: a decision already inside SQLite cannot be interrupted, so
+// WHY: the attempt count alone cannot bound the episode. The deadline is read before each attempt, so
+// WHY: an episode overshoots by at most the attempt that began before it plus one capped sleep.
+// WHY: Measured against a permanently held lock: 4642ms for this budget (model 4300ms; per-attempt
+// WHY: block 285-330ms at timeout 250, one attempt 705ms because a single attempt waits once per
+// WHY: lock-taking statement it runs) against 4756ms for the old 4 x 1000 + 3 x 100 shape, whose
+// WHY: per-attempt block was ~1114ms and whose pathological ceiling — ~20 statements each waiting out
+// WHY: a full second — was >= 21s.
+// WHY: 4300ms is 21.5% of the harness `testTimeout` (20000ms) and 14% of `hookTimeout` (30000ms), so
+// WHY: contention surfaces as the busy error rather than as a killed test. The corrupt-store rebuild
+// WHY: path can spend three budgets (3 x 4300 = 12.9s), but only immediately after quarantine
+// WHY: replaced the file — when no rival can still hold the old inode.
+const BUSY_MAX_ATTEMPTS = 8;
+const BUSY_BACKOFF_BASE_MS = 50;
+const BUSY_BACKOFF_CAP_MS = 400;
+const BUSY_BACKOFF_JITTER_MS = 50;
 
-export function withBusyRetry<T>(fn: () => T): T {
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= BUSY_RETRIES; attempt++) {
+/**
+ * The store's contention budget: how long one attempt may wait inside SQLite (`timeoutMs`, the
+ * constructor option that `PRAGMA busy_timeout` reports) and how the retry loop spaces its attempts.
+ * Every field is optional — production call sites pass nothing and get the constants above — so a
+ * caller that must not spend the production budget (a test shrinking it deterministically) can say
+ * so explicitly without any production call site changing.
+ */
+export interface BusyBudget {
+  /** SQLite's own busy-handler wait per statement; 0 disables that wait. */
+  timeoutMs?: number;
+  /** Total attempts, including the first. */
+  maxAttempts?: number;
+  /** First backoff; doubles per attempt. */
+  backoffBaseMs?: number;
+  /** Hard ceiling on the exponential term. */
+  backoffCapMs?: number;
+  /** Upper bound of the jitter draw added to every backoff. */
+  backoffJitterMs?: number;
+  /** The jitter draw, in [0, 1). Injectable so a test can pin the schedule. */
+  random?: () => number;
+}
+
+function resolveBusyBudget(overrides?: BusyBudget): Required<BusyBudget> {
+  return {
+    timeoutMs: overrides?.timeoutMs ?? HASH_STORE_BUSY_TIMEOUT,
+    // SAFETY: at least one attempt, so the loop always runs once and can never spin on 0 or -1.
+    maxAttempts: Math.max(1, Math.trunc(overrides?.maxAttempts ?? BUSY_MAX_ATTEMPTS)),
+    backoffBaseMs: overrides?.backoffBaseMs ?? BUSY_BACKOFF_BASE_MS,
+    backoffCapMs: overrides?.backoffCapMs ?? BUSY_BACKOFF_CAP_MS,
+    backoffJitterMs: overrides?.backoffJitterMs ?? BUSY_BACKOFF_JITTER_MS,
+    random: overrides?.random ?? (() => Math.random()),
+  };
+}
+
+/**
+ * The wait before retry `attempt` (0-based): exponential from `backoffBaseMs`, doubled per attempt
+ * and capped at `backoffCapMs`, plus a draw in [0, backoffJitterMs). The jitter is the point — it is
+ * what stops writers that started together from waking together again on every attempt.
+ */
+export function busyBackoffMs(
+  attempt: number,
+  random: () => number,
+  overrides?: BusyBudget,
+): number {
+  const budget = resolveBusyBudget(overrides);
+  const exponential = budget.backoffBaseMs * 2 ** Math.max(0, attempt);
+  return Math.min(budget.backoffCapMs, exponential) + random() * budget.backoffJitterMs;
+}
+
+/**
+ * The modelled worst case of one contention episode: every attempt spending its full internal wait,
+ * plus every backoff at its maximum jitter draw. `withBusyRetry` uses it as a wall-clock deadline, so
+ * the number the constants above were chosen against is also the number the loop enforces.
+ */
+export function busyBudgetMs(overrides?: BusyBudget): number {
+  const budget = resolveBusyBudget(overrides);
+  let total = budget.timeoutMs * budget.maxAttempts;
+  for (let attempt = 0; attempt < budget.maxAttempts - 1; attempt++) {
+    total += busyBackoffMs(attempt, () => 1, budget);
+  }
+  return total;
+}
+
+/**
+ * Run `fn` under the store's contention budget. EVERY store write funnels through here — the open
+ * (via `openDbWithBusyRetry`), `withStore`, and the statement-level retries in snapshot-store,
+ * undo-store and the served session — so this budget and its deadline apply to all of them, not just
+ * to the open. On exhaustion the ORIGINAL error is rethrown unchanged, so every caller keeps
+ * classifying busy against corrupt exactly as it did before.
+ */
+export function withBusyRetry<T>(fn: () => T, overrides?: BusyBudget): T {
+  const budget = resolveBusyBudget(overrides);
+  // SAFETY: a deadline, not only an attempt count — an attempt already inside SQLite cannot be
+  // SAFETY: interrupted, so the count alone would let one slow attempt extend the episode without bound.
+  const deadline = Date.now() + busyBudgetMs(budget);
+  for (let attempt = 0; ; attempt++) {
     try {
       return fn();
     } catch (error) {
-      lastError = error;
-      if (!isBusyError(error) || attempt === BUSY_RETRIES) throw error;
-      sleepSync(BUSY_RETRY_DELAY_MS);
+      if (!isBusyError(error) || attempt >= budget.maxAttempts - 1 || Date.now() >= deadline) {
+        throw error;
+      }
+      sleepSync(busyBackoffMs(attempt, budget.random, budget));
     }
   }
-  throw lastError;
 }
 
 export function getCached<T>(
@@ -129,13 +236,14 @@ export function onStoreOpen(hook: StoreOpenHook): void {
   openHooks.push(hook);
 }
 
-function openDbWithBusyRetry(storePath: string): DatabaseSync {
-  return withBusyRetry(() => openDb(storePath));
+function openDbWithBusyRetry(storePath: string, budget?: BusyBudget): DatabaseSync {
+  return withBusyRetry(() => openDb(storePath, budget), budget);
 }
 
-function openDb(storePath: string): DatabaseSync {
+function openDb(storePath: string, budget?: BusyBudget): DatabaseSync {
   const db = new DatabaseSync(storePath, {
-    timeout: HASH_STORE_BUSY_TIMEOUT,
+    // WHY: this option IS the busy handler the wiring guard reads back as `PRAGMA busy_timeout`.
+    timeout: resolveBusyBudget(budget).timeoutMs,
   });
   try {
     buildStore(db);
@@ -502,7 +610,7 @@ function shutdownDb(db: DatabaseSync): void {
   db.close();
 }
 
-async function openStore(storePath: string): Promise<HashStore> {
+async function openStore(storePath: string, budget?: BusyBudget): Promise<HashStore> {
   shutdownHashStore();
 
   await initHasher();
@@ -511,19 +619,19 @@ async function openStore(storePath: string): Promise<HashStore> {
   let existed = existsSync(storePath);
   let db: DatabaseSync;
   try {
-    db = openDbWithBusyRetry(storePath);
+    db = openDbWithBusyRetry(storePath, budget);
   } catch (error) {
     if (!isCorruptionError(error)) throw error;
     console.error("Hash store failed to open, rebuilding:", error);
     await quarantineStore(storePath);
     existed = false;
-    db = openDbWithBusyRetry(storePath);
+    db = openDbWithBusyRetry(storePath, budget);
   }
   if (!isHealthy(db)) {
     shutdownDb(db);
     await quarantineStore(storePath);
     existed = false;
-    db = openDbWithBusyRetry(storePath);
+    db = openDbWithBusyRetry(storePath, budget);
   }
 
   for (const hook of openHooks) {
@@ -546,7 +654,11 @@ async function openStore(storePath: string): Promise<HashStore> {
   return { db, engine: "node:sqlite" };
 }
 
-export function loadHashStore(): Promise<HashStore> {
+/**
+ * Open (or return the cached) store. `budget` shapes the contention wait of THIS open; production
+ * callers pass nothing, and a cached open returns immediately without consulting it.
+ */
+export function loadHashStore(budget?: BusyBudget): Promise<HashStore> {
   const storePath = hashStorePath();
   if (cachedDb && cachedDb.path === storePath && cachedDb.db.isOpen) {
     return Promise.resolve({ db: cachedDb.db, engine: "node:sqlite" });
@@ -554,7 +666,7 @@ export function loadHashStore(): Promise<HashStore> {
   if (opening && opening.path === storePath) {
     return opening.promise;
   }
-  const promise = openStore(storePath).finally(() => {
+  const promise = openStore(storePath, budget).finally(() => {
     if (opening?.path === storePath) opening = null;
   });
   opening = { path: storePath, promise };

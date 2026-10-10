@@ -164,7 +164,10 @@ describe("hash store open error handling", () => {
         content: "x\n",
       });
     }).toThrow(/locked/);
-    expect(state.runCalls - callsBefore).toBe(4);
+    // WHY: the deliberate contention budget of #87b — 8 attempts (BUSY_MAX_ATTEMPTS) before the
+    // WHY: original error propagates, where the old fixed 4-attempt loop spent 4. The budget block in
+    // WHY: src/hash-store.ts states the arithmetic; this pins the attempt count that reaches here.
+    expect(state.runCalls - callsBefore).toBe(8);
   });
 });
 
