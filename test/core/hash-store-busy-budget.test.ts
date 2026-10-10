@@ -44,6 +44,15 @@ const harnessCeilingMs = Math.min(harnessTestTimeoutMs, harnessHookTimeoutMs) / 
  * at 250 -> 500 (+100%) and at BUSY_MAX_ATTEMPTS 8 -> 100 (a test-level timeout, not an assertion) —
  * while a modest increase surfaces only in the wiring literal and the arithmetic pin below.
  *
+ * The contention tests below assert STRUCTURE — at most `maxAttempts` attempts, at least one, the
+ * ORIGINAL busy error rethrown, the rival's lock still held — and carry every wall-clock reading as a
+ * diagnostic in the assertion MESSAGE. Where an exact count IS asserted, the clock is injected through
+ * the optional `BusyBudget.now`: FROZEN, so the deadline cannot fire and the count terminates alone
+ * (the nominal branch), or jumped PAST the deadline, so the documented backstop ends the episode between
+ * attempts (the early-exit branch). Neither branch depends on host load, and each is refutable by a
+ * one-token mutation of the loop: attempt once and the exact count reddens; drop the deadline check and
+ * the reduced count reddens.
+ *
  * These tests need a REAL second connection holding a real RESERVED lock, so they open the store
  * under a temp HOME (the shape `test/core/hash-store.test.ts` uses) and opt out of the worker-wide
  * seam with an empty `PI_BETTER_EDIT_CONFIG_DIR` (#89) so each call resolves its own fresh store.
@@ -116,12 +125,20 @@ describe("hash store busy wiring (#87b)", () => {
         // The draw is counted, not declared: with a budgeted draw the loop sleeps once per retry, so
         // the draw count IS the retry count (attempts = draws + 1 — the last failure throws, no draw).
         let draws = 0;
+        // WHY the clock is frozen — the NOMINAL branch: an EXACT attempt count is an invariant only
+        // when the COUNT is the terminator, and with a real clock it is not. The deadline is a
+        // wall-clock backstop with no structural headroom (the model charges each attempt its 25ms
+        // internal wait; each attempt really costs ~40-50ms here), so a loaded host ends the episode a
+        // retry early. A clock that never advances puts the deadline out of reach by construction, so
+        // every attempt the budget grants is spent and the exact count becomes true again.
+        const frozen = 0;
         const budget: BusyBudget = {
           timeoutMs: 25,
           maxAttempts: 4,
           backoffBaseMs: 10,
           backoffCapMs: 20,
           backoffJitterMs: 0,
+          now: () => frozen,
           random: () => {
             draws++;
             return 0;
@@ -138,28 +155,107 @@ describe("hash store busy wiring (#87b)", () => {
           error = caught;
         }
         const elapsed = Date.now() - started;
-        const locked = {
-          message: (error as Error | undefined)?.message,
-          errcode: (error as { errcode?: number } | undefined)?.errcode,
+        const attempts = draws + 1;
+        const model = busyBudgetMs();
+        // DIAGNOSTICS, never assertions: elapsed / cap / model / bound / per-attempt cost / total ride
+        // the assertion MESSAGE, so a failure under load reports the numbers without any of them
+        // becoming a guarantee the loop does not make.
+        const diagnostics = JSON.stringify({
+          attempts,
           elapsed,
           cap,
-          rivalStillHolds: true,
-          attempts: draws + 1,
-        };
+          model,
+          bound: model,
+          perAttempt: Math.round(elapsed / attempts),
+          rivalStillHolds: rival.isOpen,
+        });
 
         // The ORIGINAL busy error object, still the shape every classifier matches (errcode 5/6 or
         // /busy|locked/) — exhaustion changes the wait, not the error.
-        expect(error, JSON.stringify(locked)).toBeInstanceOf(Error);
+        expect(error, diagnostics).toBeInstanceOf(Error);
         expect((error as Error).message).toMatch(/busy|locked/i);
         expect((error as { errcode?: number }).errcode).toBe(5);
-        // MEASURED attempt count, not a declaration: it cannot stay 4 if the loop spends one more.
-        expect(draws + 1, JSON.stringify(locked)).toBe(budget.maxAttempts);
-        // The DISCRIMINATOR here is that the INJECTED budget was the one spent, and only this can hold
-        // if it was: the episode measures 199-214ms (3 runs) against the production model of 4300ms, so
-        // an episode that ignored the injection spends the production 4595-4811ms and fails here. The
-        // former `elapsed < cap + 600` was deleted rather than re-tightened: at 750ms it discriminated
-        // neither shape — the old 4 x 1000 shape passes it too (4850 < 4900).
-        expect(elapsed, JSON.stringify(locked)).toBeLessThan(busyBudgetMs());
+        // STRUCTURE: at least one attempt, and never more than the budget granted. With the deadline
+        // unreachable the COUNT terminates, so the exact count is a true invariant — and a load-bearing
+        // one: collapse the loop to a single attempt and this reads 1 against 4.
+        expect(attempts, diagnostics).toBeGreaterThanOrEqual(1);
+        expect(attempts, diagnostics).toBe(budget.maxAttempts);
+        // The DISCRIMINATOR that the INJECTED budget was the one spent: the bound is the PRODUCTION
+        // model (4300ms), not this budget's own 150ms `cap`, because an episode that ignored the
+        // injection spends the production 4595-4811ms and fails here. The former `elapsed < cap + 600`
+        // was deleted rather than re-tightened: at 750ms it discriminated neither shape — the old
+        // 4 x 1000 shape passes it too (4850 < 4900). Headroom measured under load: worst 308ms at load
+        // average 72-91 (6 runs, 24 CPU hogs on 10 cores; 194-205ms idle) against this 4300ms bound — 14x.
+        expect(elapsed, diagnostics).toBeLessThan(model);
+        expect(rival.isOpen).toBe(true);
+      });
+    });
+  });
+
+  /**
+   * The documented BACKSTOP, exercised deterministically — the EARLY-EXIT branch. The deadline is
+   * checked after each failed attempt, so a clock that jumps past it must end the episode between
+   * attempts: fewer attempts than `maxAttempts`, the ORIGINAL busy error still thrown, the rival's lock
+   * still held. This is the branch a loaded host reached by accident (a 150ms model against attempts
+   * that really cost ~40-50ms each) and the former exact-count assertion called a failure; with a
+   * scripted clock the reduced count is an invariant, not a race.
+   */
+  it("ends the episode at the deadline when the clock says the budget is spent", async () => {
+    await withTempHome(async (home) => {
+      await withLockedStore(home, async (rival) => {
+        let draws = 0;
+        const maxAttempts = 4;
+        const pastDeadline = Number.MAX_SAFE_INTEGER;
+        // Reading 1 sets the deadline (0 + cap), reading 2 still reports the same instant so the loop
+        // retries once, reading 3 is past the deadline and ends the episode.
+        const readings = [0, 0, pastDeadline];
+        const budget: BusyBudget = {
+          timeoutMs: 25,
+          maxAttempts,
+          backoffBaseMs: 10,
+          backoffCapMs: 20,
+          backoffJitterMs: 0,
+          now: () => readings.shift() ?? pastDeadline,
+          random: () => {
+            draws++;
+            return 0;
+          },
+        };
+        const cap = busyBudgetMs(budget);
+        expect(cap).toBe(150); // 4 x 25 + (10 + 20 + 20)
+
+        const started = Date.now();
+        let error: unknown;
+        try {
+          await loadHashStore(budget);
+        } catch (caught) {
+          error = caught;
+        }
+        const elapsed = Date.now() - started;
+        const attempts = draws + 1;
+        const model = busyBudgetMs();
+        const diagnostics = JSON.stringify({
+          attempts,
+          elapsed,
+          cap,
+          model,
+          bound: model,
+          perAttempt: Math.round(elapsed / attempts),
+          rivalStillHolds: rival.isOpen,
+        });
+
+        // The ORIGINAL busy error survives the backstop: the deadline changes when the loop stops, not
+        // which error it reports.
+        expect(error, diagnostics).toBeInstanceOf(Error);
+        expect((error as Error).message).toMatch(/busy|locked/i);
+        expect((error as { errcode?: number }).errcode).toBe(5);
+        // STRUCTURE: one attempt at minimum, the reduced count exactly, and the count is the clock's
+        // doing — the third reading threw between the first and second retry, so one draw happened and
+        // the remaining attempts were never spent.
+        expect(attempts, diagnostics).toBeGreaterThanOrEqual(1);
+        expect(attempts, diagnostics).toBeLessThanOrEqual(maxAttempts);
+        expect(attempts, diagnostics).toBe(2);
+        expect(draws, diagnostics).toBe(1);
         expect(rival.isOpen).toBe(true);
       });
     });
@@ -168,14 +264,24 @@ describe("hash store busy wiring (#87b)", () => {
   /**
    * The production budget, NOTHING injected — the shape every production call site uses — which is what
    * makes this test refutable by the constants: a budget injected here would override every constant it
-   * is meant to guard, so no injected contention test can redden for a constants regression. The bound
-   * is derived from `resolveBusyBudget()` and the attempt count is measured; that bound moves with the
-   * constants as well and has not fired in any measured run (250 -> 500 reads a 7334ms bound against a
-   * 6797ms episode), so a constants increase is caught by the harness CEILING, not the bound —
-   * measured GREEN at +20%..+80% on the timeout and red at 250 -> 500. Cost: one
-   * exhausted production budget, ~5s, because a permanently held lock must exhaust it.
+   * is meant to guard, so no injected contention test can redden for a constants regression.
+   *
+   * WHAT IS ASSERTED IS STRUCTURE, not an exact count: at most `maxAttempts` attempts, at least one, the
+   * ORIGINAL busy error rethrown, the rival's lock still held. The former `attempts === maxAttempts` was
+   * a FALSE invariant — the deadline is a wall-clock backstop checked AFTER each failed attempt, so a
+   * host loaded far enough ends the episode a retry early. That is the branch the frozen-clock and
+   * scripted-clock tests above cover deterministically.
+   *
+   * The harness CEILING is the one wall-clock assertion kept, and its headroom was measured under load:
+   * worst episode 4748ms at load average 54-91 (6 runs, 24 CPU hogs on 10 cores) against the 6666ms
+   * ceiling — 1.40x, with `attempts` reaching its bound of 8 on every one of those runs. `bound` stays a
+   * diagnostic: on the same runs it read 5174-5358ms against a 4687-4748ms episode (~1.1x), and it is
+   * derived per run from a single-attempt measurement taken moments earlier. What reddens this test on a
+   * constants increase is the ceiling, not `bound` — GREEN at +20%..+80% on the timeout, red at
+   * 250 -> 500. Cost: one exhausted production budget, ~5s, because a permanently held lock must
+   * exhaust it.
    */
-  it("spends the production budget on a held lock, with the attempt count measured", async () => {
+  it("spends the production budget on a held lock, in at most maxAttempts attempts", async () => {
     await withTempHome(async (home) => {
       await withLockedStore(home, async (rival) => {
         const production = resolveBusyBudget();
@@ -210,10 +316,11 @@ describe("hash store busy wiring (#87b)", () => {
         random.mockRestore();
         const attempts = draws + 1;
 
-        // Derived from the production constants: the model counts one internal wait per attempt, so the
-        // bound charges every attempt its MEASURED cost, and allows the one capped sleep an episode the
-        // deadline ends can overshoot by. A bound derived from the constants alone moves with them, so
-        // the harness ceiling below is what catches a constants increase.
+        // DIAGNOSTICS, never assertions: elapsed / cap / model / bound / per-attempt cost / total ride
+        // the assertion MESSAGE. `bound` charges every attempt its MEASURED cost and allows the one
+        // capped sleep a deadline-ended episode can overshoot by, but it is derived per run from a
+        // single-attempt measurement taken moments earlier, so asserting `elapsed < bound` would be a
+        // wall-clock guarantee whose headroom was never measured under load.
         const model = busyBudgetMs();
         const sleepsMax = model - production.timeoutMs * production.maxAttempts;
         const bound =
@@ -221,14 +328,30 @@ describe("hash store busy wiring (#87b)", () => {
           sleepsMax +
           production.backoffCapMs +
           production.backoffJitterMs;
-        const measured = { attempts, elapsed, model, bound, harnessCeilingMs, singleAttempt };
+        const diagnostics = JSON.stringify({
+          attempts,
+          elapsed,
+          cap: model,
+          model,
+          bound,
+          perAttempt: Math.round(elapsed / attempts),
+          singleAttempt,
+          harnessCeilingMs,
+        });
 
-        expect(error, JSON.stringify(measured)).toBeInstanceOf(Error);
+        // The ORIGINAL busy error object: the deadline changes when the loop stops, not what it reports.
+        expect(error, diagnostics).toBeInstanceOf(Error);
         expect((error as Error).message).toMatch(/busy|locked/i);
         expect((error as { errcode?: number }).errcode).toBe(5);
-        expect(attempts, JSON.stringify(measured)).toBe(production.maxAttempts);
-        expect(elapsed, JSON.stringify(measured)).toBeLessThan(bound);
-        expect(elapsed, JSON.stringify(measured)).toBeLessThan(harnessCeilingMs);
+        // STRUCTURE, not an exact count: the loop makes at least one attempt and never more than it was
+        // given. The exact count is NOT asserted here — with a real clock the deadline can end the
+        // episode a retry early, which is the false invariant this test used to carry.
+        expect(attempts, diagnostics).toBeGreaterThanOrEqual(1);
+        expect(attempts, diagnostics).toBeLessThanOrEqual(production.maxAttempts);
+        // The one wall-clock assertion kept: the harness ceiling, whose headroom IS measured under load
+        // (in the doc comment above). It is what reddens a constants increase — `bound` moves with the
+        // constants it would have to indict, so it cannot catch that regression.
+        expect(elapsed, diagnostics).toBeLessThan(harnessCeilingMs);
         expect(rival.isOpen).toBe(true);
       });
     });
@@ -261,9 +384,21 @@ describe("hash store busy wiring (#87b)", () => {
         const elapsed = Date.now() - started;
 
         expect(store.db.isOpen).toBe(true);
-        const measured = { attempts: attempts.length, elapsed, cap: busyBudgetMs(budget) };
-        expect(attempts.length, JSON.stringify(measured)).toBe(1);
-        expect(elapsed, JSON.stringify(measured)).toBeLessThan(1000);
+        const diagnostics = JSON.stringify({
+          attempts: attempts.length,
+          elapsed,
+          cap: busyBudgetMs(budget),
+          perAttempt: Math.round(elapsed / attempts.length),
+          bound: 1000,
+        });
+        // EXACT and structural, not a measurement: the rival's lock can only be released from the draw,
+        // and a draw only happens after a failed attempt, so the loop cannot reach a second attempt.
+        expect(attempts.length, diagnostics).toBe(1);
+        // Kept because its headroom was measured under load: worst 58ms at load average 54-91 (6 runs,
+        // 24 CPU hogs on 10 cores; 45-52ms idle) against this 1000ms bound — 17x. The bound is this
+        // test's own, not the injected budget's: the episode is one failed attempt plus the
+        // release-triggered retry, so a stalled attempt still reddens here.
+        expect(elapsed, diagnostics).toBeLessThan(1000);
       });
     });
   });
@@ -314,6 +449,10 @@ describe("busyBackoffMs (#87b)", () => {
     const overridden = busyBudgetMs({ timeoutMs: 25, maxAttempts: 4 });
     // 4 x 25 + (100 + 150 + 250): the production backoff schedule at its maximum jitter draw.
     expect(overridden).toBe(600);
+    // The deadline's clock: with nothing injected the resolved budget carries the REAL clock (the same
+    // function, not a wrapper), so every production call site keeps measuring wall time exactly as
+    // before while a test can freeze or jump it through the same optional budget argument.
+    expect(resolveBusyBudget().now).toBe(Date.now);
   });
 
   it("reads the jitter from ONE channel: the budget's `random`, else Math.random", () => {

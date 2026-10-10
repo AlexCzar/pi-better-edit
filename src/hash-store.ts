@@ -136,9 +136,10 @@ const BUSY_BACKOFF_JITTER_MS = 50;
 /**
  * The store's contention budget: how long one attempt may wait inside SQLite (`timeoutMs`, the
  * constructor option that `PRAGMA busy_timeout` reports) and how the retry loop spaces its attempts.
- * Every field is optional — production call sites pass nothing and get the constants above — so a
- * caller that must not spend the production budget (a test shrinking it deterministically) can say
- * so explicitly without any production call site changing.
+ * Every field is optional — production call sites pass nothing and get the constants above, plus the
+ * real clock for the deadline — so a caller that must not spend the production budget, or must pin the
+ * schedule or the deadline source (a test making a branch deterministic), can say so explicitly without
+ * any production call site changing.
  */
 export interface BusyBudget {
   /** SQLite's own busy-handler wait per statement; 0 disables that wait. */
@@ -153,6 +154,14 @@ export interface BusyBudget {
   backoffJitterMs?: number;
   /** The jitter draw, in [0, 1). Injectable so a test can pin the schedule. */
   random?: () => number;
+  /**
+   * The clock the deadline is measured against, in the same sense as `Date.now`. Injectable so a test
+   * can FREEZE it — the attempt count is then the only terminator, which is the branch that asserts an
+   * exact count — or jump it past the deadline, which exercises the documented backstop deterministically
+   * instead of waiting for a loaded host to reach it. Nothing injected means the real clock, so every
+   * production call site keeps measuring wall time exactly as it did before.
+   */
+  now?: () => number;
 }
 
 /**
@@ -170,6 +179,10 @@ export function resolveBusyBudget(overrides?: BusyBudget): Required<BusyBudget> 
     backoffCapMs: overrides?.backoffCapMs ?? BUSY_BACKOFF_CAP_MS,
     backoffJitterMs: overrides?.backoffJitterMs ?? BUSY_BACKOFF_JITTER_MS,
     random: overrides?.random ?? (() => Math.random()),
+    // SAFETY: `Date.now` by reference (not a wrapper), so the default IS the real clock: a caller that
+    // SAFETY: injects nothing gets production wall-clock behaviour, and the optional seam cannot change
+    // SAFETY: what any existing call site measures.
+    now: overrides?.now ?? Date.now,
   };
 }
 
@@ -215,12 +228,16 @@ export function withBusyRetry<T>(fn: () => T, overrides?: BusyBudget): T {
   // SAFETY: interrupted, so the count alone would let one slow attempt extend the episode without bound.
   // SAFETY: The check runs AFTER the attempt that failed, so a deadline-ended episode stops between
   // SAFETY: attempts: at most one capped sleep plus one already-running attempt past the deadline.
-  const deadline = Date.now() + busyBudgetMs(budget);
+  // SAFETY: The clock is `budget.now` — the real clock unless a caller injects one — so production keeps
+  // SAFETY: measuring wall time while a test can freeze or jump the deadline source through the same
+  // SAFETY: optional budget argument. This backstop is what lets an episode end BELOW `maxAttempts`
+  // SAFETY: attempts, so no caller may treat an exact count as guaranteed.
+  const deadline = budget.now() + busyBudgetMs(budget);
   for (let attempt = 0; ; attempt++) {
     try {
       return fn();
     } catch (error) {
-      if (!isBusyError(error) || attempt >= budget.maxAttempts - 1 || Date.now() >= deadline) {
+      if (!isBusyError(error) || attempt >= budget.maxAttempts - 1 || budget.now() >= deadline) {
         throw error;
       }
       sleepSync(busyBackoffMs(attempt, budget));
