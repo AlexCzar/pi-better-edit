@@ -109,8 +109,10 @@ function sleepSync(ms: number): void {
 // WHY: and 299-334ms under load (8 runs, 8 CPU hogs on 10 cores, load average 46): the 250ms internal
 // WHY: wait plus 53-84ms of connection-open and statement work. A retry pays that ONCE, not once per
 // WHY: lock-taking statement — measured at timeouts 25/50/100/250/500/1000, one attempt costs 33/69/131/
-// WHY: 1116ms (one sample each), ~1.1-1.3x the timeout and linear in it — so the old 4 x 1000 shape's
-// WHY: real ceiling was 4719ms (4 x 1116 + 3 x 100), not the >= 21s a per-statement reading suggests.
+// WHY: 306/579/1116ms (one sample each), ~1.1-1.4x the timeout and linear in it — so the old 4 x 1000
+// WHY: shape's real ceiling was a measured 4719ms episode — 4 attempts averaging ~1104.75ms plus 300ms
+// WHY: of sleeps — not the >= 21s a per-statement reading suggests; the 4764ms of 4 x 1116 + 3 x 100 is
+// WHY: a back-formation: 1116ms is a STANDALONE sample, not what that episode's attempts averaged.
 // WHY: the deadline is the backstop, not the usual terminator: it is checked AFTER each attempt, so it
 // WHY: can only end an episode between attempts — one capped sleep plus one already-running attempt past
 // WHY: it. At these constants the COUNT ends the episode first: 8 attempts on every run — 4595-4662ms

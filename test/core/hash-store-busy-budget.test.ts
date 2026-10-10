@@ -19,8 +19,9 @@ import vitestConfig from "../../vitest.config";
 /**
  * The harness ceilings, READ from vitest.config.ts rather than restated, so this file follows the
  * configuration instead of drifting from it. The contention measurements below assert against them:
- * the budget is a fraction of the ceiling, so a regression that inflates the budget has to surface as
- * a failure of a test that measures a real held lock.
+ * the budget is a fraction of the ceiling, so what reddens a test that measures a real held lock is
+ * only a LARGE inflation: 250 -> 500 does it (6797ms measured against a 6666.67ms ceiling), while
+ * 250 -> 300, 350, 400 and 450 all pass, and so does the old-shape 1000 x 4 reshape.
  */
 const harnessTestTimeoutMs = vitestConfig.test?.testTimeout ?? 0;
 const harnessHookTimeoutMs = vitestConfig.test?.hookTimeout ?? 0;
@@ -36,9 +37,12 @@ const harnessCeilingMs = Math.min(harnessTestTimeoutMs, harnessHookTimeoutMs) / 
  * blocked silence per attempt, four attempts, one fixed delay, so every writer woke at the same
  * instants) — now explicit, bounded and decorrelated.
  *
- * One wiring test below spends the PRODUCTION budget with NOTHING injected — the shape every production
- * call site has — and derives its bound from the same constants the episode spends, so a constants
- * regression reddens a test that measures a real held lock rather than only the arithmetic pin below.
+ * The production contention test below spends the PRODUCTION budget with NOTHING injected — the shape
+ * every production call site has — and derives its bound from `resolveBusyBudget()`. That bound moves
+ * with the constants it would have to indict, so the test does NOT redden for every constants
+ * regression: measured GREEN at +20%..+80% on the timeout and at the same-model 1000 x 4 reshape, red
+ * at 250 -> 500 (+100%) and at BUSY_MAX_ATTEMPTS 8 -> 100 (a test-level timeout, not an assertion) —
+ * while a modest increase surfaces only in the wiring literal and the arithmetic pin below.
  *
  * These tests need a REAL second connection holding a real RESERVED lock, so they open the store
  * under a temp HOME (the shape `test/core/hash-store.test.ts` uses) and opt out of the worker-wide
@@ -165,8 +169,10 @@ describe("hash store busy wiring (#87b)", () => {
    * The production budget, NOTHING injected — the shape every production call site uses — which is what
    * makes this test refutable by the constants: a budget injected here would override every constant it
    * is meant to guard, so no injected contention test can redden for a constants regression. The bound
-   * is derived from `resolveBusyBudget()` and the attempt count is measured, so raising
-   * BUSY_MAX_ATTEMPTS (or HASH_STORE_BUSY_TIMEOUT) reddens a test that holds a real lock. Cost: one
+   * is derived from `resolveBusyBudget()` and the attempt count is measured; that bound moves with the
+   * constants as well and has not fired in any measured run (250 -> 500 reads a 7334ms bound against a
+   * 6797ms episode), so a constants increase is caught by the harness CEILING, not the bound —
+   * measured GREEN at +20%..+80% on the timeout and red at 250 -> 500. Cost: one
    * exhausted production budget, ~5s, because a permanently held lock must exhaust it.
    */
   it("spends the production budget on a held lock, with the attempt count measured", async () => {
