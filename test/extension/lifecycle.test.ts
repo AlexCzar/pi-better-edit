@@ -51,6 +51,41 @@ function makeLifecyclePi() {
    * from cancelling its siblings (it runs the rest, then reports through `emitError`), so the loop
    * must finish — but a handler that throws is a broken extension, so the failure must still reach
    * the test rather than vanish behind a silently-absent side effect.
+   *
+   * WHAT THIS DOUBLE MODELS AND WHAT IT DELIBERATELY DOES NOT. Each divergence is labelled, because
+   * a stub STRICTER than the host is safe while a stub LAXER is how a green test hides a production
+   * miss.
+   *
+   * DIVERGENCE — the `registered.length === 0` throw in this helper is STRICTER than the host, the
+   * safe direction. The host tolerates an unsubscribed event: `runner.js`'s `ExtensionRunner.emit`
+   * reads each extension's handler list for the event and `continue`s when it is absent or empty,
+   * returning without complaint, and it CATCHES a handler's throw and reports it through `emitError`
+   * before the next handler runs — so the host neither throws for an unsubscribed event nor lets a
+   * handler throw end the emit. The host's own `emitSessionShutdownEvent` guards its call with
+   * `hasHandlers("session_shutdown")`, a check that is only necessary BECAUSE the emit path tolerates
+   * zero handlers. Throwing is therefore OUR anti-vacuity device, not a host behaviour, and it cannot
+   * hide a production miss: a stricter double produces false REDs, and only a false GREEN can bury a
+   * miss — the collected-and-re-raised handler throws above are the same safe direction.
+   *
+   * BOUNDARY, unmodelled — `result.cancel`. For the cancelable BEFORE-events (`isSessionBeforeEvent`:
+   * `session_before_switch`, `session_before_fork`, `session_before_compact`, `session_before_tree`)
+   * the host's `emit` keeps a handler's RETURNED value and returns at once when it carries a cancel
+   * flag, so later subscribers never run. This double ignores return values. A case asserting that a
+   * cancelled BEFORE-event stopped the dispatch would therefore read no effect where the host reads
+   * one — LAXER than the host in exactly the dimension that case asserts. Latent, not benign: safe
+   * only while NO case exercises it, so extend this double BEFORE adding one.
+   *
+   * BOUNDARY, unmodelled — cross-extension ordering. The host's `emit` nests extension-load order
+   * OUTER around registration order INNER (`for (const ext of this.extensions)` wrapping
+   * `for (const handler of handlers)`), so two extensions interleave event by event. This harness
+   * registers one extension's handlers into one flat per-event list and orders them only by
+   * registration, so it cannot express an interleaving across extensions. Same scope rule as above:
+   * safe while no case asserts an order between two extensions, LAXER the instant one does.
+   *
+   * WHY THE SCOPE IS WRITTEN DOWN: each bound above names the symbol whose reading produced it, so a
+   * later editor can re-measure instead of guessing. An unexplained hedge is the first thing a
+   * well-meaning editor deletes — they cannot tell whether it was measured, guessed or copied — and
+   * they simplify it back to the unconditional sentence, which is the false one.
    */
   const emit = async (event: string, ...args: unknown[]): Promise<void> => {
     const registered = handlers.get(event) ?? [];
