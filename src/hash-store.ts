@@ -99,8 +99,8 @@ function sleepSync(ms: number): void {
 // WHY:   ---------------------------------------------------------------
 // WHY:   modelled episode (busyBudgetMs)                       = 4300ms
 // WHY: 250ms rather than the previous 1000ms: the contended critical section is one short WAL write
-// WHY: transaction, so a second of blocked silence was roughly a hundred times the thing being
-// WHY: waited for, and four such silences made a contended open indistinguishable from a hang.
+// WHY: transaction, so a second of blocked silence DWARFED the thing being waited for, and four such
+// WHY: silences made a contended open indistinguishable from a hang.
 // WHY: Eight samples at 250ms buy back the patience the old 4 x 1000 + 3 x 100 shape had — the SAME
 // WHY: 4300ms model — so the two shapes cannot be told apart by aggregate duration; the tests below
 // WHY: separate them by attempt count and by per-attempt stall, which the shapes DO differ in.
