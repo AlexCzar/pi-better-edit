@@ -1012,10 +1012,10 @@ function smokeCheckStoreFile(storePath: string): boolean {
  * otherwise well-formed file had no detector left at open. `src/store-janitor.ts` runs this same
  * function on `session_start` and `session_shutdown`, off the tool-call hot path, and that run IS
  * the periodic half of issue #100: it closes "not detected at open" (this call finds the damage)
- * and "not healed on reopen" (its failure routes into `healUnhealthyStore`, which runs the open
- * path's own quarantine-and-rebuild), and it deliberately leaves "not quarantined at use" — the
- * FIRST FAILING STATEMENT as the trigger — to #100, which owns the use-time clause. See the
- * janitor's header for the full boundary statement.
+ * and "not healed on reopen" (its failure routes into `healUnhealthyStore`, which quarantines and
+ * rebuilds through the one `quarantineStore` primitive), and it deliberately leaves "not quarantined
+ * at use" — the FIRST FAILING STATEMENT as the trigger — to #100, which owns the use-time clause.
+ * See the janitor's header for the full boundary statement.
  */
 export function isHealthy(db: DatabaseSync): boolean {
   try {
@@ -1061,8 +1061,8 @@ function shutdownDb(db: DatabaseSync): void {
 }
 
 /**
- * The HEAL half of the janitor's periodic deep check: when the open store fails `isHealthy`, take
- * the open path's own corruption recovery — quarantine the file set, then rebuild through
+ * The HEAL half of the janitor's periodic deep check: when the open store fails `isHealthy`, quarantine
+ * and rebuild as the open path's own recovery does — through the one `quarantineStore`, then
  * `openStore` — and report whether that happened. Called only by the store janitor
  * (`src/store-janitor.ts`), off the tool-call path.
  *
@@ -1071,10 +1071,10 @@ function shutdownDb(db: DatabaseSync): void {
  * recovery has too (`if (... !isHealthy(db))`). The cost is one extra `PRAGMA quick_check` on a
  * store already known to be damaged.
  *
- * WHY it is HONEST on a LIVE store: the recovery is the open path's, quoted here as the sequence it
- * is — `shutdownHashStore`, then `quarantineStore`, then `openStore` — and every piece of state it
- * drops is re-derivable, because the store is a disposable cache: the served mirror, the snapshots
- * and their lineage are all rebuilt from the files on disk. What it does NOT
+ * WHY it is HONEST on a LIVE store: the sequence it runs is its OWN, quoted here as it is —
+ * `shutdownHashStore`, then `quarantineStore`, then `openStore` — and every piece of state it drops
+ * is re-derivable, because the store is a disposable cache: the served mirror, the snapshots and
+ * their lineage are all rebuilt from the files on disk. What it does NOT
  * do is reach a second QUARANTINE implementation: there is ONE (`quarantineStore`), with TWO
  * orchestrations calling it — this heal and the open path's own recovery — and it
  * does NOT touch a store that is currently inside a transaction of its own: the janitor runs at a
