@@ -125,17 +125,19 @@ export function updateConfigFile(
 ): void {
   const existing = readConfigObject(path) ?? {};
   const existingSchema = existing.$schema;
-  const updated = { ...update(existing) };
-  // WHY: the delete + rebuild instead of spreading first is `$schema` placement — it must land at
-  // WHY: the head of the written file for every writer, and only this seam decides its value.
-  delete updated.$schema;
+  const updated = update(existing);
+  // WHY: `$schema` is rebuilt FIRST and skipped out of the caller's object rather than spread and
+  // WHY: overwritten — the head of the written file is then the same for every writer, and only this
+  // WHY: seam decides the value.
   const next: Record<string, unknown> = {
     $schema:
       typeof existingSchema === "string" && existingSchema.length > 0
         ? existingSchema
         : CONFIG_SCHEMA_ID,
-    ...updated,
   };
+  for (const [key, value] of Object.entries(updated)) {
+    if (key !== "$schema") next[key] = value;
+  }
 
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true });
