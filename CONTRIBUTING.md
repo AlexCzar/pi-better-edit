@@ -34,6 +34,23 @@ Prompt rule: when the model helps file an issue, infer `bug` vs `feat` from inte
 
 `pnpm run lint && pnpm run format && pnpm run typecheck && pnpm run test:coverage` must pass. See `AGENTS.md` for agent rules.
 
+### Gate preconditions
+
+A gate is valid only for the tip it measured, so check the tree before starting one:
+
+- `git rev-parse HEAD` — the sha the run's result belongs to.
+- `git status --porcelain --untracked-files=all` and `git diff --stat` — both empty.
+- `git diff-index --quiet HEAD` — the invariance authority: exit 0 means no tracked path differs from `HEAD`, staged or unstaged (measured: either kind of edit to a tracked file exits 1).
+- `git stash list` — empty; stashed work is not the tree under test.
+- `uptime` — the host has not just rebooted or woken, and its load at the time of the run is known; a suspend or a load spike mid-run invalidates any timing evidence the run produces.
+
+Two scans cover what those checks cannot see:
+
+- `find . -path ./node_modules -prune -o -name '*-probe*' -print`
+- untracked test files: `comm -13 <(git ls-files '*.test.ts' | sort) <(find . -path ./node_modules -prune -o -name '*.test.ts' -print | sed 's|^\./||' | sort)`
+
+**Why the scan is not `git status`.** Worked example from this tranche: a scratch `tmp/pi-on-probe.mjs` was gitignored (`/tmp/` is root-anchored in `.gitignore` — `git check-ignore -v tmp/pi-on-probe.mjs` names the rule that hid it). `git status --porcelain --untracked-files=all` reported the tree CLEAN and `git diff --stat` stayed empty, so both tree checks hid the file; only the `find` scan above found it. General form: the two instruments disagree exactly when the residue is gitignored, and that is precisely the case that matters, because scratch and probe files are the ones a worktree's ignore rules exist to hide. Read the hits rather than counting them: `docs/.archive_issues/*-probe-*.md` match the name scan and are archived issue documents, not residue.
+
 ## Pull Requests
 Prefer topic branch → PR → squash merge. Keep one concern per PR; link the issue with `Closes #NN` in the description or commit footer.
 ### Description
