@@ -74,10 +74,19 @@ export const SERVED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // WHY: (#87c) the served-mirror TTL prune is a PERIODIC open item, not a per-open one: a `DELETE`
 // WHY: takes the store's write lock even when it matches no row, so running it on every open made a
-// WHY: healthy, stamp-matching open contend for a store it had nothing to change. The item runs at most
-// WHY: once per this interval, expressed as a whole fraction of the horizon it enforces: the prune's
-// WHY: own decision is measured in days (`SERVED_TTL_MS`), so a finer cadence buys nothing, while one
-// WHY: run per day-quarter keeps the mirror's lag behind that horizon well inside a day.
+// WHY: healthy, stamp-matching open contend for a store it had nothing to change.
+// WHY: WHAT THE TIMER RELAXES, stated rather than implied: retention is now enforced at most four times
+// WHY: a day instead of on every open, so an expired mirror row can live up to `SERVED_TTL_MS` +
+// WHY: `SERVED_PRUNE_INTERVAL_MS` — the 7-day TTL plus the cadence below — and spec §5.1 item 8's
+// WHY: "enforced on every open" no longer holds across the deferred window.
+// WHY: WHY THE TIMER IS THE CHEAPER OF THE TWO: the guard it skips is an existence read with NO usable
+// WHY: index — `served` is keyed `(session_id, path)` and the predicate is on `updated_at` — so when
+// WHY: nothing is expired (the fast path's case) it scans the whole mirror. Measured medians, n=9, on
+// WHY: this machine: 0.04ms at 1,000 rows, 0.71ms at 20,000, 1.77ms at 50,000, versus 0.002ms when
+// WHY: something IS expired (that scan stops at the first hit). The timer bounds that per-open cost
+// WHY: however large the mirror grew, which is the property a lock-free open needs.
+// WHY: #90 owns the cadence: it is handed this constant as a knob, and its GC design (lifecycle events,
+// WHY: throttled, never on the tool-call open path) is where the number should finally be tuned.
 export const SERVED_PRUNE_INTERVAL_MS = SERVED_TTL_MS / 28;
 
 // WHY: §3.6.2 post-write failure semantics — the bytes are already on disk when the store commit

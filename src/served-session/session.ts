@@ -460,9 +460,14 @@ const SERVED_PRUNE_META_KEY = "served_prune_at";
 /**
  * The served-mirror TTL prune — a PERIODIC item of the store open (#87c), not a per-open one. Both the
  * delete and its run stamp are writes, and a `DELETE` takes the store's write lock even when its
- * predicate matches no row, so a healthy stamp-matching open that took no lock before would still
+ * predicate matches no row, so a healthy stamp-matching open that took no lock before would otherwise
  * contend for one here. The item is therefore asked only when it is due, and it deletes only when
- * there is something to delete: its common case — nothing expired — is two reads.
+ * there is something to delete.
+ *
+ * WHAT IT RELAXES: retention moves from "every open" to the cadence in `SERVED_PRUNE_INTERVAL_MS`, so
+ * an expired row can live `SERVED_TTL_MS` plus that interval. The timer earns its place because the
+ * guard it skips scans the mirror whenever nothing is expired (no index covers `updated_at`); the
+ * measured medians and the sizing argument are in that constant's WHY block.
  *
  * SEMANTICS ARE UNCHANGED: the same predicate with the same cutoff (`updated_at < now -
  * SERVED_TTL_MS`) is asked as an existence question before it is asked as a delete, the same rows are
