@@ -1,5 +1,6 @@
+import { join } from "path";
 import { describe, expect, it, vi } from "vitest";
-import { loadHashStore } from "../../src/hash-store";
+import { loadHashStore, type HashStore } from "../../src/hash-store";
 import { upsertServed, getServed } from "../../src/served-session/index.js";
 import { upsertSnapshot, getSnapshot, snapshotHashFor } from "../../src/snapshot-store";
 import { withTempDir } from "../support/fixtures";
@@ -69,6 +70,57 @@ function makeLifecyclePi() {
   return { pi, handlers, commands, notify, getActiveTools: () => activeTools, emit };
 }
 
+/**
+ * The POSITIVE CONTROL for the cases below whose subject is an ABSENCE.
+ *
+ * WHY a control at all: `notify` never called, the active tool set unchanged, and served state
+ * intact are all satisfied by a hook that never runs, so each of those cases must first PROVE the
+ * session-start work executed. Measured on this file: with the lifecycle hook's `session_start`
+ * registration removed from the entry point, it reported `1 failed | 3 passed` — only the debug
+ * case, whose assertion is positive, noticed.
+ *
+ * WHY the double's anti-vacuity throw is not that proof: it guards the whole EVENT (no handler
+ * registered for `event` at all), not one handler, and the janitor keeps `session_start` registered
+ * (`JANITOR_EVENTS`), so it cannot fire in the mutant that matters here. A guard that only reports
+ * "everyone is missing" cannot report "the handler under test ran".
+ *
+ * WHY the observable is this prune: the one effect `onSessionStart` has besides the debug notify is
+ * `deps.pruneMissingAll`, which drops the snapshots of files that no longer exist. No other
+ * `session_start` subscriber in the entry point produces it — `regEdit`'s #165 capture only records
+ * the ctx's session manager, and the janitor deletes foreign-generation and expired rows, never a
+ * missing-file snapshot — so "the seeded snapshot is gone" is caused by the hook under test.
+ *
+ * WHY the seed is asserted PRESENT before the emit: the control claims a disappearance, and a
+ * disappearance only evidences work if there was something to disappear; an unarmed absence would
+ * be the same vacuous assertion this control exists to remove.
+ */
+interface SessionStartControl {
+  readonly store: HashStore;
+  readonly path: string;
+  readonly content: string;
+}
+
+async function armSessionStartControl(dir: string): Promise<SessionStartControl> {
+  const store = await loadHashStore();
+  // WHY never written: a snapshot whose file is gone is exactly what `pruneMissing` exists to drop.
+  const path = join(dir, "stale-never-written.ts");
+  const content = "stale\n";
+  upsertSnapshot(store, {
+    path,
+    snapshotHash: snapshotHashFor(content),
+    lineCount: 1,
+    hashes: ["abcc"],
+    content,
+  });
+  expect(getSnapshot(store, path, content)).toEqual(["abcc"]);
+  return { store, path, content };
+}
+
+/** The control itself: the hook under test ran iff it pruned the armed snapshot. */
+function expectSessionStartWorkRan(control: SessionStartControl): void {
+  expect(getSnapshot(control.store, control.path, control.content)).toBeUndefined();
+}
+
 async function registerExtension(pi: any) {
   const { default: register } = await import("../../index");
   register(pi);
@@ -80,8 +132,10 @@ describe("session_start lifecycle", () => {
       const { pi, emit } = makeLifecyclePi();
       pi.setActiveTools(["read", "edit", "write", "bash"]);
       await registerExtension(pi);
+      const control = await armSessionStartControl(dir);
       // WHY: the whole event, as the host emits it — three handlers subscribe to `session_start`.
       await emit("session_start", {}, { cwd: dir, ui: { notify: vi.fn() } });
+      expectSessionStartWorkRan(control);
       expect(pi.getActiveTools()).toEqual(["read", "edit", "write", "bash"]);
     });
   });
@@ -106,7 +160,9 @@ describe("session_start lifecycle", () => {
       await withTempDir("lifecycle-quiet-", async (dir) => {
         const { pi, notify, emit } = makeLifecyclePi();
         await registerExtension(pi);
+        const control = await armSessionStartControl(dir);
         await emit("session_start", {}, { cwd: dir, ui: { notify } });
+        expectSessionStartWorkRan(control);
         expect(notify).not.toHaveBeenCalled();
       });
     } finally {
@@ -117,7 +173,6 @@ describe("session_start lifecycle", () => {
   it("keeps served state at session start", async () => {
     await withTempDir("lifecycle-served-", async (dir) => {
       const { writeFile } = await import("fs/promises");
-      const { join } = await import("path");
       const keep = join(dir, "keep.ts");
       await writeFile(keep, "keep\n", "utf-8");
 
@@ -133,8 +188,10 @@ describe("session_start lifecycle", () => {
 
       const { pi, emit } = makeLifecyclePi();
       await registerExtension(pi);
+      const control = await armSessionStartControl(dir);
       await emit("session_start", {}, { cwd: dir, ui: { notify: vi.fn() } });
 
+      expectSessionStartWorkRan(control);
       expect(getServed(store, "sessionA", keep)).toEqual(["abcc"]);
       expect(getSnapshot(store, keep, "keep\n")).toEqual(["abcc"]);
     });
