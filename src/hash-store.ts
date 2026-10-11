@@ -373,6 +373,21 @@ function tableColumns(db: DatabaseSync, table: string): Set<string> {
     const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
     return new Set(rows.map((row) => row.name));
   } catch {
+    // WHY: the empty set answers TWO questions at once — "this table is not there yet" and "this
+    // WHY: schema could not be read" — and the first is the intended one: PRAGMA table_info returns
+    // WHY: no rows for a missing table rather than throwing (measured), so only a failed READ
+    // WHY: arrives here (a closed handle reads `database is not open`).
+    // WHY: The two questions stop being interchangeable per caller: `addColumnIfMissing` and
+    // WHY: `renameGenerationColumn` go on to attempt their ALTER and fail LOUDLY (`duplicate column
+    // WHY: name`, `no such table`) rather than silently, and `buildStore`'s pre-session-keyed
+    // WHY: `served` shell guard reads `size > 0` as false and so skips its DROP — the safe direction.
+    // WHY: The one SILENT consumer is `hasTable` in `ensureSnapshotTables`, where a failed read makes
+    // WHY: `hasLeases` false and the sweep skips its two lease deletes: a PARTIAL sweep that reports
+    // WHY: success. That residue is the exposure the stamp gate's own trade already accepts — a
+    // WHY: surviving lease is generation-gated at use, so its worst case is a MISS or a fail-closed
+    // WHY: refusal, never a wrongly honored identity — and the next stamp-invalidating open or the
+    // WHY: janitor's throttled periodic sweep removes it, running the same two predicates
+    // WHY: unconditionally.
     return new Set<string>();
   }
 }
