@@ -104,35 +104,31 @@ function sleepSync(ms: number): void {
 // WHY: Eight samples at 250ms buy back the patience the old 4 x 1000 + 3 x 100 shape had — the SAME
 // WHY: 4300ms model — so the two shapes cannot be told apart by aggregate duration; the tests below
 // WHY: separate them by attempt count and by per-attempt stall, which the shapes DO differ in.
-// WHY: the model is what the constants were chosen against, not what an attempt costs. Measured
-// WHY: against a permanently held lock at timeout 250, ONE attempt spends 312-342ms with no load
-// WHY: added by this pass (8 samples, Apple M1 Pro / 10 cores, loadavg 4.36-4.48): that is the ONE
-// WHY: band for this quantity. No loaded band stands beside it — the same measurement under added
-// WHY: load has read three different figures across three passes on this host — and no loaded
-// WHY: maximum is offered instead, so no competing figure is left for a reader to reconcile. The
-// WHY: attempt is the 250ms internal wait plus 62-92ms of connection-open and statement work (band
-// WHY: minus the wait). A retry pays that ONCE, not once per lock-taking statement — measured at
-// WHY: timeouts 25/50/100/500/1000 against the same held lock (250 is the band above), one attempt
-// WHY: costs 38/73/140/603/1137ms (3 samples each, median, loadavg 4.36-4.41), ~1.1-1.5x the
-// WHY: timeout — so the old 4 x 1000 shape's real ceiling was a measured 4843-4897ms episode (3
-// WHY: runs, loadavg 3.83-4.77) — 4 attempts averaging ~1136-1149ms plus 300ms of sleeps — not
-// WHY: the per-statement reading a fixed second of waiting would suggest: the series' standalone
-// WHY: 1137ms sample does reproduce that episode here (4 x 1137 + 300 = 4848ms), but that is a
-// WHY: coincidence, not a derivation: a standalone sample is not what an episode's attempts cost.
+// WHY: the model is what the constants were chosen against, not what an attempt costs. SQLite returns
+// WHY: SQLITE_BUSY once the busy timeout elapses, so ONE attempt against a permanently held lock
+// WHY: spends its full 250ms internal wait plus a small constant overhead of connection-open and
+// WHY: statement work. That overhead varies with the harness rather than with these constants — a store
+// WHY: opened per attempt or pre-built, the way the rival takes the lock, the host — so it carries no
+// WHY: figure here, and neither does anything derived from it: a millisecond band read off one harness
+// WHY: is a fact about that harness, not about this code. A retry pays the overhead ONCE, not once per
+// WHY: lock-taking statement, because a contended attempt blocks at its FIRST lock-taking statement and
+// WHY: does no body work. The overhead is the same whatever the per-attempt wait is, so a shape's real
+// WHY: cost is its attempts x (its own timeout + that overhead) plus its sleeps: four overheads on the
+// WHY: old 4 x 1000 + 300 shape, eight on the 8 x 250 + 2300 one, both sitting on the same 4300ms model
+// WHY: above.
 // WHY: the deadline is the backstop, not the usual terminator: it is checked AFTER each attempt, so it
 // WHY: can only end an episode between attempts — one capped sleep plus one already-running attempt past
-// WHY: it. At these constants the COUNT ends the episode first: 8 attempts on every run — 4710-4840ms
-// WHY: with no load added by this pass (12 runs: 6 with no budget injected, 6 with these exact
-// WHY: values injected; loadavg 3.48-4.62, same host and process as the band above) — i.e.
-// WHY: +410..+540ms OVER the 4300ms model. That overshoot is the band's 62-92ms per-attempt excess
-// WHY: times 8 (496..736ms) less the 175ms by which the model's maximum jitter (7 x 50ms) exceeds
-// WHY: the fixed 0.5 draw these runs paid (7 x 25ms): 321..561ms, which brackets the measured
-// WHY: 410..540ms. The injected and uninjected halves are ONE band, not two: a budget injected with
-// WHY: exactly these values measures the same episode, which is why the contention test below
-// WHY: injects nothing — an injected budget replaces every constant it would be guarding.
+// WHY: it. At these constants the COUNT is what ends an episode — a lock no attempt can outwait fails
+// WHY: every attempt, and the tests below assert the count explicitly against `maxAttempts` — while the
+// WHY: deadline remains the backstop that can end an episode below it. What the count then adds on top
+// WHY: of the model is the arithmetic the model is already made of: the per-attempt overhead times the
+// WHY: attempt count, less what the model over-charges in its jitter term, because it charges every
+// WHY: backoff its MAXIMUM draw while an episode pays some fraction of one. Injected and uninjected runs
+// WHY: are ONE quantity, not two: a budget injected with exactly these values resolves to the same model,
+// WHY: which is why the contention test below injects nothing — an injected budget replaces every
+// WHY: constant it would be guarding.
 // WHY: scoped to THESE constants: an injected budget carries its own, larger model — maxAttempts 100
-// WHY: models 68.7s (code-derived: 100 x 250ms plus 43.7s of capped backoff and jitter) and measured
-// WHY: 69.5s over 93 attempts in ONE sample, loadavg 5.24 (the DEADLINE, not the count, ended it) —
+// WHY: models 68.7s (code-derived: 100 x 250ms plus 43.7s of capped backoff and jitter) —
 // WHY: so what is bounded is the episode's own model, never 'one episode is capped at 4300ms'.
 // WHY: 4300ms is 21.5% of the harness `testTimeout` (20000ms) and 14% of `hookTimeout` (30000ms), so
 // WHY: contention surfaces as the busy error rather than as a killed test. The corrupt-store rebuild
@@ -246,16 +242,15 @@ export function busyBudgetMs(overrides?: BusyBudget): number {
  * `BEGIN IMMEDIATE ... COMMIT` too, and that transaction cannot serve the open instead: the open hooks
  * run before the store handle is published and `withStore` refuses without it, so the open path has
  * one transaction while the write path retries its whole body.
- * The ceiling on re-entry is therefore `maxAttempts` and not one attempt — measured 4 -> 8 (2x) on an
+ * The ceiling on re-entry is therefore `maxAttempts` and not one attempt — 4 -> 8 (2x) on an
  * idempotent, lock-serialized path, at the SAME 4300ms TOTAL model either way: the internal waiting
  * moved with the shape, 8 x 250ms = 2000ms here against 4 x 1000ms = 4000ms there, while the model
  * that replaced it holds the TOTAL at 4300ms. That is a WASH under sustained contention, because a
- * contended attempt blocks at its FIRST lock-taking statement — the ONE per-attempt band the
- * constants block above keeps, quoted there with its n, host and loadavg; no second band is cited
- * here, and the same pass counted the attempts each shape stops at: 4 on every old-shape run, 8 on
- * every run of these constants — and
- * does no body work. The INTERLEAVED case, a rival taking the lock BETWEEN statements, can reach
- * that ceiling and is BOUNDED BUT UNMEASURED.
+ * contended attempt blocks at its FIRST lock-taking statement — one full busy timeout plus the same
+ * connection and statement overhead in either shape, an overhead these constants do not model and a
+ * comment cannot derive, so it carries no figure here — and does no body work; the attempts each
+ * shape spends are its own `maxAttempts`, 4 there against 8 here. The INTERLEAVED case, a rival
+ * taking the lock BETWEEN statements, can reach that ceiling and is BOUNDED BUT UNMEASURED.
  */
 export function withBusyRetry<T>(fn: () => T, overrides?: BusyBudget): T {
   const budget = resolveBusyBudget(overrides);
