@@ -26,7 +26,7 @@
  * the close path that already truncates it, and `wal_checkpoint(TRUNCATE)` on an already-truncated
  * WAL is a no-op. One writer, one checkpoint, measured on close — see the report for the WAL numbers.
  *
- * THE #90 / #100 BOUNDARY, stated where the deep check is scheduled. Issue #100's three clauses, its
+ * THE #90 / #100 BOUNDARY, stated here in this module's own header. Issue #100's three clauses, its
  * own words: "not detected at open, not quarantined at use, not healed on reopen."
  * - CLOSED HERE: "not detected at open" — the fast path stopped running `PRAGMA quick_check` (#87c),
  *   so page-level damage was detected by nothing at all; this janitor detects it periodically, on a
