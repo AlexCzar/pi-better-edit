@@ -374,11 +374,12 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
 
 // WHY: (#87c) the open stamp — the store's own TWO-PART record that both its schema and the generation
 // WHY: its persisted anchors were derived under are current, which is what lets an open skip the
-// WHY: generation sweep and the version upsert ENTIRELY. The halves cost differently: `PRAGMA user_version` is a database header
-// WHY: field, so reading it needs no query and no lock, while the generation half is one indexed
-// WHY: single-row read of `meta`. The version row is part of the gate even though it carries no new
-// WHY: information, because the fast path SKIPS the upsert that maintains it: a gate that ignored it
-// WHY: could leave a deleted version row unrestored for as long as the rest of the stamp matched.
+// WHY: generation sweep and the version upsert ENTIRELY. The halves cost differently: `PRAGMA`
+// WHY: `user_version` is a database header field, so reading it needs no query and no lock, while
+// WHY: the generation half is one indexed single-row read of `meta`. The version row is part of the
+// WHY: gate even though it carries no new information, because the fast path SKIPS the upsert that
+// WHY: maintains it: a gate that ignored the row could leave a deleted one unrestored for as long as
+// WHY: the rest of the stamp matched.
 // WHY: BOTH halves must match, so a half-written stamp can only send the next open down the slow path,
 // WHY: never past it.
 //
