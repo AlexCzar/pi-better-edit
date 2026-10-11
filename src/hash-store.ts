@@ -1038,6 +1038,14 @@ export function isHealthy(db: DatabaseSync): boolean {
     return row?.quick_check === "ok";
   } catch (error) {
     if (isCorruptionError(error)) return false;
+    // WHY: a failure that is NOT corruption reads as HEALTHY, and that direction is load-bearing:
+    // WHY: the remedy for a false verdict is `quarantineStore` plus a rebuild from empty, which
+    // WHY: renames the store file aside and rebuilds it from the DDL, so the undo rows in the old
+    // WHY: file become unreachable. `file_undo` is the table this file calls the single source of
+    // WHY: truth for undo history, and it is not among the rows a read re-derives (the served
+    // WHY: mirror, the snapshots and their lineage are). A probe that merely could not RUN must not
+    // WHY: destroy undo history; a store that really is broken fails closed at the first statement
+    // WHY: that touches the damage instead — #100's use-time clause.
     return true;
   }
 }
