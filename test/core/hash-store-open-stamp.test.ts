@@ -9,8 +9,19 @@
  * half, a `meta` row for the anchor-generation half) decides whether the sweep and the version upsert
  * run, and the whole fast path is proved lock-free by opening while a RIVAL HOLDS THE WRITE LOCK —
  * which no write statement can survive.
+ *
+ * (#87d) WHY THE STAMP IS THE OPEN'S LAST STEP: a stamp written inside `buildStore` — before
+ * `isHealthy` and before the five registered hooks — certifies work that has not happened yet, so a hook
+ * that throws leaves a VALID-LOOKING STAMP over an unfinished store and the next open takes the fast
+ * path over it. The tests below pin the replacement: `buildStore` hands the stamp-due decision back
+ * instead of writing the stamp, `openStore` writes both halves once every hook has succeeded (inside the
+ * retry budget, because that write leaves `openDbWithBusyRetry`'s envelope), and the hook phase's
+ * re-entrant ensure consults the open's IN-MEMORY decision rather than the row — so a slow-path open
+ * still sweeps exactly ONCE and writes the stamp exactly ONCE.
+
  */
 import { describe, expect, it, vi, beforeAll } from "vitest";
+import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -18,6 +29,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   hashStorePath,
   loadHashStore,
+  onStoreOpen,
   shutdownHashStore,
   type HashStore,
 } from "../../src/hash-store";
@@ -101,6 +113,10 @@ function readStamp(): StampView {
 interface StatementTrace {
   beginImmediate: number;
   sweepDeletes: number;
+  /** `meta` upserts PREPARED by the open: the `version` row and the `store_stamp` row, one prepare each. */
+  metaUpserts: number;
+  /** `PRAGMA user_version = ...` writes the open issued — the header half of the stamp. */
+  headerStamps: number;
   /** Every `exec` the open issued that would need the write lock. */
   writes: string[];
   /** Every `exec` the open issued, in order — the DDL trace of the two schema-ensure sites. */
@@ -118,17 +134,23 @@ function schemaEnsureSites(trace: StatementTrace): number {
 }
 
 /**
- * Record every statement any connection issues, so a test can count the write-lock takers an open
- * runs. `exec`-level only: statements run through a prepared handle are covered by the rival-lock
- * test instead, because no write statement can succeed while that lock is held.
+ * Record every statement any connection issues, so a test can count the write-lock takers an open runs.
+ * `exec`-level for the statements that take the lock through `exec`, plus a `prepare` COUNTER for the two
+ * `meta` upserts (each is prepared where it is run, exactly once, so counting prepares counts writes).
+ * What this cannot see is covered by the rival-lock test instead: no write statement can succeed while
+ * that lock is held.
  */
 function startTrace(): { stop: () => StatementTrace } {
   const proto = DatabaseSync.prototype as unknown as {
     exec: (sql: string) => unknown;
+    prepare: (sql: string) => unknown;
   };
   const originalExec = proto.exec;
+  const originalPrepare = proto.prepare;
   let beginImmediate = 0;
   let sweepDeletes = 0;
+  let metaUpserts = 0;
+  let headerStamps = 0;
   const writes: string[] = [];
   const execs: string[] = [];
   proto.exec = function (sql: string) {
@@ -136,15 +158,22 @@ function startTrace(): { stop: () => StatementTrace } {
     execs.push(flat);
     if (/^BEGIN IMMEDIATE/i.test(flat)) beginImmediate += 1;
     if (/^DELETE FROM (served_leases|file_snapshots|line_lineage)\b/i.test(flat)) sweepDeletes += 1;
+    if (/^PRAGMA user_version\s*=/i.test(flat)) headerStamps += 1;
     if (/^(BEGIN IMMEDIATE|COMMIT|DELETE|INSERT|UPDATE|ALTER TABLE|DROP TABLE)/i.test(flat)) {
       writes.push(flat.slice(0, 80));
     }
     return originalExec.call(this, sql);
   };
+  proto.prepare = function (sql: string) {
+    const flat = sql.replace(/\s+/g, " ").trim();
+    if (/^INSERT INTO meta/i.test(flat)) metaUpserts += 1;
+    return originalPrepare.call(this, sql);
+  };
   return {
     stop: () => {
       proto.exec = originalExec;
-      return { beginImmediate, sweepDeletes, writes, execs };
+      proto.prepare = originalPrepare;
+      return { beginImmediate, sweepDeletes, metaUpserts, headerStamps, writes, execs };
     },
   };
 }
@@ -177,23 +206,62 @@ function plantSnapshot(store: HashStore, path: string, content: string): void {
 }
 
 /** A snapshot row of another generation: exactly what the sweep exists to remove. */
-function plantForeignGenerationRow(store: HashStore, path: string): void {
-  const row = store.db
+function plantForeignGenerationRow(db: DatabaseSync, path: string): void {
+  const row = db
     .prepare(
       "INSERT INTO file_snapshots (path, snapshot_hash, line_count, created_at, committed, anchor_generation) " +
         "VALUES (?,?,?,?,1,?) RETURNING snapshot_id",
     )
     .get(path, `${CANON_VERSION}:999:foreign`, 3, Date.now(), 999) as { snapshot_id: number };
-  store.db
-    .prepare(
-      "INSERT INTO line_lineage (snapshot_id, line_number, line_id, canon_hash, anchor) VALUES (?,?,?,?,?)",
-    )
-    .run(row.snapshot_id, 0, 987654, "deadbeefdeadbeef", "zzz1");
+  db.prepare(
+    "INSERT INTO line_lineage (snapshot_id, line_number, line_id, canon_hash, anchor) VALUES (?,?,?,?,?)",
+  ).run(row.snapshot_id, 0, 987654, "deadbeefdeadbeef", "zzz1");
 }
 
 function countRows(db: DatabaseSync, sql: string, ...params: (string | number)[]): number {
   return (db.prepare(sql).get(...params) as { n: number }).n;
 }
+
+/**
+ * The test's own open hook, registered LAST — after every hook the imports above register — so an open
+ * that fails or blocks here has already run all of the open's other work. Inert unless a test arms it.
+ */
+let hookThrows = false;
+let holdWriteLockMs = 0;
+
+/**
+ * A lock holder for the "write lock held across the hook phase" test. It is a CHILD process because the
+ * retry loop that waits on that lock sleeps the test worker's own event loop, so a timer in this process
+ * could not fire while the deferred write is being retried. The child takes the store's write lock, says
+ * so on stdout, and releases it `holdMs` later on its own loop.
+ */
+const LOCK_HOLDER_SCRIPT = `
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.argv[1], { timeout: 0 });
+db.exec("BEGIN IMMEDIATE");
+db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)").run("hook-rival", "1");
+process.stdout.write("locked\\n");
+setTimeout(() => { try { db.exec("ROLLBACK"); } finally { db.close(); process.exit(0); } }, Number(process.argv[2]));
+`;
+
+onStoreOpen(async () => {
+  if (hookThrows) throw new Error("injected hook failure");
+  if (holdWriteLockMs > 0) {
+    const holder = spawn(
+      process.execPath,
+      ["-e", LOCK_HOLDER_SCRIPT, hashStorePath(), String(holdWriteLockMs)],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
+    await new Promise<void>((resolve, reject) => {
+      holder.stdout.once("data", () => resolve());
+      holder.once("error", reject);
+      holder.once("exit", (code) =>
+        reject(new Error(`lock holder exited before locking (${code})`)),
+      );
+    });
+    holder.unref();
+  }
+});
 
 describe("stamp-gated open (#87c)", () => {
   it("takes no write lock: a fast-path open succeeds while a rival holds BEGIN IMMEDIATE", async () => {
@@ -278,7 +346,7 @@ describe("stamp-gated open (#87c)", () => {
       await withStoreDir(async (dir) => {
         const store = await loadHashStore();
         plantSnapshot(store, join(dir, "healthy.ts"), "aaa\nbbb\nccc\n");
-        plantForeignGenerationRow(store, join(dir, "poisoned.ts"));
+        plantForeignGenerationRow(store.db, join(dir, "poisoned.ts"));
         expectCurrentStamp();
         poison.apply(store.db);
         expect(readStamp()).toMatchObject(poison.mismatched);
@@ -319,7 +387,7 @@ describe("stamp-gated open (#87c)", () => {
     // WHY: is why `HASH_STORE_VERSION`'s bump convention still governs semantic changes.
     await withStoreDir(async () => {
       const store = await loadHashStore();
-      plantForeignGenerationRow(store, "/poisoned.ts");
+      plantForeignGenerationRow(store.db, "/poisoned.ts");
       const count = Number((readStamp().stamp as string).split(":")[4]);
       expect(Number.isInteger(count)).toBe(true);
       store.db.exec(
@@ -349,7 +417,7 @@ describe("stamp-gated open (#87c)", () => {
     // WHY: shape BY CONSTRUCTION. This is that claim, exercised: an unknown format takes the slow path.
     await withStoreDir(async () => {
       const store = await loadHashStore();
-      plantForeignGenerationRow(store, "/poisoned.ts");
+      plantForeignGenerationRow(store.db, "/poisoned.ts");
       const value = readStamp().stamp as string;
       store.db.exec(
         `UPDATE meta SET value = '0:${value.split(":").slice(1).join(":")}' WHERE key = '${STAMP_KEY}'`,
@@ -379,7 +447,7 @@ describe("stamp-gated open (#87c)", () => {
     for (const version of [HASH_STORE_VERSION - 1, HASH_STORE_VERSION + 1]) {
       await withStoreDir(async () => {
         const store = await loadHashStore();
-        plantForeignGenerationRow(store, "/poisoned.ts");
+        plantForeignGenerationRow(store.db, "/poisoned.ts");
         store.db.exec(`PRAGMA user_version = ${version}`);
         shutdownHashStore();
 
@@ -456,7 +524,7 @@ describe("stamp-gated open (#87c)", () => {
     // WHY: there is nothing to upgrade); the poison goes when the stamp moves.
     await withStoreDir(async (dir) => {
       const store = await loadHashStore();
-      plantForeignGenerationRow(store, join(dir, "poisoned.ts"));
+      plantForeignGenerationRow(store.db, join(dir, "poisoned.ts"));
       shutdownHashStore();
       const fast = await loadHashStore();
       expect(
@@ -477,6 +545,154 @@ describe("stamp-gated open (#87c)", () => {
           ANCHOR_GENERATION,
         ),
       ).toBe(0);
+    });
+  });
+});
+
+describe("the stamp is the open's last step (#87d)", () => {
+  /**
+   * THE RED PROOF: a hook that throws must leave NO stamp, because the stamp certifies the WHOLE open —
+   * the build, the migrations, the sweep and every hook. Stamped before the hooks, that failure leaves a
+   * valid-looking stamp over an unfinished store, and the next open takes the fast path over it.
+   */
+  it("a hook that throws leaves no stamp, and the next open takes the slow path and re-stamps", async () => {
+    await withStoreDir(async () => {
+      hookThrows = true;
+      try {
+        await expect(loadHashStore(), "the open must fail at the throwing hook").rejects.toThrow(
+          /injected hook failure/,
+        );
+      } finally {
+        hookThrows = false;
+      }
+
+      // THE RED ASSERTION: neither half of the stamp survives a failed open. The `version` row the gate
+      // also reads is NOT part of the stamp — the build writes it, before any hook runs.
+      const failed = readStamp();
+      expect(failed, `stamp after a throwing hook: ${JSON.stringify(failed)}`).toEqual({
+        userVersion: 0,
+        version: String(HASH_STORE_VERSION),
+        stamp: undefined,
+      });
+
+      // The hooks' DDL is deliberately ungated — it ran, and it stays, which is what keeps the open
+      // self-healing. Nothing here is gated by the stamp.
+      const probe = new DatabaseSync(hashStorePath());
+      try {
+        expect(
+          countRows(
+            probe,
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'file_undo'",
+          ),
+        ).toBe(1);
+      } finally {
+        probe.close();
+      }
+
+      // With no stamp the next open cannot take the fast path: it sweeps again as ONE `BEGIN IMMEDIATE`
+      // and writes BOTH halves, so the store is stamped again.
+      const trace = startTrace();
+      await loadHashStore();
+      const recorded = trace.stop();
+      expect(recorded.beginImmediate).toBe(1);
+      expect(recorded.sweepDeletes).toBe(4);
+      expectCurrentStamp();
+    });
+  });
+
+  /**
+   * The move takes the stamp write out of `openDbWithBusyRetry`'s envelope, so the deferred write needs
+   * a retry of its own. The write lock here is REAL and held across the hook phase by a child process; an
+   * unwrapped write would reject with `errcode 5` here, i.e. it would fail an open that had already done
+   * all of its work.
+   */
+  it("retries the deferred stamp write when the store is busy at the end of the open", async () => {
+    await withStoreDir(async () => {
+      const store = await loadHashStore();
+      // The next open must OWE a stamp write, so it reaches the deferred step.
+      store.db.exec("PRAGMA user_version = 0");
+      shutdownHashStore();
+
+      let draws = 0;
+      const budget = {
+        timeoutMs: 25,
+        maxAttempts: 40,
+        backoffBaseMs: 10,
+        backoffCapMs: 40,
+        backoffJitterMs: 0,
+        random: () => {
+          draws += 1;
+          return 0;
+        },
+      };
+      holdWriteLockMs = 350;
+      try {
+        await loadHashStore(budget);
+      } finally {
+        holdWriteLockMs = 0;
+      }
+      expect(draws, "the deferred stamp write must have retried").toBeGreaterThanOrEqual(1);
+      expectCurrentStamp();
+    });
+  });
+
+  /**
+   * The statement counts the open owed: what it wrote, and how many write locks it took to do it. They
+   * ride the assertion MESSAGE, so a failure reports the observed counts rather than only the diff.
+   */
+  function countsOf(trace: StatementTrace): {
+    beginImmediate: number;
+    sweepDeletes: number;
+    metaUpserts: number;
+    headerStamps: number;
+  } {
+    return {
+      beginImmediate: trace.beginImmediate,
+      sweepDeletes: trace.sweepDeletes,
+      metaUpserts: trace.metaUpserts,
+      headerStamps: trace.headerStamps,
+    };
+  }
+
+  /**
+   * THE COUNTS: the move must not double the slow path's work. Read on a store whose stamp no longer
+   * matches — the upgrade shape — where the sweep's own site runs ONCE (the hook's re-entrant ensure
+   * consults the open's in-memory decision, not the row the open has not written yet) and the stamp is
+   * written ONCE, whichever statement issues it.
+   */
+  it("sweeps once and writes the stamp once on the slow path, and nothing at all on the fast path", async () => {
+    await withStoreDir(async () => {
+      const store = await loadHashStore();
+      plantForeignGenerationRow(store.db, "/poisoned.ts");
+      store.db.exec("PRAGMA user_version = 0");
+      shutdownHashStore();
+
+      const trace = startTrace();
+      await loadHashStore();
+      const slow = trace.stop();
+      const slowCounts = countsOf(slow);
+      expect(slowCounts, `slow-path open: ${JSON.stringify(slowCounts)}`).toEqual({
+        beginImmediate: 1,
+        sweepDeletes: 4,
+        metaUpserts: 2,
+        headerStamps: 1,
+      });
+      // BOTH ensure sites still ran: the gate skipped the second sweep, a call was not skipped.
+      expect(schemaEnsureSites(slow)).toBe(2);
+      expectCurrentStamp();
+
+      shutdownHashStore();
+      const fast = startTrace();
+      await loadHashStore();
+      const fastTrace = fast.stop();
+      const fastCounts = { ...countsOf(fastTrace), writes: fastTrace.writes };
+      expect(fastCounts, `fast-path open: ${JSON.stringify(fastCounts)}`).toEqual({
+        beginImmediate: 0,
+        sweepDeletes: 0,
+        metaUpserts: 0,
+        headerStamps: 0,
+        writes: [],
+      });
     });
   });
 });
