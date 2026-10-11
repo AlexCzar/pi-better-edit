@@ -154,7 +154,7 @@ function startTrace(): { stop: () => JanitorTrace } {
   let quickChecks = 0;
   const record = (raw: string): void => {
     const flat = raw.replace(/\s+/g, " ").trim();
-    if (/^DELETE FROM /.test(flat)) allDeletes.push(flat);
+    if (flat.startsWith("DELETE FROM ")) allDeletes.push(flat);
     if (/^DELETE FROM \w+ WHERE rowid IN \(SELECT rowid FROM/.test(flat)) {
       janitorDeletes.push(flat);
     }
@@ -297,7 +297,7 @@ describe("the janitor's GC", () => {
         sql.startsWith("DELETE FROM file_snapshots"),
       );
       expect(snapshotBatches).toHaveLength(3);
-      expect(snapshotBatches.every((sql) => /LIMIT \?\)$/.test(sql))).toBe(true);
+      expect(snapshotBatches.every((sql) => sql.endsWith("LIMIT ?)"))).toBe(true);
     });
   });
 
