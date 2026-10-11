@@ -83,9 +83,15 @@ export const SERVED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // WHY: index — `served` is keyed `(session_id, path)` and the predicate is on `updated_at` — so when
 // WHY: nothing is expired (the fast path's case) it scans the whole mirror. Measured medians of that
 // WHY: read — n=9 batches of 200 calls, 2026-10-11, Apple M1 Pro, macOS 15.1.1, node v26.8.1, loadavg
-// WHY: 4.84 7.19 8.61 at the start of the run, rows as the mirror holds them (`hashes` `'[]'`,
-// WHY: 60-65 B/row) — 0.037ms at 1,000 rows, 0.72ms at 20,000, 2.36ms at 50,000, versus 0.0014ms when
-// WHY: something IS expired (that scan stops at the first hit). The statement for every figure is
+// WHY: 3.44 4.85 6.04, 2.96 4.64 5.94 and 3.13 4.57 5.88 at the start of the three runs, rows as the
+// WHY: mirror holds them (`hashes` `'[]'`, session id and path as the mirror writes them: 73 B/row of
+// WHY: store file at the short end, 164 at the long end, the `(session_id, path)` index included) —
+// WHY: 0.037ms at 1,000 rows, 0.72ms at 20,000, and 2.1-2.5ms at 50,000, versus 0.0014ms when something
+// WHY: IS expired (that scan stops at the first hit). The 50,000 figure is quoted as the RANGE it moves
+// WHY: through rather than as a point, because it tracks the row size: the same three runs measured
+// WHY: 2.08ms at 73 B/row, 2.34-2.35ms at 132-133 B/row and 2.46-2.52ms at 164 B/row, and the single
+// WHY: 2.36ms an earlier version of this comment carried did not reproduce as a value. The statement
+// WHY: for every figure is
 // WHY: `SELECT 1 AS one FROM served WHERE updated_at < ? LIMIT 1`. The timer bounds that per-open cost
 // WHY: however large the mirror grew, which is the property a lock-free open needs.
 // WHY: #90 owns the cadence: it is handed this constant as a knob, and its GC design (lifecycle events,

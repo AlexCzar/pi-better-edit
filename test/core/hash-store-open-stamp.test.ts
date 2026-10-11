@@ -670,8 +670,6 @@ describe("the stamp is the open's last step (#87d)", () => {
   });
 
   /**
-
-  /**
    * THE COUNTS: the move must not double the slow path's work. Read on a store whose stamp no longer
    * matches — the upgrade shape — where the sweep's own site runs ONCE (the hook's re-entrant ensure
    * consults the open's in-memory decision, not the row the open has not written yet) and the stamp is
@@ -805,11 +803,18 @@ describe("periodic served-mirror prune (#87c)", () => {
  * #87c — TWO SEQUENTIAL OPENS IN ONE PROCESS, IN BOTH ORDERS, WITH THE SLOT THE HOOK PHASE READS.
  *
  * WHY this exists beside "sweeps once and writes the stamp once on the slow path": that test pins what
- * ONE open owes, and the tests around the `finally` pin that the open's slot is CLEARED when the hook
- * phase ends. Neither pins the other half of that contract — that `openStamp` is INITIALISED before the
- * hook loop, so a hook's re-entrant `ensureSnapshotTables` reads the open's in-memory decision rather
- * than a stamp the open has not written yet. The slot outlives no open, so the contract is only
- * observable across two opens of one store in one process.
+ * ONE open owes. This test pins the same contract PER LEG, across three real opens of ONE store in one
+ * process and in BOTH orders — slow then fast, then fast then slow — quoting each leg's statement counts
+ * (`BEGIN IMMEDIATE`, sweep DELETEs, meta upserts, header stamps).
+ *
+ * NOT A NOVELTY, and the paragraph this replaces claimed one: deleting `openStamp = stamp` reds THIS
+ * test at leg 1 (`{beginImmediate: 2}` against `{beginImmediate: 1}`) AND reds SEVEN tests this file
+ * ALREADY had, identically — "sweeps at both call sites on a fresh store…", "a mismatch in EITHER
+ * stamp half…", "folds the open-hook count into the stamp…", "folds the stamp's FORMAT version in…",
+ * "a stale or future HASH_STORE_VERSION…", "a hook that throws leaves no stamp…" and "sweeps once and
+ * writes the stamp once on the slow path…". Measured on the file as it stood BEFORE this test was
+ * added: 15 tests, 7 red under that one deletion. The property was already pinned; what this test adds
+ * is the per-leg contract above, and that is worth having.
  *
  * THE LEGS ARE REAL OPENS OF ONE STORE, AND NO TEST-SIDE SHUTDOWN RUNS BETWEEN THEM. A second
  * `loadHashStore()` on an unchanged config path is served from the cache, so each leg reaches the
@@ -817,10 +822,16 @@ describe("periodic served-mirror prune (#87c)", () => {
  * same file). The open path's own shutdown is then the only thing that ends the previous connection —
  * which is also why the SLOT, not the handle, is what these counts pin.
  *
- * RED PROOF: remove `openStamp = stamp` (or move it after the hook loop) and BOTH SLOW legs red — each
- * reports 2 `BEGIN IMMEDIATE` against 1, and each sweep runs twice: 2 → 6 DELETEs on the fresh store,
- * 4 → 8 on the store that already has `served_leases`. With neither a slot nor a persisted stamp, the
- * hook's re-entrant ensure sweeps a second time. Leg 1 fails first, on `beginImmediate`.
+ * RED PROOF: remove `openStamp = stamp` (or move it after the hook loop) and leg 1 reds FIRST, on
+ * `beginImmediate`: `{beginImmediate: 2, sweepDeletes: 6}` against this leg's `{beginImmediate: 1,
+ * sweepDeletes: 2}` — with neither a slot nor a persisted stamp the hook's re-entrant ensure sweeps a
+ * second time. Leg 1 ends the test, so the later legs' counts are never observed here; that same
+ * mutation on a store which already holds `served_leases` doubles to 8 sweep DELETEs against 4 in
+ * "sweeps once and writes the stamp once on the slow path". Its leg-1 failure is the same one the seven
+ * tests listed above report, each in its own shape.
+ *
+ * THE SLOW AND FAST COUNTS RESTATE what "sweeps once and writes the stamp once on the slow path"
+ * already asserts: the legs compare that same shape across open orders rather than a different one.
  */
 describe("two sequential opens in one process (#87c)", () => {
   /**
