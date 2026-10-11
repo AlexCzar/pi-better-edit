@@ -11,6 +11,16 @@
         "bridge": { "type": "string", "enum": ["auto", "on", "off"], "default": "auto" }
       },
       "additionalProperties": true
+    },
+    "store": {
+      "type": "object",
+      "description": "Storage housekeeping. The store DIRECTORY is not configurable here: PI_BETTER_EDIT_CONFIG_DIR owns it, so no file can move the store.",
+      "properties": {
+        "janitor": { "type": "string", "enum": ["on", "off"], "default": "on" },
+        "janitorIntervalMs": { "type": "integer", "minimum": 1, "default": 86400000 },
+        "janitorBatchSize": { "type": "integer", "minimum": 1, "default": 64 }
+      },
+      "additionalProperties": true
     }
   },
   "additionalProperties": true
