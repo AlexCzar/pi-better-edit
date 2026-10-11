@@ -12,6 +12,7 @@ import {
   readLensBridgeConfig,
   resolveEffectiveLensMode,
   saveLensBridgeConfig,
+  resolveEffectiveLensModeWithSource,
   type LensBridgeMode,
   type LensBridgeScope,
 } from "../../../src/integrations/pi-lens/config.js";
@@ -113,6 +114,41 @@ describe("readLensBridgeConfig / resolveEffectiveLensMode", () => {
     await mkdir(projectConfigPath(), { recursive: true });
     expect(readLensBridgeConfig(projectDir)).toEqual({});
     expect(resolveEffectiveLensMode(projectDir)).toBe("auto");
+  });
+});
+describe("resolveEffectiveLensModeWithSource", () => {
+  it("names the rung that won alongside the mode the ladder already returned", async () => {
+    expect(resolveEffectiveLensModeWithSource(projectDir)).toEqual({
+      mode: "auto",
+      source: "default",
+    });
+
+    await seedGlobalConfig({ lens: { bridge: "off" } });
+    expect(resolveEffectiveLensModeWithSource(projectDir)).toEqual({
+      mode: "off",
+      source: "global",
+    });
+
+    await seedProjectConfig({ lens: { bridge: "on" } });
+    expect(resolveEffectiveLensModeWithSource(projectDir)).toEqual({
+      mode: "on",
+      source: "project",
+    });
+
+    process.env[LENS_BRIDGE_ENV_VAR] = "  OFF  ";
+    expect(resolveEffectiveLensModeWithSource(projectDir)).toEqual({ mode: "off", source: "env" });
+
+    // An env value outside the enum is ignored by the ladder, so the file's rung stays the source.
+    process.env[LENS_BRIDGE_ENV_VAR] = "bogus";
+    expect(resolveEffectiveLensModeWithSource(projectDir)).toEqual({
+      mode: "on",
+      source: "project",
+    });
+
+    // The value half is the contract `resolveEffectiveLensMode` has always had.
+    expect(resolveEffectiveLensMode(projectDir)).toBe(
+      resolveEffectiveLensModeWithSource(projectDir).mode,
+    );
   });
 });
 

@@ -1,0 +1,59 @@
+/**
+ * One config ladder for `.pi/agents/pi-better-edit.json` (#90, acceptance item 6).
+ *
+ * The file, the two scopes, the read and the preserving atomic write live in `src/json-config.ts`
+ * and nowhere else: a second hand-rolled ladder over one file is how two settings owners drift apart,
+ * and the boundary test next door already forbids the integration directory from being imported from
+ * outside itself. This guard pins the inverse direction — the settings owners reach the seam instead
+ * of re-deriving it.
+ */
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+
+const SEAM = join("src", "json-config.ts");
+const SETTINGS_OWNERS = [
+  join("src", "integrations", "pi-lens", "config.ts"),
+  join("src", "store-config.ts"),
+];
+
+function tsFiles(dir: string, out: string[] = []): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) tsFiles(path, out);
+    else if (entry.isFile() && path.endsWith(".ts")) out.push(path);
+  }
+  return out;
+}
+
+describe("the config file has one owner (#90)", () => {
+  it("names the config file location in exactly one module", () => {
+    // The literal is what a second copy would hard-code; the seam's own constant is the only one.
+    const namers = tsFiles("src").filter((file) =>
+      readFileSync(file, "utf-8").includes(".pi/agents/pi-better-edit.json"),
+    );
+
+    expect(namers).toEqual([SEAM]);
+  });
+
+  it("routes every settings owner through the seam rather than reading the file itself", () => {
+    for (const file of SETTINGS_OWNERS) {
+      const source = readFileSync(file, "utf-8");
+
+      expect(source, file).toMatch(/from "[^"]*json-config\.js"/);
+      expect(source, file).not.toContain("readFileSync");
+      expect(source, file).not.toContain("writeFileSync");
+      expect(source, file).not.toContain("renameSync");
+    }
+  });
+
+  it("keeps the seam's readers and writer exported for both owners", () => {
+    const seam = readFileSync(SEAM, "utf-8");
+
+    for (const symbol of ["readConfigObject", "updateConfigFile", "configFilePath", "CONFIG_REL"]) {
+      expect(seam, symbol).toContain(
+        `export ${symbol === "CONFIG_REL" ? "const" : "function"} ${symbol}`,
+      );
+    }
+  });
+});

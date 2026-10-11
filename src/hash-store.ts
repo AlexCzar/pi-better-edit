@@ -23,6 +23,20 @@ function configBase(): string {
   return join(homeBase(), ".config");
 }
 
+/** The environment variable that names the app config directory, and so the store's own directory. */
+export const STORE_CONFIG_DIR_ENV_VAR = "PI_BETTER_EDIT_CONFIG_DIR";
+
+/**
+ * The operator's store-directory override, read VERBATIM, or `undefined` when unset. An empty value
+ * counts as unset. WHY it is exported rather than read where it is used: `configDir` and the
+ * `/pi-better-edit` status display both have to answer "is the store directory overridden, and to
+ * what", and two readings of one variable is how they come to disagree about "unset".
+ */
+export function configDirOverride(): string | undefined {
+  const override = process.env[STORE_CONFIG_DIR_ENV_VAR];
+  return override !== undefined && override.length > 0 ? override : undefined;
+}
+
 export function configDir(): string {
   // WHY: precedence for the app config dir is PI_BETTER_EDIT_CONFIG_DIR > XDG_CONFIG_HOME > $HOME/.config
   // WHY: — off Windows only. configBase() reads XDG_CONFIG_HOME behind a `process.platform !== "win32"`
@@ -34,9 +48,9 @@ export function configDir(): string {
   // SAFETY: mkdir or the SQLite open surfaces raw out of the open path without naming the variable. The
   // SAFETY: contract is deliberately verbatim — trimming, validating or wrapping here is out of scope by
   // SAFETY: ticket mandate, so do not "fix" that; document it instead. An empty string counts as UNSET,
-  // SAFETY: mirroring the XDG reading in configBase() above.
-  const override = process.env.PI_BETTER_EDIT_CONFIG_DIR;
-  if (override && override.length > 0) return override;
+  // SAFETY: mirroring the XDG reading in configBase() above: that whole rule lives in configDirOverride().
+  const override = configDirOverride();
+  if (override !== undefined) return override;
   // SAFETY: join of trusted configBase (homedir/.config) with fixed "pi-better-edit" — constant suffix, no traversal.
   return join(configBase(), "pi-better-edit");
 }
@@ -446,11 +460,13 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
 // WHY:     - TODAY'S BOUND, the only deterministic one: the next stamp-invalidating event — a generation
 // WHY:       or schema bump, an ADDITIONAL open hook, or a fresh store. Nothing else bounds it until the
 // WHY:       periodic bound lands.
-// WHY:     - PERIODIC BOUND: DESIGN-COMMITTED AND NOT YET IMPLEMENTED. Issue #90 records it — GC on
-// WHY:       lifecycle events only, throttled to at most about once a day, never on the tool-call open
-// WHY:       path, with batched deletes, `wal_checkpoint(TRUNCATE)` on close and a live-store guard. That
-// WHY:       design is NOT yet in `docs/` (#90 should land it there or as an ADR before this comment can
-// WHY:       cite it as a commitment rather than as an intention).
+// WHY:     - PERIODIC BOUND: IMPLEMENTED, at the lifecycle boundary this file does not own — the
+// WHY:       store janitor (`src/store-janitor.ts`) runs the sweep on `session_start` and
+// WHY:       `session_shutdown` only, throttled through its own `meta` row to at most about once a
+// WHY:       day, never on the tool-call open path, with batched deletes and a live-store guard. It
+// WHY:       reuses the SAME predicates this sweep runs (the exported `*_SQL` constants below), so
+// WHY:       an open-time sweep and a periodic one remove one set of rows. Load-bearing design is
+// WHY:       therefore in the code, not in prose.
 // WHY:     - TRIGGER: operator action only — a hand-edited store, or a copy taken from one. Nothing in
 // WHY:       normal operation reaches it.
 // WHY:     WHY THE TRADE IS SURVIVABLE: no honoring path trusts a stored row without re-deriving from the
@@ -569,6 +585,35 @@ export function markPeriodicRun(db: DatabaseSync, key: string, now: number): voi
 
 // WHY: snapshot-store reads and writes these tables through HashSnapshotIO, so the DDL lives
 // WHY: in the schema owner (spec §5.1) and both modules share one definition.
+// WHY: the store's generation and provenance predicates live HERE, once per family, because TWO
+// WHY: callers ask them — this file's open-time sweep and the store janitor's periodic sweep
+// WHY: (`src/store-janitor.ts`). A second hand-written copy of any of them is how the two sweeps
+// WHY: would drift into deleting different rows, and "the swept rows" would stop being one set.
+// WHY: anchor-gated lease prefix — the middle component of the 3-part served snapshot hash
+// WHY: (`${CANON_VERSION}:${ANCHOR_GENERATION}:${checksum}`) is the anchor generation, so a
+// WHY: canon-only change keeps leases while a generation change sweeps them; pre-rename `3:`
+// WHY: 2-part rows carry no middle component and never match, so they sweep as unknown.
+const FOREIGN_LEASE_LIKE = `%:${ANCHOR_GENERATION}:%`;
+
+/** `file_snapshots` rows whose persisted anchor generation is not the current one. */
+export const FOREIGN_GENERATION_SNAPSHOT_SQL = `anchor_generation != ${ANCHOR_GENERATION}`;
+
+/** `served_leases` rows whose served snapshot hash carries a foreign anchor generation. */
+export const FOREIGN_GENERATION_LEASE_SQL = `served_snapshot_hash NOT LIKE '${FOREIGN_LEASE_LIKE}'`;
+
+/** `line_lineage` rows naming a snapshot that no longer exists. */
+export const ORPHAN_LINEAGE_SQL = `snapshot_id NOT IN (SELECT snapshot_id FROM file_snapshots)`;
+
+/**
+ * `served_leases` rows naming no surviving COMMITTED snapshot for their own path. The grant lookup
+ * is path-scoped (`path = ? AND snapshot_hash = ? AND committed = 1`), so a lease naming a hash that
+ * survives only in a foreign path's row — or only in an uncommitted row — is dangling.
+ */
+export const DANGLING_LEASE_SQL =
+  "NOT EXISTS (SELECT 1 FROM file_snapshots fs " +
+  "WHERE fs.path = served_leases.file_path AND fs.snapshot_hash = served_leases.served_snapshot_hash " +
+  "AND fs.committed = 1)";
+
 export function ensureSnapshotTables(db: DatabaseSync): void {
   db.exec(
     "CREATE TABLE IF NOT EXISTS file_snapshots (" +
@@ -636,19 +681,16 @@ export function ensureSnapshotTables(db: DatabaseSync): void {
   // WHY: the DDL above stays unconditional (and takes no write lock once applied) — see trap (a).
   if (sweepSettledByOpen(db) || storeStampMatches(db)) return;
 
-  const anchorLike = `%:${ANCHOR_GENERATION}:%`;
   // WHY: tables created later in the fresh-build path (served_leases) may not exist
   // WHY: yet when this runs — the sweep touches only what is there.
   const hasTable = (table: string): boolean => tableColumns(db, table).size > 0;
   const hasLeases = hasTable("served_leases");
   const sweepGenerations = (): void => {
     if (hasLeases) {
-      db.exec(`DELETE FROM served_leases WHERE served_snapshot_hash NOT LIKE '${anchorLike}'`);
+      db.exec(`DELETE FROM served_leases WHERE ${FOREIGN_GENERATION_LEASE_SQL}`);
     }
-    db.exec(`DELETE FROM file_snapshots WHERE anchor_generation != ${ANCHOR_GENERATION}`);
-    db.exec(
-      "DELETE FROM line_lineage WHERE snapshot_id NOT IN (SELECT snapshot_id FROM file_snapshots)",
-    );
+    db.exec(`DELETE FROM file_snapshots WHERE ${FOREIGN_GENERATION_SNAPSHOT_SQL}`);
+    db.exec(`DELETE FROM line_lineage WHERE ${ORPHAN_LINEAGE_SQL}`);
     // WHY: one provenance rule as of this sweep — a lease that names no surviving
     // WHY: snapshot for its own path is dangling (same-generation pre-column rows read
     // WHY: as generation 0 and are swept above: a one-time pairing-baseline reset). The grant
@@ -660,11 +702,7 @@ export function ensureSnapshotTables(db: DatabaseSync): void {
     // WHY: ignores those), stranding its lease until the next open's sweep — fail-closed
     // WHY: (the generation-gated grant misses) and self-healing.
     if (hasLeases) {
-      db.exec(
-        "DELETE FROM served_leases WHERE NOT EXISTS (SELECT 1 FROM file_snapshots fs " +
-          "WHERE fs.path = served_leases.file_path AND fs.snapshot_hash = served_leases.served_snapshot_hash " +
-          "AND fs.committed = 1)",
-      );
+      db.exec(`DELETE FROM served_leases WHERE ${DANGLING_LEASE_SQL}`);
     }
   };
   // SAFETY: `isTransaction` is an experimental `node:sqlite` field the read tolerates as absent
@@ -968,8 +1006,18 @@ function smokeCheckStoreFile(storePath: string): boolean {
  * there is no stamp to trust — a fresh store, a stamp mismatch, `existed === false`, or the open
  * that follows a quarantine — where the open is already building or rebuilding from empty, so a
  * pass over every page is not the latency being avoided.
+ *
+ * WHY it is ALSO the periodic deep check, and which half of #100 that is: the fast path stopped
+ * running this pass when it took the header smoke check instead, so page-level damage inside an
+ * otherwise well-formed file had no detector left at open. `src/store-janitor.ts` runs this same
+ * function on `session_start` and `session_shutdown`, off the tool-call hot path, and that run IS
+ * the periodic half of issue #100: it closes "not detected at open" (this call finds the damage)
+ * and "not healed on reopen" (its failure routes into `healUnhealthyStore`, which quarantines and
+ * rebuilds through the one `quarantineStore` primitive), and it deliberately leaves "not quarantined
+ * at use" — the FIRST FAILING STATEMENT as the trigger — to #100, which owns the use-time clause.
+ * See the janitor's header for the full boundary statement.
  */
-function isHealthy(db: DatabaseSync): boolean {
+export function isHealthy(db: DatabaseSync): boolean {
   try {
     const row = db.prepare("PRAGMA quick_check").get() as { quick_check?: string } | undefined;
     return row?.quick_check === "ok";
@@ -992,6 +1040,17 @@ async function quarantineStore(storePath: string): Promise<void> {
   }
 }
 
+/**
+ * The WAL checkpoint's ONLY owner: truncate the journal, then close. `openStore` registers it once on
+ * `exit`, `SIGINT` and `SIGTERM`, so every path out of the process arrives here.
+ *
+ * WHY the division of labour is worth stating: the store's periodic work (`src/store-janitor.ts`)
+ * deliberately adds no checkpoint of its own — a run's writes ride the WAL like any other writer's —
+ * so this is the single site that truncates it, and the rows a run leaves in the journal are
+ * truncated by the close path that already truncates every other writer's. Nothing periodic needs to
+ * duplicate that, and `wal_checkpoint(TRUNCATE)` on an already-truncated journal is a no-op, so the
+ * two cannot double-charge.
+ */
 function shutdownDb(db: DatabaseSync): void {
   try {
     db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
@@ -999,6 +1058,48 @@ function shutdownDb(db: DatabaseSync): void {
     console.error("[hash-store] failed to checkpoint WAL on shutdown:", error);
   }
   db.close();
+}
+
+/**
+ * The HEAL half of the janitor's periodic deep check: when the open store fails `isHealthy`, quarantine
+ * and rebuild as the open path's own recovery does — through the one `quarantineStore`, then
+ * `openStore` — and report whether that happened. Called only by the store janitor
+ * (`src/store-janitor.ts`), off the tool-call path.
+ *
+ * WHY it re-checks instead of trusting its caller's verdict: this is then safe to call from
+ * anywhere and can never quarantine a healthy store, which is the property the open path's own
+ * recovery has too (`if (... !isHealthy(db))`). The cost is one extra `PRAGMA quick_check` on a
+ * store already known to be damaged.
+ *
+ * WHY it is HONEST on a LIVE store: the sequence it runs is its OWN, quoted here as it is —
+ * `shutdownHashStore`, then `quarantineStore`, then `openStore` — and every piece of state it drops
+ * is re-derivable, because the store is a disposable cache: the served mirror, the snapshots and
+ * their lineage are all rebuilt from the files on disk. What it does NOT
+ * do is reach a second QUARANTINE implementation: there is ONE (`quarantineStore`), with TWO
+ * orchestrations calling it — this heal and the open path's own recovery — and it
+ * does NOT touch a store that is currently inside a transaction of its own: the janitor runs at a
+ * lifecycle boundary, where no tool call of this session is in flight, and any statement prepared on
+ * the closed connection afterwards fails closed on the reopened one's absence rather than silently
+ * reading a dead handle.
+ *
+ * WHAT IT LEAVES BEHIND, stated rather than implied: because the rebuild goes through `openStore`
+ * and not around it, the store comes back COMPLETE — hooks run, the stamp written after them — so the
+ * next open of that path takes the fast path over a store that really is current. The one handle this
+ * leaves stale is the caller's own `db` argument, which the recovery closes: a caller must re-read the
+ * store (`loadHashStore`) rather than reuse the connection it passed in.
+ */
+export async function healUnhealthyStore(budget?: BusyBudget): Promise<boolean> {
+  const current = cachedDb;
+  if (current === null || !current.db.isOpen) return false;
+  if (isHealthy(current.db)) return false;
+  console.error("[hash-store] deep check found the store damaged, quarantining and rebuilding");
+  // WHY: the quarantine comes FIRST and on its own: the open path's fast branch accepts a store whose
+  // WHY: header is intact, and an intact header is exactly the case the janitor's deep pass exists to
+  // WHY: catch — so handing the open the same file would reopen the damage instead of repairing it.
+  shutdownHashStore();
+  await quarantineStore(current.path);
+  await openStore(current.path, budget);
+  return true;
 }
 
 async function openStore(storePath: string, budget?: BusyBudget): Promise<HashStore> {

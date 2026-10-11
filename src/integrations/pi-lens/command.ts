@@ -14,11 +14,16 @@ import {
   LENS_BRIDGE_ENV_VAR,
   LENS_CONFIG_REL,
   readLensBridgeConfig,
-  resolveEffectiveLensMode,
+  resolveEffectiveLensModeWithSource,
   saveLensBridgeConfig,
   type LensBridgeMode,
   type LensBridgeScope,
 } from "./config.js";
+import { configDirOverride, hashStorePath, STORE_CONFIG_DIR_ENV_VAR } from "../../hash-store.js";
+import {
+  resolveStoreJanitorSettingsWithSources,
+  STORE_JANITOR_KEY_NAMES,
+} from "../../store-config.js";
 
 const COMMAND_NAME = "pi-better-edit";
 const IO_BRIDGE_SYMBOL_KEY = "pi-lens:io-bridge";
@@ -86,16 +91,55 @@ function notify(
 
 function statusText(cwd: string): string {
   const config = readLensBridgeConfig(cwd);
+  const effective = resolveEffectiveLensModeWithSource(cwd);
   const envRaw = process.env[LENS_BRIDGE_ENV_VAR];
   const envValue = envRaw === undefined || envRaw.trim().length === 0 ? "unset" : envRaw.trim();
-  return [
+  const lensLines = [
     `${COMMAND_NAME} lens bridge`,
-    `  effective: ${resolveEffectiveLensMode(cwd)}`,
+    `  effective: ${effective.mode}`,
+    `  effective source: ${effective.source}`,
     `  io bridge detected: ${isIOBridgeMounted() ? "yes" : "no"}`,
     `  project (${LENS_CONFIG_REL}): ${config.project ?? "unset"}`,
     `  global (~/${LENS_CONFIG_REL}): ${config.global ?? "unset"}`,
     `  env ${LENS_BRIDGE_ENV_VAR}: ${envValue}`,
     "  precedence: env > project > global > auto",
+  ];
+  // WHY: a blank line between the two blocks — they are two subjects, the bridge and the store, and
+  // WHY: each one keeps the shape the other taught the reader.
+  return [lensLines.join("\n"), "", storeStatusText(cwd)].join("\n");
+}
+
+/**
+ * The store's half of the status output, in the lens block's own layout: the settings, then the
+ * override, then a precedence line.
+ *
+ * WHY each key carries its rung: the ladder resolves PER KEY, so "the project file is set" says
+ * nothing about which value the store will actually use, and the rung is what says which file to
+ * edit next.
+ *
+ * WHY the store path is printed with its override: `PI_BETTER_EDIT_CONFIG_DIR` is the ONLY thing that
+ * can move the store, and no config file key can (there is deliberately no `store.dir`), which is
+ * worth saying where a reader is looking for the setting that moved it.
+ *
+ * WHY a warning is repeated here: an unusable config file degrades to the defaults, and a display
+ * that showed those defaults with no reason would be the silent drop this ladder refuses to make.
+ */
+function storeStatusText(cwd: string): string {
+  const warnings: string[] = [];
+  const settings = resolveStoreJanitorSettingsWithSources(cwd, (reason) => warnings.push(reason));
+  // WHY: verbatim and never trimmed — this is the value the store will USE (see configDirOverride),
+  // WHY: so a display that trimmed it would name a directory the store does not open.
+  const override = configDirOverride();
+  return [
+    `${COMMAND_NAME} store`,
+    `  store.${STORE_JANITOR_KEY_NAMES.mode}: ${settings.mode.value} (${settings.mode.source})`,
+    `  store.${STORE_JANITOR_KEY_NAMES.intervalMs}: ${settings.intervalMs.value} (${settings.intervalMs.source})`,
+    `  store.${STORE_JANITOR_KEY_NAMES.batchSize}: ${settings.batchSize.value} (${settings.batchSize.source})`,
+    `  store path: ${hashStorePath()}`,
+    `  override ${STORE_CONFIG_DIR_ENV_VAR}: ${override ?? "unset"}`,
+    "  precedence: env > project > global > default",
+    `  store path is set by ${STORE_CONFIG_DIR_ENV_VAR} alone: no config file key can move it`,
+    ...warnings.map((reason) => `  warning: ${reason}`),
   ].join("\n");
 }
 

@@ -12,6 +12,11 @@ import {
   LENS_CONFIG_REL,
   LENS_SCHEMA_ID,
 } from "../../../src/integrations/pi-lens/config.js";
+import {
+  STORE_JANITOR_BATCH_DEFAULT,
+  STORE_JANITOR_ENV_VAR,
+  STORE_JANITOR_INTERVAL_DEFAULT_MS,
+} from "../../../src/store-config.js";
 
 const BRIDGE_KEY = Symbol.for("pi-lens:io-bridge");
 const SETTLED_CHOICES = [
@@ -36,6 +41,7 @@ let root = "";
 let projectDir = "";
 let homeDir = "";
 const savedHome = process.env.HOME;
+const savedStoreDir = process.env.PI_BETTER_EDIT_CONFIG_DIR;
 let previousBridge: unknown;
 
 const projectConfigPath = (): string => join(projectDir, LENS_CONFIG_REL);
@@ -99,6 +105,7 @@ beforeEach(async () => {
   process.env.HOME = homeDir;
   delete process.env[LENS_BRIDGE_ENV_VAR];
   previousBridge = (globalThis as Record<symbol, unknown>)[BRIDGE_KEY];
+  delete process.env[STORE_JANITOR_ENV_VAR];
   delete (globalThis as Record<symbol, unknown>)[BRIDGE_KEY];
 });
 
@@ -109,6 +116,9 @@ afterEach(async () => {
   if (savedHome === undefined) delete process.env.HOME;
   else process.env.HOME = savedHome;
   delete process.env[LENS_BRIDGE_ENV_VAR];
+  delete process.env[STORE_JANITOR_ENV_VAR];
+  if (savedStoreDir === undefined) delete process.env.PI_BETTER_EDIT_CONFIG_DIR;
+  else process.env.PI_BETTER_EDIT_CONFIG_DIR = savedStoreDir;
   await rm(root, { recursive: true, force: true });
 });
 
@@ -268,5 +278,98 @@ describe("registerLensCommand", () => {
 
     expect(notifications).toHaveLength(1);
     expect(notifications[0]).toContain("pi-better-edit:");
+  });
+  describe("status output — the store section (#90)", () => {
+    const LENS_LINES = [
+      "pi-better-edit lens bridge",
+      "  effective: auto",
+      `  project (${LENS_CONFIG_REL}): unset`,
+      `  global (~/${LENS_CONFIG_REL}): unset`,
+      `  env ${LENS_BRIDGE_ENV_VAR}: unset`,
+      "  precedence: env > project > global > auto",
+    ] as const;
+
+    async function statusOf(cwd: string): Promise<string> {
+      const { options } = captureCommand();
+      const { ctx, notifications, selectCalls } = fakeCtx({ hasUI: true, cwd });
+      await options.handler("lens status", ctx);
+      expect(selectCalls).toEqual([]);
+      expect(notifications).toHaveLength(1);
+      return notifications[0] ?? "";
+    }
+
+    it("keeps every settled lens line byte-identical and appends the store section after it", async () => {
+      const lines = (await statusOf(projectDir)).split("\n");
+
+      // The lens block keeps its own line order; the store block starts at a blank separator line.
+      const storeAt = lines.indexOf("pi-better-edit store");
+      expect(storeAt).toBeGreaterThan(0);
+      expect(lines[storeAt - 1]).toBe("");
+      expect(lines.slice(0, storeAt - 1)).toEqual([
+        ...LENS_LINES.slice(0, 2),
+        "  effective source: default",
+        "  io bridge detected: no",
+        ...LENS_LINES.slice(2),
+      ]);
+    });
+
+    it("names each store key, the rung that supplied it, the resolved store path and the sole override", async () => {
+      const storeDir = process.env.PI_BETTER_EDIT_CONFIG_DIR;
+      expect(storeDir, "test/support/isolate-store.ts pins the store seam").toBeTruthy();
+
+      const text = await statusOf(projectDir);
+
+      expect(text).toContain(`store.janitor: on (default)`);
+      expect(text).toContain(
+        `store.janitorIntervalMs: ${STORE_JANITOR_INTERVAL_DEFAULT_MS} (default)`,
+      );
+      expect(text).toContain(`store.janitorBatchSize: ${STORE_JANITOR_BATCH_DEFAULT} (default)`);
+      expect(text).toContain(`store path: ${join(storeDir ?? "", "hash-store.sqlite")}`);
+      expect(text).toContain(`override PI_BETTER_EDIT_CONFIG_DIR: ${storeDir}`);
+      expect(text).toContain("precedence: env > project > global > default");
+      expect(text).toContain("store path is set by PI_BETTER_EDIT_CONFIG_DIR alone");
+      expect(text).toContain("no config file key can move it");
+    });
+
+    it("labels the rung that won per key, so one rung never masks another", async () => {
+      await mkdir(join(homeDir, ".pi", "agents"), { recursive: true });
+      await writeFile(
+        globalConfigPath(),
+        JSON.stringify({ store: { janitorBatchSize: 8 } }),
+        "utf-8",
+      );
+      await mkdir(join(projectDir, ".pi", "agents"), { recursive: true });
+      await writeFile(
+        projectConfigPath(),
+        JSON.stringify({ store: { janitorIntervalMs: 900 } }),
+        "utf-8",
+      );
+      process.env[STORE_JANITOR_ENV_VAR] = "off";
+
+      const text = await statusOf(projectDir);
+
+      expect(text).toContain("store.janitor: off (env)");
+      expect(text).toContain("store.janitorIntervalMs: 900 (project)");
+      expect(text).toContain("store.janitorBatchSize: 8 (global)");
+    });
+
+    it("shows the override as unset when the store seam names no directory", async () => {
+      process.env.PI_BETTER_EDIT_CONFIG_DIR = "";
+
+      const text = await statusOf(projectDir);
+
+      expect(text).toContain("override PI_BETTER_EDIT_CONFIG_DIR: unset");
+      expect(text).toMatch(/store path: .*hash-store\.sqlite/);
+    });
+
+    it("shows the defaults WITH the reason when a store config file cannot be used", async () => {
+      await mkdir(join(projectDir, ".pi", "agents"), { recursive: true });
+      await writeFile(projectConfigPath(), "{ not json", "utf-8");
+
+      const text = await statusOf(projectDir);
+
+      expect(text).toContain("store.janitor: on (default)");
+      expect(text).toContain(`warning: cannot parse config ${projectConfigPath()}`);
+    });
   });
 });

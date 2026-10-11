@@ -8,6 +8,7 @@ import { registerSearchHook } from "./src/search-hook.js";
 import { createLifecycleHooks } from "./src/lifecycle-hooks/index.js";
 import { registerLensCommand } from "./src/integrations/pi-lens/command.js";
 import { attachIOBridgeAdapter } from "./src/integrations/pi-lens/io-bridge-adapter.js";
+import { registerJanitorHooks } from "./src/store-janitor.js";
 
 export { createLifecycleHooks, registerLifecycleHooks } from "./src/lifecycle-hooks/index.js";
 
@@ -38,4 +39,9 @@ export default function (pi: ExtensionAPI): void {
     // SAFETY: ExtensionAPI tool_result overload is tuple-specific — cast to lifecycle hook handler validated by onToolResult in src/lifecycle-hooks.
     hooks.onToolResult as unknown as never,
   );
+
+  // WHY: the store janitor is wired to the lifecycle events that are OFF the tool-call hot path
+  // WHY: (`session_start`, `session_shutdown`) and to no other event: see JANITOR_EVENTS in
+  // WHY: src/store-janitor.ts for the never-subscribe list and the reason it is a prohibition.
+  registerJanitorHooks(pi);
 }
