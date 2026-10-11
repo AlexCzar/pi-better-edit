@@ -1,5 +1,5 @@
 // SAFETY: large-class — hasher module owns single wasm instance and helpers as cohesive unit; no split needed.
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readSync } from "node:fs";
 import { rename, mkdir } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
@@ -865,6 +865,110 @@ function buildStore(db: DatabaseSync): boolean {
   return true;
 }
 
+/**
+ * The SQLite database header — the 100-byte prefix of every database file, described by the file
+ * format spec (`fileformat2.html` §1.3, "The Database Header"). Every field below is read from
+ * those bytes directly, which is what makes the smoke check cheap: no page cache, no statement, no
+ * lock — one read of the file's first page.
+ *
+ * WHAT EACH FIELD CARRIES, and the range this check holds it to:
+ * - bytes 0-15: the magic string `SQLite format 3\000`. A file without it is not a database.
+ * - bytes 16-17: the page size, big-endian, a power of two from 512 to 32768 inclusive — or the
+ *   literal value 1, the format's encoding of 65536.
+ * - bytes 28-31: the database size in pages, big-endian. The main file's page count only: WAL
+ *   frames live outside it (measured — the field equals the file's own page count both while a WAL
+ *   is pending and after a checkpoint, on the same store). Zero means "size unknown" to SQLite,
+ *   which then derives the size from the file; no open of this store writes zero, so this check
+ *   reads it as damage instead of guessing.
+ * - the file's length must then be exactly page size x page count.
+ */
+const SQLITE_MAGIC = "SQLite format 3\0";
+const SQLITE_HEADER_BYTES = 100;
+const SQLITE_PAGE_SIZE_OFFSET = 16;
+const SQLITE_PAGE_COUNT_OFFSET = 28;
+/** The format's floor and ceiling for a page size; out of range is not a database. */
+const SQLITE_MIN_PAGE_SIZE = 512;
+const SQLITE_MAX_PAGE_SIZE = 65536;
+/** The header value that ENCODES the ceiling — not a 1-byte page size. */
+const SQLITE_MAX_PAGE_SIZE_ENCODING = 1;
+
+/**
+ * The FAST path's integrity check (#87c): does this store FILE still look like one SQLite file?
+ *
+ * WHY a header read replaces the full `PRAGMA quick_check` here: the stamp gate removed the sweep,
+ * so the integrity sweep became the dominant remaining cost of a stamp-matching open — it walks
+ * every page of the store — and what it buys is EARLIER notice, not prevention. The remedy for a
+ * damaged store is `quarantineStore` plus a rebuild from empty, because this store is a
+ * disposable CACHE: the served mirror, the snapshots and their lineage are all re-derived from the
+ * files on disk on the next read. Paying the dominant share of every process's open latency, on
+ * every open, to move that notice a few statements earlier was the bad trade.
+ *
+ * WHAT IS DELIBERATELY NOT CHECKED, and where the check MOVES to instead: page-level damage inside
+ * an otherwise well-formed file — a torn b-tree page, a freelist that disagrees with itself — is
+ * not visible from the header. Such corruption surfaces LATER, at the statement that first touches
+ * the damaged page, as its own error (`database disk image is malformed`, SQLITE_CORRUPT), never
+ * as a silently wrong result: every honoring path re-derives from the bytes it is about (see the
+ * trap-(c) block above). Issue #90 INHERITS the throttled deep check: its janitor sweep runs the
+ * store's own maintenance off the tool-call path, so the deep pass is MOVED rather than lost.
+ */
+function smokeCheckStoreFile(storePath: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(storePath, "r");
+    // SAFETY: allocUnsafe is safe here because readSync fills all 100 bytes before any of them is
+    // SAFETY: read — the `read < SQLITE_HEADER_BYTES` guard below rejects a short read first.
+    // WHY: kept on purpose, uncovered though they are (#87c). The short-read guard, the magic
+    // WHY: comparison, the page-size range check and its power-of-two test are this check's ONLY
+    // WHY: arms whose refusal body never runs — in a whole-suite coverage run at 17f7e14 those
+    // WHY: four return statements execute 0 times while the four conditions run 601 times — and
+    // WHY: they are uncovered because NO SEAM REACHES THEM: SQLite's own first read of the file
+    // WHY: refuses every file they guard, so a file that would trip one never arrives here.
+    // WHY: Measured at 17f7e14, in a /tmp copy: deleting all four leaves the focused file green
+    // WHY: (11 tests) and the whole suite green (2264 passed | 2 skipped, the unchanged baseline).
+    // WHY: Do NOT delete them on that evidence; re-measure first. They are defence in depth —
+    // WHY: unreachable only while SQLite keeps refusing a malformed header at first read, and live
+    // WHY: work again the day a version stops — so four uncovered arms here are a KEPT decision.
+    const header = Buffer.allocUnsafe(SQLITE_HEADER_BYTES);
+    const read = readSync(fd, header, 0, SQLITE_HEADER_BYTES, 0);
+    if (read < SQLITE_HEADER_BYTES) return false;
+    if (header.toString("latin1", 0, 16) !== SQLITE_MAGIC) return false;
+    const rawPageSize = header.readUInt16BE(SQLITE_PAGE_SIZE_OFFSET);
+    const pageSize =
+      rawPageSize === SQLITE_MAX_PAGE_SIZE_ENCODING ? SQLITE_MAX_PAGE_SIZE : rawPageSize;
+    if (pageSize < SQLITE_MIN_PAGE_SIZE || pageSize > SQLITE_MAX_PAGE_SIZE) return false;
+    if ((pageSize & (pageSize - 1)) !== 0) return false;
+    const pageCount = header.readUInt32BE(SQLITE_PAGE_COUNT_OFFSET);
+    // WHY: NOT one of the four above, and NOT uncovered: this arm's refusal body DID run (1
+    // WHY: execution in that same suite run). Deleting it is nonetheless invisible, for an
+    // WHY: ARITHMETIC reason instead — the length rule below refuses the same file by itself,
+    // WHY: because `pageSize * 0` is 0 and no store file's size equals 0 (measured in the /tmp
+    // WHY: copy with this line deleted: page size 4096, a 163840-byte store, still quarantined).
+    // WHY: FIVE arms here are invisible to mutation; only the four above are UNCOVERED. Coverage
+    // WHY: and mutation-sensitivity are different properties.
+    if (pageCount === 0) return false;
+    return fstatSync(fd).size === pageSize * pageCount;
+  } catch {
+    // WHY: a file that cannot be read at all cannot be a healthy store — and the CALLER decides
+    // WHY: what that means (quarantine and rebuild), so this check reports only its verdict.
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // SAFETY: closing a read-only descriptor this call opened; a failure leaves no lock, no
+        // SAFETY: write and no state behind, and the verdict above is already decided.
+      }
+    }
+  }
+}
+
+/**
+ * The SLOW path's integrity check: SQLite's own full pass over the store, unchanged. Runs when
+ * there is no stamp to trust — a fresh store, a stamp mismatch, `existed === false`, or the open
+ * that follows a quarantine — where the open is already building or rebuilding from empty, so a
+ * pass over every page is not the latency being avoided.
+ */
 function isHealthy(db: DatabaseSync): boolean {
   try {
     const row = db.prepare("PRAGMA quick_check").get() as { quick_check?: string } | undefined;
@@ -915,7 +1019,14 @@ async function openStore(storePath: string, budget?: BusyBudget): Promise<HashSt
     opened = openDbWithBusyRetry(storePath, budget);
   }
   let db = opened.db;
-  if (!isHealthy(db)) {
+  // WHY: (#87c) WHICH integrity check an open pays follows from the stamp, because the stamp is the
+  // WHY: store's own record that its provenance is current. `existed` is read before the open and
+  // WHY: cleared by either recovery path below, so a store this open CREATED — or just rebuilt after
+  // WHY: quarantine — is never handed to the header check: it has no settled identity yet, and the
+  // WHY: open is already doing the expensive work. Both arms fence the same single failure shape,
+  // WHY: `false`, so the recovery below is shared rather than duplicated per check.
+  const stampTrusted = existed && !opened.stampDue;
+  if (stampTrusted ? !smokeCheckStoreFile(storePath) : !isHealthy(db)) {
     shutdownDb(db);
     await quarantineStore(storePath);
     existed = false;

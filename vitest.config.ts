@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 /**
  * Test-harness hardening (#84). This suite is I/O- and subprocess-heavy: 204 files, each opening the
@@ -56,5 +56,11 @@ export default defineConfig({
     setupFiles: ["./test/support/isolate-store.ts"],
     testTimeout: 20_000,
     hookTimeout: 30_000,
+    // WHY: (#87) a scratch *.test.ts under a tmp/ or temp/ anywhere — root or nested — joined the suite
+    // WHY: and failed the gate on a clean tree. Spread the defaults, never hand-roll: an upgrade cannot
+    // WHY: silently drop one. This exclude is PROTECTIVE (`**/`), deliberately broader than the
+    // WHY: CONSERVATIVE root-anchored `/tmp/` in .gitignore: its narrow form must not hide a
+    // WHY: legitimately-named nested tmp/ inside a source tree.
+    exclude: [...configDefaults.exclude, "**/tmp/**", "**/temp/**"],
   },
 });
