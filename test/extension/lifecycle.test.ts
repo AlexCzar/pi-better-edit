@@ -4,8 +4,24 @@ import { upsertServed, getServed } from "../../src/served-session/index.js";
 import { upsertSnapshot, getSnapshot, snapshotHashFor } from "../../src/snapshot-store";
 import { withTempDir } from "../support/fixtures";
 
+/**
+ * WHY a per-event LIST and not a `Map<event, handler>`: the extension API ACCUMULATES registrations,
+ * so a second `pi.on("session_start", …)` ADDS a handler rather than replacing one. Measured, not
+ * assumed — `node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js` implements
+ * `on(event, handler)` as `const list = extension.handlers.get(event) ?? []; list.push(handler);
+ * extension.handlers.set(event, list)`, and `runner.js` dispatches one event by looping
+ * `for (const handler of handlers)` (its own comment: "A single extension may register multiple
+ * handlers for the same event"). A probe against that loader and runner registered two
+ * `session_start` handlers and both ran.
+ *
+ * WHY it is load-bearing HERE: the entry point registers THREE `session_start` handlers — #165's
+ * session capture inside `regEdit`, the lifecycle hook's session-start work, and (since #90) the
+ * store janitor's pass. The last-write-wins `Map` this helper used to hold let the janitor's
+ * registration SHADOW the handler under test, so the notify assertion below read zero calls against
+ * a host that calls every handler. Collapsing registrations is not a simplification; keep the list.
+ */
 function makeLifecyclePi() {
-  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
   const commands = new Map<string, { handler: (...args: unknown[]) => unknown }>();
   const notify = vi.fn();
   let activeTools: string[] = [];
@@ -14,15 +30,43 @@ function makeLifecyclePi() {
     registerCommand(name: string, def: { handler: (...args: unknown[]) => unknown }) {
       commands.set(name, def);
     },
+    // WHY: `loader.js`'s `on`, in effect — append to the event's list, never replace it.
     on(event: string, handler: (...args: unknown[]) => unknown) {
-      handlers.set(event, handler);
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
     },
     getActiveTools: () => activeTools,
     setActiveTools(tools: string[]) {
       activeTools = tools;
     },
   } as any;
-  return { pi, handlers, commands, notify, getActiveTools: () => activeTools };
+  /**
+   * Dispatch `event` the way the host does (`runner.js`'s `emit`): EVERY handler registered for it,
+   * in registration order. Driving one handler lifted out of the map would re-open the exact
+   * fidelity gap this harness was fixed for.
+   *
+   * WHY the throws are collected and re-raised instead of swallowed: the host keeps one bad handler
+   * from cancelling its siblings (it runs the rest, then reports through `emitError`), so the loop
+   * must finish — but a handler that throws is a broken extension, so the failure must still reach
+   * the test rather than vanish behind a silently-absent side effect.
+   */
+  const emit = async (event: string, ...args: unknown[]): Promise<void> => {
+    const registered = handlers.get(event) ?? [];
+    // WHY: emitting an event nothing subscribed to would let every assertion below pass vacuously.
+    if (registered.length === 0) throw new Error(`no handler registered for "${event}"`);
+    const failures: unknown[] = [];
+    for (const handler of registered) {
+      try {
+        await handler(...args);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, `handlers for "${event}" threw`);
+  };
+  return { pi, handlers, commands, notify, getActiveTools: () => activeTools, emit };
 }
 
 async function registerExtension(pi: any) {
@@ -33,12 +77,11 @@ async function registerExtension(pi: any) {
 describe("session_start lifecycle", () => {
   it("leaves the active tool set untouched (the extension owns the edit name)", async () => {
     await withTempDir("lifecycle-tools-", async (dir) => {
-      const { pi, handlers } = makeLifecyclePi();
+      const { pi, emit } = makeLifecyclePi();
       pi.setActiveTools(["read", "edit", "write", "bash"]);
       await registerExtension(pi);
-      const sessionStart = handlers.get("session_start");
-      expect(sessionStart).toBeDefined();
-      await sessionStart!({}, { cwd: dir, ui: { notify: vi.fn() } });
+      // WHY: the whole event, as the host emits it — three handlers subscribe to `session_start`.
+      await emit("session_start", {}, { cwd: dir, ui: { notify: vi.fn() } });
       expect(pi.getActiveTools()).toEqual(["read", "edit", "write", "bash"]);
     });
   });
@@ -47,10 +90,9 @@ describe("session_start lifecycle", () => {
     vi.stubEnv("PI_HASHLINE_DEBUG", "1");
     try {
       await withTempDir("lifecycle-debug-", async (dir) => {
-        const { pi, handlers, notify } = makeLifecyclePi();
+        const { pi, notify, emit } = makeLifecyclePi();
         await registerExtension(pi);
-        const sessionStart = handlers.get("session_start")!;
-        await sessionStart({}, { cwd: dir, ui: { notify } });
+        await emit("session_start", {}, { cwd: dir, ui: { notify } });
         expect(notify).toHaveBeenCalledWith("Hashline Edit mode active", "info");
       });
     } finally {
@@ -62,10 +104,9 @@ describe("session_start lifecycle", () => {
     vi.stubEnv("PI_HASHLINE_DEBUG", "0");
     try {
       await withTempDir("lifecycle-quiet-", async (dir) => {
-        const { pi, handlers, notify } = makeLifecyclePi();
+        const { pi, notify, emit } = makeLifecyclePi();
         await registerExtension(pi);
-        const sessionStart = handlers.get("session_start")!;
-        await sessionStart({}, { cwd: dir, ui: { notify } });
+        await emit("session_start", {}, { cwd: dir, ui: { notify } });
         expect(notify).not.toHaveBeenCalled();
       });
     } finally {
@@ -90,10 +131,9 @@ describe("session_start lifecycle", () => {
         content: "keep\n",
       });
 
-      const { pi, handlers } = makeLifecyclePi();
+      const { pi, emit } = makeLifecyclePi();
       await registerExtension(pi);
-      const sessionStart = handlers.get("session_start")!;
-      await sessionStart({}, { cwd: dir, ui: { notify: vi.fn() } });
+      await emit("session_start", {}, { cwd: dir, ui: { notify: vi.fn() } });
 
       expect(getServed(store, "sessionA", keep)).toEqual(["abcc"]);
       expect(getSnapshot(store, keep, "keep\n")).toEqual(["abcc"]);
