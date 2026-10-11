@@ -410,11 +410,29 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
 // WHY:     stamp at all — mismatches, re-sweeps, and re-stamps its own view; the other build then
 // WHY:     mismatches in turn. Fail-safe and merely slower: they alternate between the slow and fast
 // WHY:     paths instead of either one trusting a stamp it did not write.
-// WHY: (c) ROW-LEVEL POISONING: the deliberate trade. The sweep is an upgrade/migration action now, not
-// WHY:     a per-open one, so a row poisoned AFTER the sweep that stamped the store is not removed by a
-// WHY:     stamp-matching reopen. Periodic re-sweeping belongs to the janitor, and the readers that
-// WHY:     consume this state are generation-gated regardless — the trade is bounded latency, not a
-// WHY:     wrongly trusted row.
+// WHY: (c) ROW-LEVEL POISONING: the deliberate trade, and the DURATION of the exposure. The sweep is an
+// WHY:     upgrade/migration action now, not a per-open one, so a row poisoned AFTER the sweep that
+// WHY:     stamped the store is not removed by a stamp-matching reopen. What this changes is WHEN foreign
+// WHY:     rows can exist, never WHETHER they can:
+// WHY:     - TODAY'S BOUND, the only deterministic one: the next stamp-invalidating event — a generation
+// WHY:       or schema bump, an ADDITIONAL open hook, or a fresh store. Nothing else bounds it until the
+// WHY:       periodic bound lands.
+// WHY:     - PERIODIC BOUND: DESIGN-COMMITTED AND NOT YET IMPLEMENTED. Issue #90 records it — GC on
+// WHY:       lifecycle events only, throttled to at most about once a day, never on the tool-call open
+// WHY:       path, with batched deletes, `wal_checkpoint(TRUNCATE)` on close and a live-store guard. That
+// WHY:       design is NOT yet in `docs/` (#90 should land it there or as an ADR before this comment can
+// WHY:       cite it as a commitment rather than as an intention).
+// WHY:     - TRIGGER: operator action only — a hand-edited store, or a copy taken from one. Nothing in
+// WHY:       normal operation reaches it.
+// WHY:     WHY THE TRADE IS SURVIVABLE: no honoring path trusts a stored row without re-deriving from the
+// WHY:       bytes it is about. A lease is generation-gated AT USE TIME (`isCurrentAnchorGeneration` on
+// WHY:       the lease's own 3-part `served_snapshot_hash`, `src/mutation-engine/edit-source.ts`), and its
+// WHY:       resolved span must clear the MVCC contiguity gate (`verifyRebasedSpan` -> `E_STALE_RANGE`,
+// WHY:       `src/hashline/served-verification.ts`), whose line identities come from the CURRENT content's
+// WHY:       own lineage (`positionsByIdentity`). The served mirror decides no identity either: it feeds
+// WHY:       an evidence-only scan of the lines about to be written (`findServedHashEcho`,
+// WHY:       `src/hashline/apply.ts`) and, through `retired`, a refusal set. A stale row's worst case is
+// WHY:       therefore a MISS or a fail-closed refusal, never a wrongly honored line identity.
 // WHY: (d) `BEGIN IMMEDIATE` CANNOT NEST: the sweep keeps its own in-transaction guard, so a caller
 // WHY:     already inside a transaction still absorbs the sweep instead of opening a second one.
 // WHY: (e) The open hooks' `existed` flag keeps its meaning — computed once in `openStore`, cleared on
