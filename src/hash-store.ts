@@ -85,7 +85,7 @@ function sleepSync(ms: number): void {
 
 // WHY: (#87b) the retry policy below REFRAMES the defect, which was never a missing timeout.
 // WHY: `node:sqlite`'s `timeout` constructor option IS SQLite's busy handler — `PRAGMA busy_timeout`
-// WHY: reports it back verbatim ({ timeout: 250 } reads 250, no option at all reads 0) — so no pragma was
+// WHY: reports it back verbatim ({ timeout: 250 } reads 250, probe-measured: no option at all reads 0) — so no pragma was
 // WHY: absent here and adding one would install a second, competing budget. The real defect was an
 // WHY: IMPLICIT, OVERSIZED, UNIFORM one: every attempt could sit blocked and silent for a full
 // WHY: second, there were four of them, and the gap between them was one fixed 100ms, so writers
@@ -101,7 +101,7 @@ function sleepSync(ms: number): void {
 // WHY: 250ms rather than the previous 1000ms: the contended critical section is one short WAL write
 // WHY: transaction, so a second of blocked silence DWARFED the thing being waited for, and four such
 // WHY: silences made a contended open indistinguishable from a hang.
-// WHY: Eight samples at 250ms buy back the patience the old 4 x 1000 + 3 x 100 shape had — the SAME
+// WHY: Eight attempts at 250ms buy back the patience the old 4 x 1000 + 3 x 100 shape had — the SAME
 // WHY: 4300ms model — so the two shapes cannot be told apart by aggregate duration; the tests below
 // WHY: separate them by attempt count and by per-attempt stall, which the shapes DO differ in.
 // WHY: the model is what the constants were chosen against, not what an attempt costs. SQLite returns
@@ -180,11 +180,10 @@ export function resolveBusyBudget(overrides?: BusyBudget): Required<BusyBudget> 
   return {
     timeoutMs: overrides?.timeoutMs ?? HASH_STORE_BUSY_TIMEOUT,
     // SAFETY: DEFENSIVE, not the mechanism: the loop's own `attempt >= maxAttempts - 1` guard throws
-    // SAFETY: after the FIRST failed attempt for any maxAttempts <= 1, so the single attempt belongs to
-    // SAFETY: the loop. MEASURED by dropping this floor and injecting 0 and -1: each still makes exactly
-    // SAFETY: ONE attempt and rethrows the ORIGINAL error object unchanged (errcode 5). What the floor
-    // SAFETY: buys is a sane RESOLVED model — `resolveBusyBudget` 0 -> 1 attempt and -1 -> 1, and
-    // SAFETY: `busyBudgetMs` 0 -> 250ms and -250 -> 250ms — so no caller reads a non-positive deadline.
+    // SAFETY: after the FIRST failed attempt for any maxAttempts <= 1, so the single attempt is
+    // SAFETY: guaranteed by the loop itself. What the floor buys is a sane RESOLVED model —
+    // SAFETY: `resolveBusyBudget` maps 0 -> 1 attempt and -1 -> 1, and `busyBudgetMs` maps
+    // SAFETY: 0 -> 250ms and -250 -> 250ms — so no caller reads a non-positive deadline.
     maxAttempts: Math.max(1, Math.trunc(overrides?.maxAttempts ?? BUSY_MAX_ATTEMPTS)),
     backoffBaseMs: overrides?.backoffBaseMs ?? BUSY_BACKOFF_BASE_MS,
     backoffCapMs: overrides?.backoffCapMs ?? BUSY_BACKOFF_CAP_MS,
