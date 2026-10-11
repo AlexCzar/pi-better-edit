@@ -116,8 +116,18 @@ mutation **is** the review — no second adversarial pass is owed.
 ### (e) Tip-binding
 
 A green must be able to fail for the reason it exists — **that the tree moved**. Bind every result to
-`git rev-parse HEAD` and to the tracked-tree fingerprint, `git diff-index --quiet HEAD` (exit 0 = no tracked path
-differs from `HEAD`, staged or unstaged).
+`git rev-parse HEAD` and to the tree fingerprint, which has **two halves**: the tracked tree,
+`git diff-index --quiet HEAD` (exit 0 = no tracked path differs from `HEAD`, staged or unstaged), and the
+untracked/ignored residue, `git ls-files --others --ignored --exclude-standard` — captured before the window and diffed
+after, because `git status` reports clean exactly when the residue is gitignored. The residue's pass condition is the
+**conditional** form, not emptiness: **no added line that is not an output of the gate's own commands**, attributed by
+directory — `coverage/` (`test:coverage`, 93 lines), `.husky/_/` (17) and `dist/` (1) from the `prepare` lifecycle, and
+the tooling's own cache under `node_modules/.cache/`. Measured in a fresh clone: the listing starts at 0,
+`pnpm install` takes it to 31,677 (18 of them outside `node_modules/` — `.husky/_/` 17, `dist/` 1), the gate's own
+commands add one more (the jiti cache line) and remove none, and `test:coverage` adds 93 under `coverage/`. A count
+would measure that listing's size: 31,678 after the gate in the clone, 33,444 in this long-lived worktree, 33,217 of it
+`node_modules` — so **emptiness measures the environment while the diff measures the window** — which is why the
+instrument is a baseline diff.
 
 This one is in the list because it fails by **false attestation** rather than by a wrong number: a stale green is
 not caught by the next measurement, it is *quoted* by the next reader.
@@ -257,4 +267,5 @@ reddens — and a doc in which every section passes by construction is the versi
 
 `pnpm run lint` (oxlint + `knip --max-issues`) · `pnpm run format` (oxfmt `--check`) · `pnpm run typecheck` (tsc
 `--noEmit`) · `pnpm run test:coverage` (vitest + thresholds) · `uv run python scripts/changelog-gate.py ledger
---landing squash` · the two residue scans and `git diff-index --quiet HEAD` above · `git ls-remote --heads origin <branch>`.
+--landing squash` · the two residue scans, `git diff-index --quiet HEAD`, and `git ls-files --others --ignored
+--exclude-standard` above · `git ls-remote --heads origin <branch>`.
