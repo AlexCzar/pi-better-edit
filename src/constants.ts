@@ -81,9 +81,12 @@ export const SERVED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // WHY: "enforced on every open" no longer holds across the deferred window.
 // WHY: WHY THE TIMER IS THE CHEAPER OF THE TWO: the guard it skips is an existence read with NO usable
 // WHY: index — `served` is keyed `(session_id, path)` and the predicate is on `updated_at` — so when
-// WHY: nothing is expired (the fast path's case) it scans the whole mirror. Measured medians, n=9, on
-// WHY: this machine: 0.04ms at 1,000 rows, 0.71ms at 20,000, 1.77ms at 50,000, versus 0.002ms when
-// WHY: something IS expired (that scan stops at the first hit). The timer bounds that per-open cost
+// WHY: nothing is expired (the fast path's case) it scans the whole mirror. Measured medians of that
+// WHY: read — n=9 batches of 200 calls, 2026-10-11, Apple M1 Pro, macOS 15.1.1, node v26.8.1, loadavg
+// WHY: 4.84 7.19 8.61 at the start of the run, rows as the mirror holds them (`hashes` `'[]'`,
+// WHY: 60-65 B/row) — 0.037ms at 1,000 rows, 0.72ms at 20,000, 2.36ms at 50,000, versus 0.0014ms when
+// WHY: something IS expired (that scan stops at the first hit). The statement for every figure is
+// WHY: `SELECT 1 AS one FROM served WHERE updated_at < ? LIMIT 1`. The timer bounds that per-open cost
 // WHY: however large the mirror grew, which is the property a lock-free open needs.
 // WHY: #90 owns the cadence: it is handed this constant as a knob, and its GC design (lifecycle events,
 // WHY: throttled, never on the tool-call open path) is where the number should finally be tuned.

@@ -460,8 +460,12 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
 // WHY:       `src/hashline/served-verification.ts`), whose line identities come from the CURRENT content's
 // WHY:       own lineage (`positionsByIdentity`). The served mirror decides no identity either: it feeds
 // WHY:       an evidence-only scan of the lines about to be written (`findServedHashEcho`,
-// WHY:       `src/hashline/apply.ts`) and, through `retired`, a refusal set. A stale row's worst case is
-// WHY:       therefore a MISS or a fail-closed refusal, never a wrongly honored line identity.
+// WHY:       `src/hashline/apply.ts`) and, through `retired`, the set of anchors the RESULT may not be
+// WHY:       ASSIGNED to: `loadBlockedHashes` hands them to the identity as `blockedHashes`, and
+// WHY:       `markHashUsed` pre-marks those slots, so no line of the new content is given one. A
+// WHY:       retired anchor is never refused — only never re-assigned — so it decides no identity
+// WHY:       either. A stale row's worst case is a MISS or a fail-closed refusal, never a wrongly
+// WHY:       honored line identity.
 // WHY: (d) `BEGIN IMMEDIATE` CANNOT NEST: the sweep keeps its own in-transaction guard, so a caller
 // WHY:     already inside a transaction still absorbs the sweep instead of opening a second one.
 // WHY: (e) The open hooks' `existed` flag keeps its meaning — computed once in `openStore`, cleared on
@@ -953,7 +957,14 @@ async function openStore(storePath: string, budget?: BusyBudget): Promise<HashSt
 
     return { db, engine: "node:sqlite" };
   } finally {
-    // WHY: the hook phase is over — outside this open the persisted stamp decides the sweep again.
+    // WHY: NOT housekeeping, and not defensive tidiness: this clear is what keeps the slot to the hook
+    // WHY: phase. The slot answers one question — "is an open in its hook phase on THIS connection" —
+    // WHY: and leaving it set lets the next ensure on the still-open connection read a spent decision:
+    // WHY: `sweepSettledByOpen` matches the live handle, so an ensure that runs OUTSIDE an open —
+    // WHY: `ensureSnapshotTables` called directly, which is how seven committed tests sweep after moving
+    // WHY: the stamp (`test/integration/undo-generation-bump.test.ts`, "generation bump refuses pre-v3
+    // WHY: anchors") — silently SKIPS the sweep it owes, and the rows it had to remove survive. Delete
+    // WHY: this line and those seven tests fail.
     openStamp = null;
   }
 }

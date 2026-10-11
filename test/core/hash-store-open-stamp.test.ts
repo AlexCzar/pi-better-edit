@@ -22,7 +22,7 @@
  */
 import { describe, expect, it, vi, beforeAll } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -80,6 +80,21 @@ async function withStoreDir(run: (dir: string) => Promise<void>): Promise<void> 
     vi.unstubAllEnvs();
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+/**
+ * A SECOND PATH to the store file of `dir`: the alias is a symlink to `dir`, so the two spellings
+ * resolve to ONE file while `loadHashStore`'s cache — keyed on the path STRING — cannot serve the
+ * next leg from the previous leg's handle. That is what makes every leg of the two-sequential-opens
+ * test below a REAL open, in one process, with no `shutdownHashStore()` between them: the open path's
+ * own shutdown is the only thing that ends the previous connection. A symlink is the platform's only
+ * spelling of one file that survives `path.join`'s normalisation of `.`, `..` and repeated
+ * separators — and the same spelling is asserted to resolve back to the store file itself.
+ */
+async function aliasStoreDir(dir: string): Promise<string> {
+  const alias = join(dir, "alias");
+  await symlink(dir, alias);
+  return alias;
 }
 
 interface StampView {
@@ -220,6 +235,24 @@ function plantForeignGenerationRow(db: DatabaseSync, path: string): void {
 
 function countRows(db: DatabaseSync, sql: string, ...params: (string | number)[]): number {
   return (db.prepare(sql).get(...params) as { n: number }).n;
+}
+
+/**
+ * The statement counts an open owed: what it wrote, and how many write locks it took to do it. They
+ * ride the assertion MESSAGE, so a failure reports the observed counts rather than only the diff.
+ */
+function countsOf(trace: StatementTrace): {
+  beginImmediate: number;
+  sweepDeletes: number;
+  metaUpserts: number;
+  headerStamps: number;
+} {
+  return {
+    beginImmediate: trace.beginImmediate,
+    sweepDeletes: trace.sweepDeletes,
+    metaUpserts: trace.metaUpserts,
+    headerStamps: trace.headerStamps,
+  };
 }
 
 /**
@@ -637,22 +670,6 @@ describe("the stamp is the open's last step (#87d)", () => {
   });
 
   /**
-   * The statement counts the open owed: what it wrote, and how many write locks it took to do it. They
-   * ride the assertion MESSAGE, so a failure reports the observed counts rather than only the diff.
-   */
-  function countsOf(trace: StatementTrace): {
-    beginImmediate: number;
-    sweepDeletes: number;
-    metaUpserts: number;
-    headerStamps: number;
-  } {
-    return {
-      beginImmediate: trace.beginImmediate,
-      sweepDeletes: trace.sweepDeletes,
-      metaUpserts: trace.metaUpserts,
-      headerStamps: trace.headerStamps,
-    };
-  }
 
   /**
    * THE COUNTS: the move must not double the slow path's work. Read on a store whose stamp no longer
@@ -780,6 +797,101 @@ describe("periodic served-mirror prune (#87c)", () => {
       expect(
         reopened.db.prepare("SELECT value FROM meta WHERE key = ?").get(PRUNE_RUN_KEY),
       ).toBeUndefined();
+    });
+  });
+});
+
+/**
+ * #87c — TWO SEQUENTIAL OPENS IN ONE PROCESS, IN BOTH ORDERS, WITH THE SLOT THE HOOK PHASE READS.
+ *
+ * WHY this exists beside "sweeps once and writes the stamp once on the slow path": that test pins what
+ * ONE open owes, and the tests around the `finally` pin that the open's slot is CLEARED when the hook
+ * phase ends. Neither pins the other half of that contract — that `openStamp` is INITIALISED before the
+ * hook loop, so a hook's re-entrant `ensureSnapshotTables` reads the open's in-memory decision rather
+ * than a stamp the open has not written yet. The slot outlives no open, so the contract is only
+ * observable across two opens of one store in one process.
+ *
+ * THE LEGS ARE REAL OPENS OF ONE STORE, AND NO TEST-SIDE SHUTDOWN RUNS BETWEEN THEM. A second
+ * `loadHashStore()` on an unchanged config path is served from the cache, so each leg reaches the
+ * store through a different spelling of its path (`aliasStoreDir`, asserted below to resolve to the
+ * same file). The open path's own shutdown is then the only thing that ends the previous connection —
+ * which is also why the SLOT, not the handle, is what these counts pin.
+ *
+ * RED PROOF: remove `openStamp = stamp` (or move it after the hook loop) and BOTH SLOW legs red — each
+ * reports 2 `BEGIN IMMEDIATE` against 1, and each sweep runs twice: 2 → 6 DELETEs on the fresh store,
+ * 4 → 8 on the store that already has `served_leases`. With neither a slot nor a persisted stamp, the
+ * hook's re-entrant ensure sweeps a second time. Leg 1 fails first, on `beginImmediate`.
+ */
+describe("two sequential opens in one process (#87c)", () => {
+  /**
+   * What a store's FIRST open owes when there is no stamp: one `BEGIN IMMEDIATE` around the sweep, the
+   * sweep's two DELETEs (a fresh build has no `served_leases` table yet, so its lease deletes are not
+   * owed), the version and stamp `meta` upserts, and the header write.
+   */
+  const FIRST_OPEN_LEG = { beginImmediate: 1, sweepDeletes: 2, metaUpserts: 2, headerStamps: 1 };
+  /**
+   * What an open owes when its stamp does NOT match on a store that already has the lease table: the
+   * same again plus the sweep's two `served_leases` deletes.
+   */
+  const SLOW_LEG = { beginImmediate: 1, sweepDeletes: 4, metaUpserts: 2, headerStamps: 1 };
+  /** What an open owes when its stamp DOES match: nothing — the fast path takes no write lock. */
+  const FAST_LEG = { beginImmediate: 0, sweepDeletes: 0, metaUpserts: 0, headerStamps: 0 };
+
+  it("runs slow then fast, then fast then slow, on one store in one process", async () => {
+    await withStoreDir(async (dir) => {
+      const alias = await aliasStoreDir(dir);
+
+      // LEG 1 — SLOW, the store's first open: no stamp, so the sweep's site runs once, the hook's
+      // re-entrant ensure reads the slot instead of the unwritten row, and both halves are stamped.
+      const leg1 = startTrace();
+      await loadHashStore();
+      const leg1Run = leg1.stop();
+      const leg1Counts = countsOf(leg1Run);
+      expect(leg1Counts, `leg 1, fresh store: ${JSON.stringify(leg1Counts)}`).toEqual(
+        FIRST_OPEN_LEG,
+      );
+      expect(
+        schemaEnsureSites(leg1Run),
+        "both ensure sites ran; the gate skipped the second sweep",
+      ).toBe(2);
+      expectCurrentStamp();
+      // The precondition every later leg rests on: the two spellings name ONE store file, not two.
+      expect(await realpath(join(alias, "hash-store.sqlite"))).toBe(
+        await realpath(join(dir, "hash-store.sqlite")),
+      );
+
+      // LEG 2 — the stamp leg 1 wrote matches, so the second open of the same store owes no statement.
+      vi.stubEnv("PI_BETTER_EDIT_CONFIG_DIR", alias);
+      const leg2 = startTrace();
+      const store = await loadHashStore();
+      const leg2Run = leg2.stop();
+      const leg2Counts = { ...countsOf(leg2Run), writes: leg2Run.writes };
+      expect(leg2Counts, `leg 2, stamp current: ${JSON.stringify(leg2Counts)}`).toEqual({
+        ...FAST_LEG,
+        writes: [],
+      });
+      expect(
+        schemaEnsureSites(leg2Run),
+        "both ensure sites ran; the gate skipped both sweeps",
+      ).toBe(2);
+
+      // LEG 3 — FAST THEN SLOW, on the same store: the header half is moved on leg 2's OWN connection,
+      // outside any open (the slot was cleared when leg 2's hook phase ended). The next open must
+      // notice, and the store still holds the lease table leg 1 built, so this sweep is the full one.
+      store.db.exec("PRAGMA user_version = 0");
+      vi.stubEnv("PI_BETTER_EDIT_CONFIG_DIR", dir);
+      const leg3 = startTrace();
+      await loadHashStore();
+      const leg3Run = leg3.stop();
+      const leg3Counts = countsOf(leg3Run);
+      expect(leg3Counts, `leg 3, header half moved: ${JSON.stringify(leg3Counts)}`).toEqual(
+        SLOW_LEG,
+      );
+      expect(
+        schemaEnsureSites(leg3Run),
+        "both ensure sites ran; the gate skipped the second sweep",
+      ).toBe(2);
+      expectCurrentStamp();
     });
   });
 });
