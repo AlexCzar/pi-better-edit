@@ -466,7 +466,7 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
 // WHY:       day, never on the tool-call open path, with batched deletes and a live-store guard. It
 // WHY:       reuses the SAME predicates this sweep runs (the exported `*_SQL` constants below), so
 // WHY:       an open-time sweep and a periodic one remove one set of rows. Load-bearing design is
-// WHY:       therefore in the code, not in prose; the ADR/docs half of #90 is not written yet.
+// WHY:       therefore in the code, not in prose.
 // WHY:     - TRIGGER: operator action only — a hand-edited store, or a copy taken from one. Nothing in
 // WHY:       normal operation reaches it.
 // WHY:     WHY THE TRADE IS SURVIVABLE: no honoring path trusts a stored row without re-deriving from the
