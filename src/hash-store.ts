@@ -413,14 +413,15 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
     } catch {
       db.exec(`ALTER TABLE ${table} ADD COLUMN anchor_generation INTEGER NOT NULL DEFAULT 0`);
       db.exec(`UPDATE ${table} SET anchor_generation = canon_version`);
-      // SAFETY: the RENAME fallback tolerates a store that keeps both columns — the DROP
-      // SAFETY: fails on SQLite builds without DROP COLUMN support, and a both-columns store is
-      // SAFETY: inert: every v7 reader/writer names `anchor_generation` only, and the leftover
-      // SAFETY: `canon_version` values were already copied over by the UPDATE above, so the stale
-      // SAFETY: column is never read. A concurrently open pre-rename process whose prepared
-      // SAFETY: statement names `canon_version` breaks fail-closed on its next step (same failure
-      // SAFETY: class as the v6 `canons` guard below) — exposure is the unreleased intermediate
-      // SAFETY: build only; see ADR-0031 §4.
+      // SAFETY: the RENAME fallback tolerates a store that keeps both columns — the DROP is refused
+      // SAFETY: whenever SQLite cannot drop the column at all (measured on this runtime, which DOES
+      // SAFETY: support DROP COLUMN: an index naming the column refuses it with `error in index ...
+      // SAFETY: after drop column`), and a both-columns store is inert: every v7 reader/writer names
+      // SAFETY: `anchor_generation` only, and the leftover `canon_version` values were already copied
+      // SAFETY: over by the UPDATE above, so the stale column is never read. A concurrently open
+      // SAFETY: pre-rename process whose prepared statement names `canon_version` breaks fail-closed
+      // SAFETY: on its next step (same failure class as the v6 `canons` guard in `buildStore`) —
+      // SAFETY: exposure is the unreleased intermediate build only; see ADR-0031 §4.
       try {
         db.exec(`ALTER TABLE ${table} DROP COLUMN canon_version`);
       } catch {}
