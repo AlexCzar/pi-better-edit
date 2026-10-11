@@ -1,6 +1,7 @@
 import { readFileSync } from "fs";
 import { describe, expect, it } from "vitest";
 import register from "../../index";
+import { JANITOR_EVENTS } from "../../src/store-janitor";
 
 describe("extension registration", () => {
   it("registers the read and edit tools", () => {
@@ -24,17 +25,26 @@ describe("extension registration", () => {
     expect(toolNames.sort()).toEqual(["edit", "read", "undo_last_edit"]);
     expect(commandNames).toEqual(["pi-better-edit"]);
 
-    // WHY: (#165) two session_start listeners: regEdit captures the session for the preview pane,
-    // WHY: the lifecycle hook handles session resets. Two tool_call listeners: the pre-write served
-    // WHY: hash echo guard and the search line-number injection (spec §3.1); they filter by tool name
-    // WHY: independently, so order is not load-bearing.
-    expect(eventNames.sort()).toEqual([
+    // WHY: the extension's own subscriptions, one entry per `pi.on` site in `index.ts`'s factory.
+    // WHY: TWO `session_start` here — (#165) regEdit captures the session for the preview pane and
+    // WHY: the lifecycle hook does the session-start work; the janitor's is the third, and comes
+    // WHY: from `JANITOR_EVENTS` below. TWO `tool_call`: the pre-write served hash echo guard and the
+    // WHY: search line-number injection (spec §3.1); they filter by tool name independently, so order
+    // WHY: is not load-bearing.
+    const extensionSubscriptions = [
       "session_start",
       "session_start",
       "tool_call",
       "tool_call",
       "tool_result",
-    ]);
+    ];
+    // WHY exact equality and not containment: this case IS the registration contract, in the same
+    // WHY shape as the tool and command assertions above. A new subscription widens the extension's
+    // WHY surface, so it must fail here and be added deliberately rather than arrive unnoticed.
+    // WHY the janitor's half is read from `JANITOR_EVENTS` instead of written out again: those two
+    // WHY registrations are the module's own export, and a second literal here could disagree with
+    // WHY the module's loop while both stayed green.
+    expect(eventNames.sort()).toEqual([...extensionSubscriptions, ...JANITOR_EVENTS].sort());
   });
 });
 
