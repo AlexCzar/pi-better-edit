@@ -1072,9 +1072,9 @@ function shutdownDb(db: DatabaseSync): void {
  * store already known to be damaged.
  *
  * WHY it is HONEST on a LIVE store: the recovery is the open path's, quoted here as the sequence it
- * is — `shutdownDb(db)`, `await quarantineStore(storePath)`, `openDbWithBusyRetry(storePath)` — and
- * every piece of state it drops is re-derivable, because the store is a disposable cache: the served
- * mirror, the snapshots and their lineage are all rebuilt from the files on disk. What it does NOT
+ * is — `shutdownHashStore`, then `quarantineStore`, then `openStore` — and every piece of state it
+ * drops is re-derivable, because the store is a disposable cache: the served mirror, the snapshots
+ * and their lineage are all rebuilt from the files on disk. What it does NOT
  * do is reach a second REPAIR path (there is exactly one, and this function only invokes it), and it
  * does NOT touch a store that is currently inside a transaction of its own: the janitor runs at a
  * lifecycle boundary, where no tool call of this session is in flight, and any statement prepared on
