@@ -917,6 +917,17 @@ function smokeCheckStoreFile(storePath: string): boolean {
     fd = openSync(storePath, "r");
     // SAFETY: allocUnsafe is safe here because readSync fills all 100 bytes before any of them is
     // SAFETY: read — the `read < SQLITE_HEADER_BYTES` guard below rejects a short read first.
+    // WHY: kept on purpose, uncovered though they are (#87c). The short-read guard, the magic
+    // WHY: comparison, the page-size range check and its power-of-two test are this check's ONLY
+    // WHY: arms whose refusal body never runs — in a whole-suite coverage run at 17f7e14 those
+    // WHY: four return statements execute 0 times while the four conditions run 601 times — and
+    // WHY: they are uncovered because NO SEAM REACHES THEM: SQLite's own first read of the file
+    // WHY: refuses every file they guard, so a file that would trip one never arrives here.
+    // WHY: Measured at 17f7e14, in a /tmp copy: deleting all four leaves the focused file green
+    // WHY: (11 tests) and the whole suite green (2264 passed | 2 skipped, the unchanged baseline).
+    // WHY: Do NOT delete them on that evidence; re-measure first. They are defence in depth —
+    // WHY: unreachable only while SQLite keeps refusing a malformed header at first read, and live
+    // WHY: work again the day a version stops — so four uncovered arms here are a KEPT decision.
     const header = Buffer.allocUnsafe(SQLITE_HEADER_BYTES);
     const read = readSync(fd, header, 0, SQLITE_HEADER_BYTES, 0);
     if (read < SQLITE_HEADER_BYTES) return false;
@@ -927,6 +938,13 @@ function smokeCheckStoreFile(storePath: string): boolean {
     if (pageSize < SQLITE_MIN_PAGE_SIZE || pageSize > SQLITE_MAX_PAGE_SIZE) return false;
     if ((pageSize & (pageSize - 1)) !== 0) return false;
     const pageCount = header.readUInt32BE(SQLITE_PAGE_COUNT_OFFSET);
+    // WHY: NOT one of the four above, and NOT uncovered: this arm's refusal body DID run (1
+    // WHY: execution in that same suite run). Deleting it is nonetheless invisible, for an
+    // WHY: ARITHMETIC reason instead — the length rule below refuses the same file by itself,
+    // WHY: because `pageSize * 0` is 0 and no store file's size equals 0 (measured in the /tmp
+    // WHY: copy with this line deleted: page size 4096, a 163840-byte store, still quarantined).
+    // WHY: FIVE arms here are invisible to mutation; only the four above are UNCOVERED. Coverage
+    // WHY: and mutation-sensitivity are different properties.
     if (pageCount === 0) return false;
     return fstatSync(fd).size === pageSize * pageCount;
   } catch {
