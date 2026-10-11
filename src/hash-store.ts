@@ -1046,11 +1046,11 @@ function shutdownDb(db: DatabaseSync): void {
  * the closed connection afterwards fails closed on the reopened one's absence rather than silently
  * reading a dead handle.
  *
- * WHAT IT DOES NOT RESTORE, stated rather than implied: the rebuilt connection is published through
- * `openStore`, but at the time this returns the store is fresh — its open hooks have run, and the
- * build that ran them writes no stamp of its own (`buildStore` never does; `openStore` writes it
- * after the LAST hook), so the next open takes the slow path. That is the SAME direction as any other
- * rebuild from empty, never a fast path over an unfinished store.
+ * WHAT IT LEAVES BEHIND, stated rather than implied: because the rebuild goes through `openStore`
+ * and not around it, the store comes back COMPLETE — hooks run, the stamp written after them — so the
+ * next open of that path takes the fast path over a store that really is current. The one handle this
+ * leaves stale is the caller's own `db` argument, which the recovery closes: a caller must re-read the
+ * store (`loadHashStore`) rather than reuse the connection it passed in.
  */
 export async function healUnhealthyStore(budget?: BusyBudget): Promise<boolean> {
   const current = cachedDb;
