@@ -372,14 +372,31 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
   db.exec(`ALTER TABLE ${table} ADD COLUMN anchor_generation INTEGER NOT NULL DEFAULT 0`);
 }
 
-// WHY: (#87c) the open stamp — the store's own TWO-PART record that both its schema and the generation
-// WHY: its persisted anchors were derived under are current, which is what lets an open skip the
-// WHY: generation sweep and the version upsert ENTIRELY. The halves cost differently: `PRAGMA`
-// WHY: `user_version` is a database header field, so reading it needs no query and no lock, while
-// WHY: the generation half is one indexed single-row read of `meta`. The version row is part of the
-// WHY: gate even though it carries no new information, because the fast path SKIPS the upsert that
-// WHY: maintains it: a gate that ignored the row could leave a deleted one unrestored for as long as
-// WHY: the rest of the stamp matched.
+// WHY: (#87c) the open stamp — the store's own record that its schema, the generation its persisted
+// WHY: anchors were derived under, and the BUILD that wrote it all agree with the one reading it.
+// WHY: It is carried as the header field `PRAGMA user_version` (free: no query, no lock) plus one
+// WHY: indexed read of `meta`. The version row is part of the gate even though it carries no new
+// WHY: information, because the fast path SKIPS the upsert that maintains it: a gate that ignored the
+// WHY: row could leave a deleted one unrestored for as long as the rest of the stamp matched.
+// WHY: The value is a VERSIONED FORMAT and carries IDENTITY only:
+// WHY:     <format>:<store schema>:<canon>:<anchor generation>:<registered open hooks>
+// WHY: - the LEADING field is the format version: bump it when the field list below changes shape, so
+// WHY:   every stamp written by the old shape is invalid BY CONSTRUCTION rather than by luck.
+// WHY: - `HASH_STORE_VERSION` is the schema half — `constants.ts` says when it must move.
+// WHY: - `CANON_VERSION` and `ANCHOR_GENERATION` are the persisted anchor set's generation.
+// WHY: - the OPEN-HOOK COUNT is the build fingerprint. The registry is built by module top-level
+// WHY:   pushes, so the count is a function of the BUILD: a build that registers an ADDITIONAL hook
+// WHY:   mismatches every stamp an older build wrote, instead of silently suppressing the new hook's
+// WHY:   work. LIMITATION, stated rather than implied: a SWAP (one hook removed, another added) keeps
+// WHY:   the count, so this guards ADDITION only — a semantic change to an existing hook still needs
+// WHY:   the version bump above. The count is preferred over a hash of the hook list: a hash would
+// WHY:   have to be measured free on the bundled artifact to earn its place, and the count is free by
+// WHY:   construction. A module imported lazily that registers a hook later costs one extra slow open:
+// WHY:   the count moves, the stamp mismatches, and the next open re-stamps.
+// WHY: NO TIME-VARYING STATE IS FOLDED IN. Due-ness instants — the periodic served-mirror prune's
+// WHY: last-run row, the janitor's schedule — live in their OWN `meta` rows. Folding one in would
+// WHY: conflate "the store's identity changed" with "maintenance is due", and a reader could not tell
+// WHY: from a mismatch WHY the open took the slow path.
 // WHY: BOTH halves must match, so a half-written stamp can only send the next open down the slow path,
 // WHY: never past it.
 //
@@ -405,9 +422,18 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
 const META_VERSION_KEY = "version";
 const META_STAMP_KEY = "store_stamp";
 
-/** The generation half of the stamp: the axes the persisted anchor set is derived under. */
+/** The stamp's format version — the leading field, bumped only when the field list itself changes. */
+const STAMP_FORMAT_VERSION = 1;
+
+/** The value the gate compares against, in the format documented above. */
 function storeGenerationStamp(): string {
-  return `${CANON_VERSION}:${ANCHOR_GENERATION}`;
+  return [
+    STAMP_FORMAT_VERSION,
+    HASH_STORE_VERSION,
+    CANON_VERSION,
+    ANCHOR_GENERATION,
+    openHooks.length,
+  ].join(":");
 }
 
 /**

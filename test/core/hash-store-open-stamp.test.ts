@@ -32,8 +32,26 @@ import { getWritableTempRoot } from "../support/fixtures";
 const STAMP_KEY = "store_stamp";
 /** The `meta` key holding the last-run instant of the periodic served-mirror prune. */
 const PRUNE_RUN_KEY = "served_prune_at";
-/** The generation half's value: both axes the persisted anchor set is derived under. */
-const STAMP_VALUE = `${CANON_VERSION}:${ANCHOR_GENERATION}`;
+/**
+ * The stamp's documented format — `<format>:<store schema>:<canon>:<anchor generation>:<hooks>` — as a
+ * shape, because the last field is the open-hook count: a build constant the test cannot import (the
+ * registry is module-private and its count is only observable through the stamp it produces).
+ */
+const STAMP_SHAPE = new RegExp(
+  `^1:${HASH_STORE_VERSION}:${CANON_VERSION}:${ANCHOR_GENERATION}:\\d+$`,
+);
+
+/**
+ * Assert the store on disk carries a CURRENT stamp, and return its value so a test can compare it
+ * against what a later open produces (the value must be a build constant, not a per-open value).
+ */
+function expectCurrentStamp(): string {
+  const view = readStamp();
+  expect(view.userVersion).toBe(HASH_STORE_VERSION);
+  expect(view.version).toBe(String(HASH_STORE_VERSION));
+  expect(view.stamp).toMatch(STAMP_SHAPE);
+  return view.stamp as string;
+}
 
 beforeAll(async () => {
   await initHasher();
@@ -186,11 +204,7 @@ describe("stamp-gated open (#87c)", () => {
     await withStoreDir(async (dir) => {
       const store = await loadHashStore();
       plantSnapshot(store, join(dir, "healthy.ts"), "aaa\nbbb\nccc\n");
-      expect(readStamp()).toMatchObject({
-        userVersion: HASH_STORE_VERSION,
-        version: String(HASH_STORE_VERSION),
-        stamp: STAMP_VALUE,
-      });
+      expectCurrentStamp();
       shutdownHashStore();
 
       const release = holdWriteLock();
@@ -231,11 +245,7 @@ describe("stamp-gated open (#87c)", () => {
       // WHY: and BOTH call sites still ran their schema ensure — the gate is what skipped the second
       // WHY: sweep, not a missing second call.
       expect(schemaEnsureSites(firstTrace)).toBe(2);
-      expect(readStamp()).toMatchObject({
-        userVersion: HASH_STORE_VERSION,
-        version: String(HASH_STORE_VERSION),
-        stamp: STAMP_VALUE,
-      });
+      expectCurrentStamp();
 
       shutdownHashStore();
       const second = startTrace();
@@ -247,11 +257,7 @@ describe("stamp-gated open (#87c)", () => {
       expect(secondTrace.sweepDeletes).toBe(0);
       expect(schemaEnsureSites(secondTrace)).toBe(2);
       expect(secondTrace.writes).toEqual([]);
-      expect(readStamp()).toMatchObject({
-        userVersion: HASH_STORE_VERSION,
-        version: String(HASH_STORE_VERSION),
-        stamp: STAMP_VALUE,
-      });
+      expectCurrentStamp();
     });
   });
 
@@ -273,11 +279,7 @@ describe("stamp-gated open (#87c)", () => {
         const store = await loadHashStore();
         plantSnapshot(store, join(dir, "healthy.ts"), "aaa\nbbb\nccc\n");
         plantForeignGenerationRow(store, join(dir, "poisoned.ts"));
-        expect(readStamp()).toMatchObject({
-          userVersion: HASH_STORE_VERSION,
-          version: String(HASH_STORE_VERSION),
-          stamp: STAMP_VALUE,
-        });
+        expectCurrentStamp();
         poison.apply(store.db);
         expect(readStamp()).toMatchObject(poison.mismatched);
         shutdownHashStore();
@@ -304,11 +306,95 @@ describe("stamp-gated open (#87c)", () => {
             "SELECT COUNT(*) AS n FROM line_lineage WHERE snapshot_id NOT IN (SELECT snapshot_id FROM file_snapshots)",
           ),
         ).toBe(0);
-        expect(readStamp()).toMatchObject({
-          userVersion: HASH_STORE_VERSION,
-          version: String(HASH_STORE_VERSION),
-          stamp: STAMP_VALUE,
-        });
+        expectCurrentStamp();
+      });
+    }
+  });
+
+  it("folds the open-hook count into the stamp, so an ADDED hook invalidates it", async () => {
+    // WHY: the registry is built by module top-level pushes, so the count is a function of the BUILD.
+    // WHY: This rewrites the count the way a build registering one MORE hook would leave it: the next
+    // WHY: open must take the slow path — that new hook's work is not certified by the old stamp — and
+    // WHY: then re-stamp its own count. LIMITATION: a swap (one hook out, one in) keeps the count, which
+    // WHY: is why `HASH_STORE_VERSION`'s bump convention still governs semantic changes.
+    await withStoreDir(async () => {
+      const store = await loadHashStore();
+      plantForeignGenerationRow(store, "/poisoned.ts");
+      const count = Number((readStamp().stamp as string).split(":")[4]);
+      expect(Number.isInteger(count)).toBe(true);
+      store.db.exec(
+        `UPDATE meta SET value = '1:${HASH_STORE_VERSION}:${CANON_VERSION}:${ANCHOR_GENERATION}:${count + 1}' WHERE key = '${STAMP_KEY}'`,
+      );
+      shutdownHashStore();
+
+      const trace = startTrace();
+      const reopened = await loadHashStore();
+      const recorded = trace.stop();
+      expect(recorded.beginImmediate).toBe(1);
+      expect(
+        countRows(
+          reopened.db,
+          "SELECT COUNT(*) AS n FROM file_snapshots WHERE anchor_generation != ?",
+          ANCHOR_GENERATION,
+        ),
+      ).toBe(0);
+      expect(expectCurrentStamp()).toBe(
+        `1:${HASH_STORE_VERSION}:${CANON_VERSION}:${ANCHOR_GENERATION}:${count}`,
+      );
+    });
+  });
+
+  it("folds the stamp's FORMAT version in, so changing the field list invalidates old stamps", async () => {
+    // WHY: the leading field exists so a future shape change invalidates every stamp written by the old
+    // WHY: shape BY CONSTRUCTION. This is that claim, exercised: an unknown format takes the slow path.
+    await withStoreDir(async () => {
+      const store = await loadHashStore();
+      plantForeignGenerationRow(store, "/poisoned.ts");
+      const value = readStamp().stamp as string;
+      store.db.exec(
+        `UPDATE meta SET value = '0:${value.split(":").slice(1).join(":")}' WHERE key = '${STAMP_KEY}'`,
+      );
+      shutdownHashStore();
+
+      const trace = startTrace();
+      const reopened = await loadHashStore();
+      const recorded = trace.stop();
+      expect(recorded.beginImmediate).toBe(1);
+      expect(
+        countRows(
+          reopened.db,
+          "SELECT COUNT(*) AS n FROM file_snapshots WHERE anchor_generation != ?",
+          ANCHOR_GENERATION,
+        ),
+      ).toBe(0);
+      expect(expectCurrentStamp()).toBe(value);
+    });
+  });
+
+  it("a stale or future HASH_STORE_VERSION takes the slow path and is rewritten", async () => {
+    // WHY: the schema half of the stamp IS `HASH_STORE_VERSION`, so any change to an owner's
+    // WHY: schema-ensure or gated work that bumps it invalidates every stamp on disk. Both directions
+    // WHY: are checked: a store older than this build and one written by a NEWER build that this one
+    // WHY: must not trust.
+    for (const version of [HASH_STORE_VERSION - 1, HASH_STORE_VERSION + 1]) {
+      await withStoreDir(async () => {
+        const store = await loadHashStore();
+        plantForeignGenerationRow(store, "/poisoned.ts");
+        store.db.exec(`PRAGMA user_version = ${version}`);
+        shutdownHashStore();
+
+        const trace = startTrace();
+        const reopened = await loadHashStore();
+        const recorded = trace.stop();
+        expect(recorded.beginImmediate).toBe(1);
+        expect(
+          countRows(
+            reopened.db,
+            "SELECT COUNT(*) AS n FROM file_snapshots WHERE anchor_generation != ?",
+            ANCHOR_GENERATION,
+          ),
+        ).toBe(0);
+        expect(expectCurrentStamp()).toMatch(STAMP_SHAPE);
       });
     }
   });
@@ -337,11 +423,7 @@ describe("stamp-gated open (#87c)", () => {
       });
 
       await loadHashStore();
-      expect(readStamp()).toMatchObject({
-        userVersion: HASH_STORE_VERSION,
-        version: String(HASH_STORE_VERSION),
-        stamp: STAMP_VALUE,
-      });
+      expectCurrentStamp();
     });
   });
 
@@ -363,7 +445,7 @@ describe("stamp-gated open (#87c)", () => {
       expect(reopened.db.prepare("PRAGMA user_version").get()).toEqual({
         user_version: HASH_STORE_VERSION,
       });
-      expect(readStamp().stamp).toBe(STAMP_VALUE);
+      expectCurrentStamp();
     });
   });
 

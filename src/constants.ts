@@ -58,6 +58,14 @@ export const HASH_STORE_BUSY_TIMEOUT = 250;
 // WHY: `canon_version` breaks fail-closed, and the DROP fallback may leave both columns, inert
 // WHY: (see ADR-0031 §4 and `renameGenerationColumn`). Record-only marker; schema evolution itself
 // WHY: is additive or rename-preserving, never a drop.
+// WHY: (#87c) BUMP THIS CONSTANT whenever any owner's schema-ensure or gated open work changes — a
+// WHY: new table, column or index, a changed ensure, or a changed gate. It is the schema half of the
+// WHY: open stamp (`storeGenerationStamp` in `src/hash-store.ts`), so bumping it invalidates every
+// WHY: stamp already on disk BY CONSTRUCTION and forces the next open down the slow path, which runs the
+// WHY: ensure and re-stamps. A change that does NOT bump it is invisible to a running build — which is
+// WHY: exactly how a store ends up stamped current while missing the object the change added.
+// WHY: A change to the stamp's FIELD LIST instead of its content is `STAMP_FORMAT_VERSION`'s business
+// WHY: (also in `src/hash-store.ts`); an ADDITIONAL open hook is covered by the hook count in the stamp.
 export const HASH_STORE_VERSION = 9;
 export const EDITS_MAX_ITEMS = 32;
 // WHY: the served-lease session TTL: an un-retired lease pins its snapshot for this long, and
