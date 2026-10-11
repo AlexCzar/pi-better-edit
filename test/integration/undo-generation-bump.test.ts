@@ -50,6 +50,23 @@ function rows(text: string): { hash: string; text: string }[] {
   return out;
 }
 
+/**
+ * (#87c) Move the store's open stamp the way a real provenance change does, so the NEXT sweep runs.
+ * The sweep's trigger is a stamp mismatch now: an open whose stamp already matches swept when it wrote
+ * that stamp, so it has nothing left to do and skips it (see the trap-(c) test in
+ * `test/core/hash-store-open-stamp.test.ts`). A test cannot bump `ANCHOR_GENERATION`, so it moves the
+ * stamp instead — which is exactly what a released pre-stamp build leaves behind.
+ */
+function moveStoreStamp(db: HashStore["db"]): void {
+  db.exec("PRAGMA user_version = 0");
+}
+
+/** (#87c) Sweep in place through the schema-ensure seam, with the stamp moved first. */
+function sweepNow(db: HashStore["db"]): void {
+  moveStoreStamp(db);
+  ensureSnapshotTables(db);
+}
+
 async function plantLegacyRow(absPath: string): Promise<void> {
   // WHY: reproduces a pre-bump store — the old code wrote content-only hashes with
   // WHY: a null key and no generation. `upsertUndo` always stamps the current
@@ -327,7 +344,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
         ),
       ).rejects.toThrow(/E_FOREIGN_ANCHOR/);
       expect(await readFile(absB, "utf-8")).toBe(PRE);
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       const left = store.db
         .prepare("SELECT COUNT(*) AS n FROM file_snapshots WHERE path = ?")
         .get(absA) as { n: number };
@@ -431,6 +448,9 @@ describe("generation bump refuses pre-v3 anchors", () => {
       const store = await loadHashStore();
       const v2A = plantV2File(store, absA, PRE);
       plantV2File(store, absB, PRE);
+      // WHY: (#87c) a pre-bump store carries no open stamp, so the reopen below takes the SLOW path —
+      // WHY: which is the path that sweeps the v2 leases just planted.
+      moveStoreStamp(store.db);
       shutdownHashStore();
       await loadHashStore();
       const { getTool, ctx } = setupIntegrationTest(cwd);
@@ -523,7 +543,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
           .get() as { n: number };
         expect(unretiredLineless.n).toBe(0);
       };
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       checkInvariant(store.db);
       // WHY: the live read's leases name the surviving current-generation snapshot.
       const liveKey = snapshotHashFor(PRE);
@@ -603,7 +623,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
       ).n;
       expect(stranded).toBe(liveLeases);
       // WHY: self-healing — the next open's sweep drops the stranded leases.
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       const healed = (
         store.db
           .prepare(
@@ -653,7 +673,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
         )
         .get(ghostAbs, liveKey, ANCHOR_GENERATION) as { snapshot_id: number } | undefined;
       expect(grantMiss).toBeUndefined();
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       const foreignLeft = (
         store.db
           .prepare("SELECT COUNT(*) AS n FROM served_leases WHERE file_path = ?")
@@ -709,7 +729,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
         )
         .get(ghostAbs, liveKey, ANCHOR_GENERATION) as { snapshot_id: number } | undefined;
       expect(grantMiss).toBeUndefined();
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       const ghostLeft = (
         store.db
           .prepare("SELECT COUNT(*) AS n FROM served_leases WHERE file_path = ?")
@@ -751,7 +771,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
       store.db.exec("BEGIN IMMEDIATE");
       expect((store.db as unknown as { isTransaction?: boolean }).isTransaction).toBe(true);
       // WHY: no nested-BEGIN throw — the guard takes the caller-transaction branch.
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       // WHY: the sweep's deletes are present inside the caller's transaction.
       const staleInTxn = (
         store.db
@@ -773,7 +793,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
       expect(staleAfter).toBe(staleBefore);
       expect((store.db as unknown as { isTransaction?: boolean }).isTransaction).toBe(false);
       // WHY: the rolled-back sweep heals on retry — no wedge left behind.
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       const staleHealed = (
         store.db
           .prepare(
@@ -805,7 +825,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
         origExec(sql);
       });
       try {
-        expect(() => ensureSnapshotTables(store.db)).toThrow(/injected mid-sweep failure/);
+        expect(() => sweepNow(store.db)).toThrow(/injected mid-sweep failure/);
       } finally {
         spy.mockRestore();
         consoleSpy.mockRestore();
@@ -841,7 +861,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
         origExec(sql);
       });
       try {
-        expect(() => ensureSnapshotTables(store.db)).toThrow(/injected mid-sweep failure/);
+        expect(() => sweepNow(store.db)).toThrow(/injected mid-sweep failure/);
       } finally {
         spy.mockRestore();
       }
@@ -853,7 +873,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
         (store.db.prepare("SELECT COUNT(*) AS n FROM file_snapshots").get() as { n: number }).n,
       ).toBe(snapsBefore);
       // WHY: a clean retry still sweeps to the invariant — the failure left no wedge.
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       const dangling = (
         store.db
           .prepare(
@@ -875,7 +895,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
       const readTool = getTool("read");
       await readTool.execute("r1", { file: "q.txt" }, undefined, undefined, ctx);
       const store = await loadHashStore();
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       const leasesFirst = (
         store.db.prepare("SELECT COUNT(*) AS n FROM served_leases").get() as { n: number }
       ).n;
@@ -883,7 +903,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
         store.db.prepare("SELECT COUNT(*) AS n FROM file_snapshots").get() as { n: number }
       ).n;
       expect(leasesFirst).toBeGreaterThan(0);
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       expect(
         (store.db.prepare("SELECT COUNT(*) AS n FROM served_leases").get() as { n: number }).n,
       ).toBe(leasesFirst);
@@ -930,6 +950,9 @@ describe("generation bump refuses pre-v3 anchors", () => {
       ).n;
       expect(leasesBefore).toBeGreaterThan(0);
       const storePath = hashStorePath();
+      // WHY: (#87c) the sweep is what the read-only handle must abort, and only a stamp mismatch asks
+      // WHY: for one — move the stamp while the handle is still writable.
+      moveStoreStamp(store.db);
       shutdownHashStore();
       const readOnly = new DatabaseSync(storePath, { readOnly: true });
       try {
@@ -976,7 +999,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
       expect(isCurrentAnchorGeneration(`2:${cs}`)).toBe(false);
       expect(isCurrentAnchorGeneration(snapshotHashFor(PRE))).toBe(true);
       // WHY: sweep-level — the canon-drift row survives, the generation-drift row goes.
-      ensureSnapshotTables(store.db);
+      sweepNow(store.db);
       const left = store.db
         .prepare("SELECT snapshot_hash AS h FROM file_snapshots WHERE path = ?")
         .all(absK) as { h: string }[];

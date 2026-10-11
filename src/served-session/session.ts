@@ -11,13 +11,15 @@
 import { DatabaseSync } from "node:sqlite";
 import { HASH_RE } from "../hashline/alphabet.js";
 import { ANCHOR_GENERATION } from "../hashline/hash.js";
-import { SERVED_TTL_MS } from "../constants.js";
+import { SERVED_TTL_MS, SERVED_PRUNE_INTERVAL_MS } from "../constants.js";
 import {
   loadHashStore,
   onStoreOpen,
   withStore,
   withBusyRetry,
   getCached,
+  markPeriodicRun,
+  periodicDue,
   type HashStore,
 } from "../hash-store.js";
 // WHY: snapshot retention is owned by the CAS store that owns `file_snapshots` (spec §3.6.1); the
@@ -61,6 +63,11 @@ interface ServedStmts {
   servedDeletePath: (path: string) => void;
   servedWipe: (sessionKey: string) => void;
   servedPruneOlderThan: (updatedBefore: number) => void;
+  /**
+   * Whether the TTL prune has anything to delete — the SAME predicate and the SAME cutoff as
+   * `servedPruneOlderThan`, asked as a read so a due-but-empty run takes no write lock (#87c).
+   */
+  servedExpiredExists: (updatedBefore: number) => boolean;
   snapshotByHash: (path: string, snapshotHash: string) => LeaseSnapshot | undefined;
   lineageAnchorsOf: (snapshotId: number) => LeaseLineageRow[];
   leaseUpsertMany: (
@@ -197,6 +204,12 @@ function buildStmts(db: DatabaseSync): ServedStmts {
   const servedDeletePathStmt = db.prepare("DELETE FROM served WHERE path = ?");
   const servedWipeStmt = db.prepare("DELETE FROM served WHERE session_id = ?");
   const servedPruneOlderThanStmt = db.prepare("DELETE FROM served WHERE updated_at < ?");
+  // WHY: (#87c) the read half of the prune above, and it must stay the SAME predicate and the SAME
+  // WHY: parameter as the delete: this is what lets a due-but-empty prune cost nothing, and a guard
+  // WHY: that asked a different question would change which rows survive.
+  const servedExpiredExistsStmt = db.prepare(
+    "SELECT 1 AS one FROM served WHERE updated_at < ? LIMIT 1",
+  );
   // WHY: served_leases is the v7 identity authority (spec §3.1). The upsert is the atomic
   // WHY: re-serve contract: a re-served anchor adopts the fresh line_id and clears retired_at.
   const lineageAnchorsStmt = db.prepare(
@@ -302,6 +315,8 @@ function buildStmts(db: DatabaseSync): ServedStmts {
         servedPruneOlderThanStmt.run(updatedBefore);
       });
     },
+    servedExpiredExists: (updatedBefore) =>
+      servedExpiredExistsStmt.get(updatedBefore) !== undefined,
     snapshotByHash: (path: string, snapshotHash: string) =>
       snapshotByHashStmt.get(path, snapshotHash, ANCHOR_GENERATION) as LeaseSnapshot | undefined,
     // SAFETY: `node:sqlite` returns untyped rows; the SELECT above lists exactly these columns.
@@ -436,12 +451,39 @@ export function ensureServedSchema(db: DatabaseSync): void {
   }
 }
 
+/**
+ * The `meta` key recording when the served-mirror prune last removed rows — the periodic item's own
+ * record of its last run, read through `periodicDue` and written by `markPeriodicRun` (#87c).
+ */
+const SERVED_PRUNE_META_KEY = "served_prune_at";
+
+/**
+ * The served-mirror TTL prune — a PERIODIC item of the store open (#87c), not a per-open one. Both the
+ * delete and its run stamp are writes, and a `DELETE` takes the store's write lock even when its
+ * predicate matches no row, so a healthy stamp-matching open that took no lock before would still
+ * contend for one here. The item is therefore asked only when it is due, and it deletes only when
+ * there is something to delete: its common case — nothing expired — is two reads.
+ *
+ * SEMANTICS ARE UNCHANGED: the same predicate with the same cutoff (`updated_at < now -
+ * SERVED_TTL_MS`) is asked as an existence question before it is asked as a delete, the same rows are
+ * removed, and the run stamp is written only by a run that removed some.
+ */
+function pruneExpiredMirrorRows(db: DatabaseSync): void {
+  const now = Date.now();
+  if (!periodicDue(db, SERVED_PRUNE_META_KEY, SERVED_PRUNE_INTERVAL_MS, now)) return;
+  const cutoff = now - SERVED_TTL_MS;
+  const stmts = servedStmts(db);
+  if (!stmts.servedExpiredExists(cutoff)) return;
+  stmts.servedPruneOlderThan(cutoff);
+  markPeriodicRun(db, SERVED_PRUNE_META_KEY, now);
+}
+
 onStoreOpen((db) => {
   ensureServedSchema(db);
   // WHY: retention of v7 leases and session meta belongs to the vacuum engine (#86) — opening the
   // WHY: store stays strictly additive and idempotent (spec §5.1 item 8), so a version flap in a
   // WHY: mixed-version environment can never drop v7 identity state.
-  servedStmts(db).servedPruneOlderThan(Date.now() - SERVED_TTL_MS);
+  pruneExpiredMirrorRows(db);
   // WHY: the store open is the vacuum's deterministic boundary — retention is enforced across all
   // WHY: paths before a new session accumulates snapshots, including after a crash left an
   // WHY: over-budget store behind.

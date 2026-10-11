@@ -64,6 +64,14 @@ export const EDITS_MAX_ITEMS = 32;
 // WHY: the LRU vacuum's active-pin cutoff (spec §3.6.1) is measured with the same window.
 export const SERVED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// WHY: (#87c) the served-mirror TTL prune is a PERIODIC open item, not a per-open one: a `DELETE`
+// WHY: takes the store's write lock even when it matches no row, so running it on every open made a
+// WHY: healthy, stamp-matching open contend for a store it had nothing to change. The item runs at most
+// WHY: once per this interval, expressed as a whole fraction of the horizon it enforces: the prune's
+// WHY: own decision is measured in days (`SERVED_TTL_MS`), so a finer cadence buys nothing, while one
+// WHY: run per day-quarter keeps the mirror's lag behind that horizon well inside a day.
+export const SERVED_PRUNE_INTERVAL_MS = SERVED_TTL_MS / 28;
+
 // WHY: §3.6.2 post-write failure semantics — the bytes are already on disk when the store commit
 // WHY: fails, so the tool reports success and names the deferred synchronization in one wording
 // WHY: shared by the edit batch commit and the undo restore transaction.
