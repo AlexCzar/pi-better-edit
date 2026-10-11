@@ -373,6 +373,21 @@ function tableColumns(db: DatabaseSync, table: string): Set<string> {
     const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
     return new Set(rows.map((row) => row.name));
   } catch {
+    // WHY: the empty set answers TWO questions at once — "this table is not there yet" and "this
+    // WHY: schema could not be read" — and the first is the intended one: PRAGMA table_info returns
+    // WHY: no rows for a missing table rather than throwing (measured), so only a failed READ
+    // WHY: arrives here (a closed handle reads `database is not open`).
+    // WHY: The two questions stop being interchangeable per caller: `addColumnIfMissing` and
+    // WHY: `renameGenerationColumn` go on to attempt their ALTER and fail LOUDLY (`duplicate column
+    // WHY: name`, `no such table`) rather than silently, and `buildStore`'s pre-session-keyed
+    // WHY: `served` shell guard reads `size > 0` as false and so skips its DROP — the safe direction.
+    // WHY: The one SILENT consumer is `hasTable` in `ensureSnapshotTables`, where a failed read makes
+    // WHY: `hasLeases` false and the sweep skips its two lease deletes: a PARTIAL sweep that reports
+    // WHY: success. That residue is the exposure the stamp gate's own trade already accepts — a
+    // WHY: surviving lease is generation-gated at use, so its worst case is a MISS or a fail-closed
+    // WHY: refusal, never a wrongly honored identity — and the next stamp-invalidating open or the
+    // WHY: janitor's throttled periodic sweep removes it, running the same two predicates
+    // WHY: unconditionally.
     return new Set<string>();
   }
 }
@@ -398,14 +413,15 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
     } catch {
       db.exec(`ALTER TABLE ${table} ADD COLUMN anchor_generation INTEGER NOT NULL DEFAULT 0`);
       db.exec(`UPDATE ${table} SET anchor_generation = canon_version`);
-      // SAFETY: the RENAME fallback tolerates a store that keeps both columns — the DROP
-      // SAFETY: fails on SQLite builds without DROP COLUMN support, and a both-columns store is
-      // SAFETY: inert: every v7 reader/writer names `anchor_generation` only, and the leftover
-      // SAFETY: `canon_version` values were already copied over by the UPDATE above, so the stale
-      // SAFETY: column is never read. A concurrently open pre-rename process whose prepared
-      // SAFETY: statement names `canon_version` breaks fail-closed on its next step (same failure
-      // SAFETY: class as the v6 `canons` guard below) — exposure is the unreleased intermediate
-      // SAFETY: build only; see ADR-0031 §4.
+      // SAFETY: the RENAME fallback tolerates a store that keeps both columns — the DROP is refused
+      // SAFETY: whenever SQLite cannot drop the column at all (measured on this runtime, which DOES
+      // SAFETY: support DROP COLUMN: an index naming the column refuses it with `error in index ...
+      // SAFETY: after drop column`), and a both-columns store is inert: every v7 reader/writer names
+      // SAFETY: `anchor_generation` only, and the leftover `canon_version` values were already copied
+      // SAFETY: over by the UPDATE above, so the stale column is never read. A concurrently open
+      // SAFETY: pre-rename process whose prepared statement names `canon_version` breaks fail-closed
+      // SAFETY: on its next step (same failure class as the v6 `canons` guard in `buildStore`) —
+      // SAFETY: exposure is the unreleased intermediate build only; see ADR-0031 §4.
       try {
         db.exec(`ALTER TABLE ${table} DROP COLUMN canon_version`);
       } catch {}
@@ -1023,6 +1039,14 @@ export function isHealthy(db: DatabaseSync): boolean {
     return row?.quick_check === "ok";
   } catch (error) {
     if (isCorruptionError(error)) return false;
+    // WHY: a failure that is NOT corruption reads as HEALTHY, and that direction is load-bearing:
+    // WHY: the remedy for a false verdict is `quarantineStore` plus a rebuild from empty, which
+    // WHY: renames the store file aside and rebuilds it from the DDL, so the undo rows in the old
+    // WHY: file become unreachable. `file_undo` is the table this file calls the single source of
+    // WHY: truth for undo history, and it is not among the rows a read re-derives (the served
+    // WHY: mirror, the snapshots and their lineage are). A probe that merely could not RUN must not
+    // WHY: destroy undo history; a store that really is broken fails closed at the first statement
+    // WHY: that touches the damage instead — #100's use-time clause.
     return true;
   }
 }
