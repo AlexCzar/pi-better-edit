@@ -1,35 +1,17 @@
 /**
- * #90 — the janitor's trigger: the two lifecycle events that are OFF the tool-call hot path.
+ * #90 — the janitor's lifecycle hooks: what a handler does when the pass it runs FAILS.
  *
  * WHY this file exists: a background timer is impossible (the extension API exposes no idle timer and
- * no `deactivate` event), so the only honest trigger is a lifecycle event, and the choice of WHICH
- * event is load-bearing — a janitor run on `tool_call`/`tool_result` would be paid by every tool call
- * and could hold the write lock the call is waiting on. These tests pin the wiring: exactly
- * `session_start` and `session_shutdown` are subscribed, each one runs the janitor, and no hot-path
- * event is subscribed at all.
+ * no `deactivate` event), so the janitor hangs on a lifecycle event, and a maintenance item must not
+ * break the session it runs in — so the failure path is asserted here. The TRIGGER itself, and the
+ * tool-call exclusion that makes it safe, is asserted as ONE invariant in `store-janitor.test.ts`
+ * (the wiring and the measured zero-janitor-statement open in a single test), so that is where a
+ * reader looks for which events are subscribed and which are forbidden; keeping a second copy here
+ * would let the two drift apart.
  */
 import { describe, expect, it, vi } from "vitest";
 
-import { JANITOR_EVENTS, registerJanitorHooks } from "../../src/store-janitor";
-import type { JanitorOutcome } from "../../src/store-janitor";
-
-const RUN: JanitorOutcome = {
-  ran: true,
-  deleted: { snapshots: 0, lineage: 0, leases: 0, expiredLeases: 0 },
-  deepCheckFailed: false,
-  rebuilt: false,
-};
-
-/** The event names the extension API exposes that a maintenance pass must never ride on. */
-const HOT_PATH_EVENTS = [
-  "tool_call",
-  "tool_result",
-  "tool_execution_start",
-  "tool_execution_update",
-  "tool_execution_end",
-  "context",
-  "before_provider_request",
-];
+import { registerJanitorHooks } from "../../src/store-janitor";
 
 /** A stand-in for `pi` that records what was subscribed and hands the handlers back. */
 function fakePi(): {
@@ -47,28 +29,7 @@ function fakePi(): {
   };
 }
 
-describe("the janitor's lifecycle wiring", () => {
-  it("subscribes session_start and session_shutdown, and no other event", () => {
-    const { pi, subscriptions } = fakePi();
-    registerJanitorHooks(pi as never, { runJanitor: async () => RUN });
-
-    expect(subscriptions.map((entry) => entry.event)).toEqual([...JANITOR_EVENTS]);
-    for (const forbidden of HOT_PATH_EVENTS) {
-      expect(subscriptions.some((entry) => entry.event === forbidden)).toBe(false);
-    }
-  });
-
-  it("runs the janitor on each subscribed event", async () => {
-    const { pi, subscriptions } = fakePi();
-    const run = vi.fn(async () => RUN);
-    registerJanitorHooks(pi as never, { runJanitor: run });
-
-    for (const { handler } of subscriptions) await handler();
-
-    expect(run).toHaveBeenCalledTimes(subscriptions.length);
-    expect(subscriptions.length).toBeGreaterThan(0);
-  });
-
+describe("the janitor's failure containment", () => {
   it("swallows a failing pass so maintenance never breaks the session", async () => {
     const { pi, subscriptions } = fakePi();
     const run = vi.fn(async () => {

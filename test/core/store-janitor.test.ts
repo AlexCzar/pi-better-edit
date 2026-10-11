@@ -10,8 +10,11 @@
  * - GC: a foreign-generation row and a terminal lease past the retirement grace go; a
  *   current-generation row, a live lease and a lease still inside the grace stay; the deletes arrive
  *   in statements bounded by the knob, not in one unbounded scan.
- * - HOT PATH: across an open plus the write a `read`/`edit`/`undo_last_edit` call performs, the
- *   janitor issues ZERO statements and records no run.
+ * - EXCLUSION: ONE test asserts BOTH halves — the wiring subscribes exactly `session_start` and
+ *   `session_shutdown` and runs the janitor on each, while across an open plus the write a
+ *   `read`/`edit`/`undo_last_edit` call performs the janitor issues ZERO statements, prepares no
+ *   `PRAGMA quick_check` and records no run. A positive-only assertion would prove the janitor RUNS,
+ *   never that it is EXCLUDED, and exclusion is what protects tool-call latency.
  * - DEEP CHECK: damage the header smoke check accepts is detected (`isHealthy` false) and handed to
  *   the open path's own quarantine-and-rebuild, which is what closes #90's detection and healing
  *   clauses; #100's use-time trigger is NOT here, by design.
@@ -32,8 +35,10 @@ import {
   type HashStore,
 } from "../../src/hash-store";
 import {
+  JANITOR_EVENTS,
   JANITOR_META_KEY,
   janitorPass,
+  registerJanitorHooks,
   runJanitor,
   type JanitorOutcome,
 } from "../../src/store-janitor";
@@ -359,8 +364,53 @@ describe("the janitor's GC", () => {
   });
 });
 
-describe("the tool-call open path", () => {
-  it("executes no janitor statement and records no janitor run across an open and a write", async () => {
+/**
+ * The EXCLUSION invariant, both halves in ONE test: the wiring subscribes the janitor to the two
+ * off-hot-path lifecycle events (and to no hot-path event), and a tool-call open plus the write it
+ * performs issues no janitor statement at all. Split into two files, the positive half alone would
+ * prove only that the janitor RUNS, never that it is EXCLUDED — so a drift between the halves has to
+ * fail ONE test rather than quietly leave both green.
+ */
+describe("the exclusion invariant", () => {
+  /** The event names the extension API exposes that a maintenance pass must never ride on. */
+  const HOT_PATH_EVENTS = [
+    "tool_call",
+    "tool_result",
+    "tool_execution_start",
+    "tool_execution_update",
+    "tool_execution_end",
+    "context",
+    "before_provider_request",
+  ];
+  /** What the injected pass answers: an ordinary run that found nothing. */
+  const RUN: JanitorOutcome = {
+    ran: true,
+    deleted: { snapshots: 0, lineage: 0, leases: 0, expiredLeases: 0 },
+    deepCheckFailed: false,
+    rebuilt: false,
+  };
+
+  it("wires the janitor to the off-hot-path events and executes no janitor statement across an open and a write", async () => {
+    // Half 1 — the WIRING: exactly the two lifecycle events are subscribed, each handler runs the
+    // janitor, and no hot-path event is subscribed at all.
+    const subscriptions: Array<{ event: string; handler: () => Promise<void> }> = [];
+    const pi = {
+      on(event: string, handler: () => Promise<void>) {
+        subscriptions.push({ event, handler });
+      },
+    };
+    const run = vi.fn(async () => RUN);
+    registerJanitorHooks(pi as never, { runJanitor: run });
+
+    expect(subscriptions.map((entry) => entry.event)).toEqual([...JANITOR_EVENTS]);
+    for (const forbidden of HOT_PATH_EVENTS) {
+      expect(subscriptions.some((entry) => entry.event === forbidden)).toBe(false);
+    }
+    for (const { handler } of subscriptions) await handler();
+    expect(run).toHaveBeenCalledTimes(subscriptions.length);
+    expect(subscriptions.length).toBeGreaterThan(0);
+
+    // Half 2 — the EXCLUSION, measured on the open a real tool call performs.
     await withStoreDir("pi-janitor-hotpath-", async () => {
       // The store is seeded, stamped and closed OUTSIDE the trace, so what is traced is the FAST open
       // a read/edit call performs — not the slow one a brand-new store pays by design.
