@@ -172,6 +172,12 @@ Temporary Items
 
 # Test temp directories
 .tmp/
+# WHY: TRACKED, not in .git/info/exclude: that file is per-clone, so a rule kept there does not travel
+# WHY: and every fresh worktree or clone would ignore a different tree.
+# WHY: root-anchored `/tmp/`, never `**/tmp/**` here: the narrow form cannot hide a legitimately-named
+# WHY: nested tmp/ directory inside a source tree, which `**/tmp/**` in this file would. The
+# WHY: test-collection exclude is vitest.config.ts's own, separate decision, owned by that file.
+/tmp/
 
 
 # Scaffold deterministic — pi-better-edit
