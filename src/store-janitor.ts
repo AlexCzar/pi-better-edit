@@ -17,7 +17,8 @@
  *    detected failure may close this connection (step 4).
  * 4. DEEP CHECK — the open path's own `PRAGMA quick_check` (`isHealthy`, never reimplemented), on a
  *    store the fast path no longer checks (PR #101 replaced it there with the header smoke check).
- *    A failing check routes into the open path's one recovery (`healUnhealthyStore`).
+ *    A failing check routes into `healUnhealthyStore`, the janitor's orchestration over the one
+ *    `quarantineStore` primitive; the open path's own recovery is its other caller.
  *
  * NO CHECKPOINT HERE, deliberately: `shutdownDb` owns `PRAGMA wal_checkpoint(TRUNCATE)`, registered
  * once by `openStore` on `exit`, `SIGINT` and `SIGTERM`. The janitor therefore adds no second

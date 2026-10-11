@@ -1012,10 +1012,10 @@ function smokeCheckStoreFile(storePath: string): boolean {
  * otherwise well-formed file had no detector left at open. `src/store-janitor.ts` runs this same
  * function on `session_start` and `session_shutdown`, off the tool-call hot path, and that run IS
  * the periodic half of issue #100: it closes "not detected at open" (this call finds the damage)
- * and "not healed on reopen" (its failure routes into `healUnhealthyStore`, the open path's own
- * quarantine-and-rebuild), and it deliberately leaves "not quarantined at use" — the FIRST FAILING
- * STATEMENT as the trigger — to #100, which owns the use-time clause. See the janitor's header for
- * the full boundary statement.
+ * and "not healed on reopen" (its failure routes into `healUnhealthyStore`, which runs the open
+ * path's own quarantine-and-rebuild), and it deliberately leaves "not quarantined at use" — the
+ * FIRST FAILING STATEMENT as the trigger — to #100, which owns the use-time clause. See the
+ * janitor's header for the full boundary statement.
  */
 export function isHealthy(db: DatabaseSync): boolean {
   try {
@@ -1075,7 +1075,8 @@ function shutdownDb(db: DatabaseSync): void {
  * is — `shutdownHashStore`, then `quarantineStore`, then `openStore` — and every piece of state it
  * drops is re-derivable, because the store is a disposable cache: the served mirror, the snapshots
  * and their lineage are all rebuilt from the files on disk. What it does NOT
- * do is reach a second REPAIR path (there is exactly one, and this function only invokes it), and it
+ * do is reach a second QUARANTINE implementation: there is ONE (`quarantineStore`), with TWO
+ * orchestrations calling it — this heal and the open path's own recovery — and it
  * does NOT touch a store that is currently inside a transaction of its own: the janitor runs at a
  * lifecycle boundary, where no tool call of this session is in flight, and any statement prepared on
  * the closed connection afterwards fails closed on the reopened one's absence rather than silently
