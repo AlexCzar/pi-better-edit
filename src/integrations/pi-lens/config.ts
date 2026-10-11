@@ -24,6 +24,7 @@ import {
   readConfigObject,
   updateConfigFile,
   type ConfigScope,
+  type ConfigRung,
 } from "../../json-config.js";
 
 export type LensBridgeMode = "auto" | "on" | "off";
@@ -83,12 +84,33 @@ function readEnvMode(): LensBridgeMode | undefined {
   return isLensBridgeMode(normalized) ? normalized : undefined;
 }
 
+/**
+ * The effective mode and the rung that supplied it. `default` is the built-in `"auto"`, which is a
+ * value of the ladder rather than a rung of the file.
+ */
+export interface EffectiveLensBridgeMode {
+  readonly mode: LensBridgeMode;
+  readonly source: ConfigRung;
+}
+
+/**
+ * Effective mode WITH its rung: env override, then project, then global, then `"auto"`. Never throws.
+ * This is the ladder itself, and `resolveEffectiveLensMode` is its value half, so the two cannot
+ * disagree about which rung won — a caller that has to NAME the winner (the `/pi-better-edit` status
+ * text does) reads it here instead of re-walking the two files.
+ */
+export function resolveEffectiveLensModeWithSource(cwd: string): EffectiveLensBridgeMode {
+  const fromEnv = readEnvMode();
+  if (fromEnv !== undefined) return { mode: fromEnv, source: "env" };
+  const config = readLensBridgeConfig(cwd);
+  if (config.project !== undefined) return { mode: config.project, source: "project" };
+  if (config.global !== undefined) return { mode: config.global, source: "global" };
+  return { mode: "auto", source: "default" };
+}
+
 /** Effective mode: env override, then project, then global, then `"auto"`. Never throws. */
 export function resolveEffectiveLensMode(cwd: string): LensBridgeMode {
-  const fromEnv = readEnvMode();
-  if (fromEnv !== undefined) return fromEnv;
-  const config = readLensBridgeConfig(cwd);
-  return config.project ?? config.global ?? "auto";
+  return resolveEffectiveLensModeWithSource(cwd).mode;
 }
 
 /**

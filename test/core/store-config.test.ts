@@ -15,6 +15,7 @@ import { CONFIG_REL, CONFIG_SCHEMA_ID } from "../../src/json-config.js";
 import {
   readStoreJanitorConfig,
   resolveStoreJanitorSettings,
+  resolveStoreJanitorSettingsWithSources,
   saveStoreJanitorConfig,
   STORE_JANITOR_BATCH_DEFAULT,
   STORE_JANITOR_BATCH_ENV_VAR,
@@ -276,6 +277,56 @@ describe("the store directory is not configurable from the file", () => {
       },
       janitorBatchSize: { type: "integer", minimum: 1, default: STORE_JANITOR_BATCH_DEFAULT },
     });
+  });
+});
+
+describe("resolveStoreJanitorSettingsWithSources — the rung each key came from", () => {
+  it("names the rung per key, so one rung's key never masks another's", async () => {
+    expect(resolveStoreJanitorSettingsWithSources(projectDir, warn)).toEqual({
+      mode: { value: "on", source: "default" },
+      intervalMs: { value: STORE_JANITOR_INTERVAL_DEFAULT_MS, source: "default" },
+      batchSize: { value: STORE_JANITOR_BATCH_DEFAULT, source: "default" },
+    });
+
+    await seedGlobalConfig({ store: { janitorIntervalMs: 5_000 } });
+    await seedProjectConfig({ store: { janitorBatchSize: 7 } });
+    process.env[STORE_JANITOR_ENV_VAR] = "off";
+
+    expect(resolveStoreJanitorSettingsWithSources(projectDir, warn)).toEqual({
+      mode: { value: "off", source: "env" },
+      intervalMs: { value: 5_000, source: "global" },
+      batchSize: { value: 7, source: "project" },
+    });
+
+    // The value-only view is the same ladder, so the two views must agree key for key.
+    const resolved = resolveStoreJanitorSettingsWithSources(projectDir, warn);
+    expect(resolveStoreJanitorSettings(projectDir, warn)).toEqual({
+      mode: resolved.mode.value,
+      intervalMs: resolved.intervalMs.value,
+      batchSize: resolved.batchSize.value,
+    });
+  });
+
+  it("names the default rung for a key no rung answered, next to the keys that did", async () => {
+    await seedProjectConfig({ store: { janitor: "off" } });
+
+    expect(resolveStoreJanitorSettingsWithSources(projectDir, warn)).toEqual({
+      mode: { value: "off", source: "project" },
+      intervalMs: { value: STORE_JANITOR_INTERVAL_DEFAULT_MS, source: "default" },
+      batchSize: { value: STORE_JANITOR_BATCH_DEFAULT, source: "default" },
+    });
+  });
+
+  it("resolves an unusable file to the default rungs and still warns once", async () => {
+    await mkdir(join(projectDir, ".pi", "agents"), { recursive: true });
+    await writeFile(projectConfigPath(), "{ not json", "utf-8");
+
+    expect(resolveStoreJanitorSettingsWithSources(projectDir, warn)).toEqual({
+      mode: { value: "on", source: "default" },
+      intervalMs: { value: STORE_JANITOR_INTERVAL_DEFAULT_MS, source: "default" },
+      batchSize: { value: STORE_JANITOR_BATCH_DEFAULT, source: "default" },
+    });
+    expect(warnings).toHaveLength(1);
   });
 });
 

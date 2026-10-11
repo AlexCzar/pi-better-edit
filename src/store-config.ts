@@ -27,6 +27,7 @@ import {
   readConfigObject,
   updateConfigFile,
   type ConfigOnWarn,
+  type ConfigRung,
   type ConfigScope,
 } from "./json-config.js";
 
@@ -45,6 +46,28 @@ export const STORE_JANITOR_INTERVAL_DEFAULT_MS = 24 * 60 * 60 * 1000;
 
 /** WHY 64: the snapshot store already deletes in statement batches of that width (`STAT_BATCH`). */
 export const STORE_JANITOR_BATCH_DEFAULT = 64;
+
+/**
+ * One resolved setting: the value the store will use, and the rung of the ladder that supplied it.
+ * NOT exported on its own — the keyed shape below is the interface a caller reads, and a bare pair
+ * of fields has nothing to say without the key it belongs to.
+ */
+interface ResolvedStoreJanitorSetting<T> {
+  readonly value: T;
+  readonly source: ConfigRung;
+}
+
+/**
+ * Every janitor setting with its rung, keyed by the same three names `StoreJanitorSettings` uses, so
+ * a caller that needs to say WHERE a value came from reads the ladder's answer instead of guessing
+ * it from the two files (“the project file does not have the key, so the global one must have won”
+ * is a second ladder, and a wrong one as soon as a value is outside its accepted shape).
+ */
+export interface ResolvedStoreJanitorSettings {
+  readonly mode: ResolvedStoreJanitorSetting<StoreJanitorMode>;
+  readonly intervalMs: ResolvedStoreJanitorSetting<number>;
+  readonly batchSize: ResolvedStoreJanitorSetting<number>;
+}
 
 export interface StoreJanitorSettings {
   readonly mode: StoreJanitorMode;
@@ -69,6 +92,14 @@ const STORE_JANITOR_KEYS = {
   intervalMs: "janitorIntervalMs",
   batchSize: "janitorBatchSize",
 } as const satisfies Record<keyof StoreJanitorSettings, string>;
+
+/**
+ * The key each setting is read from and written to under `store`, for a caller that has to NAME one
+ * — the `/pi-better-edit` status text labels a key with the same spelling the ladder reads it by,
+ * instead of a second copy of the literal that can drift from this one.
+ */
+export const STORE_JANITOR_KEY_NAMES: Readonly<Record<keyof StoreJanitorSettings, string>> =
+  STORE_JANITOR_KEYS;
 
 function isStoreJanitorMode(value: unknown): value is StoreJanitorMode {
   return value === "on" || value === "off";
@@ -148,27 +179,67 @@ export function readStoreJanitorConfig(
 }
 
 /**
- * The effective janitor settings. Precedence is PER KEY — env, then project, then global, then the
- * default — so a file that tunes one knob does not have to restate the others. Never throws.
+ * The first rung that answered, with its own name: the ladder's three ORDERS are one comparison made
+ * three times, so the rung labels and the precedence order cannot drift apart as two literals.
+ */
+function fromRung<T>(
+  env: T | undefined,
+  project: T | undefined,
+  global: T | undefined,
+  fallback: T,
+): ResolvedStoreJanitorSetting<T> {
+  if (env !== undefined) return { value: env, source: "env" };
+  if (project !== undefined) return { value: project, source: "project" };
+  if (global !== undefined) return { value: global, source: "global" };
+  return { value: fallback, source: "default" };
+}
+
+/**
+ * The effective janitor settings WITH the rung each one came from. Precedence is PER KEY — env, then
+ * project, then global, then the default — so a file that tunes one knob does not have to restate the
+ * others, and a caller that reports the settings can name the rung it should blame for each one.
+ * Never throws. This is the ladder itself; `resolveStoreJanitorSettings` is its value half.
+ */
+export function resolveStoreJanitorSettingsWithSources(
+  cwd: string,
+  onWarn?: ConfigOnWarn,
+): ResolvedStoreJanitorSettings {
+  const config = readStoreJanitorConfig(cwd, onWarn);
+  return {
+    mode: fromRung(
+      readEnvMode(),
+      config.project?.mode,
+      config.global?.mode,
+      STORE_JANITOR_DEFAULTS.mode,
+    ),
+    intervalMs: fromRung(
+      readEnvIntervalMs(),
+      config.project?.intervalMs,
+      config.global?.intervalMs,
+      STORE_JANITOR_DEFAULTS.intervalMs,
+    ),
+    batchSize: fromRung(
+      readEnvBatchSize(),
+      config.project?.batchSize,
+      config.global?.batchSize,
+      STORE_JANITOR_DEFAULTS.batchSize,
+    ),
+  };
+}
+
+/**
+ * The effective janitor settings, without their provenance. Precedence is PER KEY — env, then
+ * project, then global, then the default. Never throws.
  */
 export function resolveStoreJanitorSettings(
   cwd: string,
   onWarn?: ConfigOnWarn,
 ): StoreJanitorSettings {
-  const config = readStoreJanitorConfig(cwd, onWarn);
+  const resolved = resolveStoreJanitorSettingsWithSources(cwd, onWarn);
   return {
-    mode:
-      readEnvMode() ?? config.project?.mode ?? config.global?.mode ?? STORE_JANITOR_DEFAULTS.mode,
-    intervalMs:
-      readEnvIntervalMs() ??
-      config.project?.intervalMs ??
-      config.global?.intervalMs ??
-      STORE_JANITOR_DEFAULTS.intervalMs,
-    batchSize:
-      readEnvBatchSize() ??
-      config.project?.batchSize ??
-      config.global?.batchSize ??
-      STORE_JANITOR_DEFAULTS.batchSize,
+    mode: resolved.mode.value,
+    intervalMs: resolved.intervalMs.value,
+    batchSize: resolved.batchSize.value,
   };
 }
 

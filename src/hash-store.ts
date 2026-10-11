@@ -23,6 +23,20 @@ function configBase(): string {
   return join(homeBase(), ".config");
 }
 
+/** The environment variable that names the app config directory, and so the store's own directory. */
+export const STORE_CONFIG_DIR_ENV_VAR = "PI_BETTER_EDIT_CONFIG_DIR";
+
+/**
+ * The operator's store-directory override, read VERBATIM, or `undefined` when unset. An empty value
+ * counts as unset. WHY it is exported rather than read where it is used: `configDir` and the
+ * `/pi-better-edit` status display both have to answer "is the store directory overridden, and to
+ * what", and two readings of one variable is how they come to disagree about "unset".
+ */
+export function configDirOverride(): string | undefined {
+  const override = process.env[STORE_CONFIG_DIR_ENV_VAR];
+  return override !== undefined && override.length > 0 ? override : undefined;
+}
+
 export function configDir(): string {
   // WHY: precedence for the app config dir is PI_BETTER_EDIT_CONFIG_DIR > XDG_CONFIG_HOME > $HOME/.config
   // WHY: — off Windows only. configBase() reads XDG_CONFIG_HOME behind a `process.platform !== "win32"`
@@ -34,9 +48,9 @@ export function configDir(): string {
   // SAFETY: mkdir or the SQLite open surfaces raw out of the open path without naming the variable. The
   // SAFETY: contract is deliberately verbatim — trimming, validating or wrapping here is out of scope by
   // SAFETY: ticket mandate, so do not "fix" that; document it instead. An empty string counts as UNSET,
-  // SAFETY: mirroring the XDG reading in configBase() above.
-  const override = process.env.PI_BETTER_EDIT_CONFIG_DIR;
-  if (override && override.length > 0) return override;
+  // SAFETY: mirroring the XDG reading in configBase() above: that whole rule lives in configDirOverride().
+  const override = configDirOverride();
+  if (override !== undefined) return override;
   // SAFETY: join of trusted configBase (homedir/.config) with fixed "pi-better-edit" — constant suffix, no traversal.
   return join(configBase(), "pi-better-edit");
 }
@@ -992,6 +1006,16 @@ function smokeCheckStoreFile(storePath: string): boolean {
  * there is no stamp to trust — a fresh store, a stamp mismatch, `existed === false`, or the open
  * that follows a quarantine — where the open is already building or rebuilding from empty, so a
  * pass over every page is not the latency being avoided.
+ *
+ * WHY it is ALSO the periodic deep check, and which half of #100 that is: the fast path stopped
+ * running this pass when it took the header smoke check instead, so page-level damage inside an
+ * otherwise well-formed file had no detector left at open. `src/store-janitor.ts` runs this same
+ * function on `session_start` and `session_shutdown`, off the tool-call hot path, and that run IS
+ * the periodic half of issue #100: it closes "not detected at open" (this call finds the damage)
+ * and "not healed on reopen" (its failure routes into `healUnhealthyStore`, the open path's own
+ * quarantine-and-rebuild), and it deliberately leaves "not quarantined at use" — the FIRST FAILING
+ * STATEMENT as the trigger — to #100, which owns the use-time clause. See the janitor's header for
+ * the full boundary statement.
  */
 export function isHealthy(db: DatabaseSync): boolean {
   try {
@@ -1016,6 +1040,17 @@ async function quarantineStore(storePath: string): Promise<void> {
   }
 }
 
+/**
+ * The WAL checkpoint's ONLY owner: truncate the journal, then close. `openStore` registers it once on
+ * `exit`, `SIGINT` and `SIGTERM`, so every path out of the process arrives here.
+ *
+ * WHY the division of labour is worth stating: the store's periodic work (`src/store-janitor.ts`)
+ * deliberately adds no checkpoint of its own — a run's writes ride the WAL like any other writer's —
+ * so this is the single site that truncates it, and the rows a run leaves in the journal are
+ * truncated by the close path that already truncates every other writer's. Nothing periodic needs to
+ * duplicate that, and `wal_checkpoint(TRUNCATE)` on an already-truncated journal is a no-op, so the
+ * two cannot double-charge.
+ */
 function shutdownDb(db: DatabaseSync): void {
   try {
     db.exec("PRAGMA wal_checkpoint(TRUNCATE)");

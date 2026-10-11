@@ -25,6 +25,13 @@ import { dirname, join } from "node:path";
 /** The two places the config file may live: beside the project, or in the user's home directory. */
 export type ConfigScope = "project" | "global";
 
+/**
+ * The rung a resolved setting came from: the two file scopes, the environment override above them,
+ * or the built-in default below them. Named once here because every settings owner's ladder is built
+ * from the same four rungs — `ConfigScope` alone would leave each owner spelling the other two out.
+ */
+export type ConfigRung = "env" | ConfigScope | "default";
+
 /** Called with a human-readable reason when a config file exists but could not be used. */
 export type ConfigOnWarn = (reason: string) => void;
 
