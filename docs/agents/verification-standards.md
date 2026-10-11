@@ -26,25 +26,47 @@ indistinguishable from a rationalisation, while one written before is a hypothes
 ### (b) Independence of instrument
 
 A second measurement must not read through the same **layer**: two runs of the same command through the same
-renderer agree perfectly and prove nothing. The routes that differ in the layer where an artifact can enter:
+renderer agree perfectly and prove nothing. The rows below are **axes** — command resolution, the write path, the
+formatting path, the pattern, the oracle — the layers an artifact can enter. **Two routes are not a control; the
+matrix is the control**: a pair can carry a confound, and a confound leaves no trace in the output to correct it.
 
-| route | second route | the artifact that separates them |
-|---|---|---|
-| rendered `git diff` output | the bytes git writes | a `Changes:` trailer appended by the output layer |
-| porcelain `git diff --name-only` | plumbing `git diff-tree -r --name-only --no-commit-id` | the same trailer |
-| a text filter over a rendered diff | `git diff --numstat` | 91 vs 94 added lines |
-| reading the ignore rule | `git check-ignore`, `git status --untracked-files=all` | a symlinked path |
+| axis | route | second route | the artifact that separates them |
+|---|---|---|---|
+| **command resolution** | the native binary, invoked by absolute path (`/usr/bin/git`, `/opt/homebrew/bin/git`) | the name as `PATH` resolves it — a filtering CLI proxy (`rtk git`) | a `Changes:` trailer the proxy appends to otherwise-correct output |
+| pattern | a text filter over a rendered diff (`grep -c '^+[^+]'`) | `git diff --numstat` | 91 vs 94 added lines |
+| oracle | reading the ignore rule | `git check-ignore`, `git status --untracked-files=all` | a symlinked path |
 
-> **Measured at `8c2504a`.** `git diff --name-only 733003b..8c2504a` redirected through the wrapped `git` wrote 589
-> bytes ending `\nChanges:\n`; piped, or run from the absolute binary path, it wrote 578. Counting added lines in
-> `d13a2f6..b95f7b7` by `grep -c '^+[^+]'` gives 91, `git diff --numstat` gives 94 — the gap is the three added
-> blank lines the pattern cannot see. `.gitignore`'s `node_modules/` is a directory-only pattern: it matches the
-> real directory and `git check-ignore` exits 1 on a symlink named `node_modules`, which `git status` reports untracked.
+> **Measured on `git diff --name-only 733003b..8c2504a`, one variable at a time — four commands × two modes.**
+> `git`, as `PATH` resolves it (`/opt/homebrew/bin/git`, git 2.55.0): 578 bytes piped, 578 redirected, no trailer.
+> `/opt/homebrew/bin/git` by absolute path: 578 / 578, no trailer. `/usr/bin/git` by absolute path: 578 / 578, no
+> trailer. `rtk git`: 589 / 589, **with** the trailer — both tails ending `…config.test.ts`, then a blank line,
+> `Changes:`, a blank line, the 11 appended bytes being `\nChanges:\n\n`. The trailer is the **proxy's**, in both
+> modes; the native binaries append it in neither, and redirection moves no number on any of the four. Through the
+> proxy the filter is format-dependent — porcelain `rtk git diff --name-only` carries it, plumbing `rtk git
+> diff-tree -r --name-only --no-commit-id` passes through — so a porcelain/plumbing pair separates the trailer only
+> while a proxy is in the path. Counting added lines in `d13a2f6..b95f7b7` by `grep -c '^+[^+]'` gives 91,
+> `git diff --numstat` gives 94 — the gap is the three added blank lines the pattern cannot see. `.gitignore`'s
+> `node_modules/` is a directory-only pattern: it matches the real directory and `git check-ignore` exits 1 on a
+> symlink named `node_modules`, which `git status` reports untracked.
 
-The preventive form is **structural**: routes that differ **by construction** — in the write path, the formatting
-path, or the oracle — not two commands that happen to be different. *"Would the routes diverge if the artifact
-were present?"* is the **diagnostic**, askable only after the fact: while the instrument is wrong you cannot know
-where the artifact lives, which is why the remedy is to choose the routes structurally rather than reason later.
+The original attribution named the **output layer**, from a pair that differed in **two** layers at once — the
+resolved binary *and* the redirection — so the difference landed on whichever variable was named first. That is the
+**diagnostic** failing for a nameable reason: **the pair did not differ in exactly the layer under test**, and the
+confound left no trace in the output to correct it. Contrast the two pairs in this tranche that **held** — the
+mutation's per-case identities in (c), and the 91-vs-94 recount in the pattern row above — where the routes differed
+in **exactly one** layer, which is why their conclusions were entailed rather than lucky.
+
+That is also why command resolution is the table's strongest example: its answer is available **before** the
+measurement — `type -a git` / `command -v git` says which binary you are about to measure — whereas *"would the
+routes diverge if the artifact were present?"* is a **diagnostic** askable only afterwards, because you cannot know
+where the artifact lives while the instrument is wrong.
+
+The preventive form is **structural**: routes that differ **by construction** — in command resolution, the write
+path, the formatting path, the pattern, or the oracle — not two commands that happen to be different. For command
+resolution the form is concrete: **invoke the native binary by absolute path, or expect a filtered stream.**
+*"Redirect it and count the file"* is not enough — redirecting through the proxy still carries the trailer, and it
+passed only because a shell happened to resolve `git` to the native binary. Check what the command **resolves to**
+before trusting its bytes.
 
 **Enforcement: mixed.** The tree-residue half is mechanised as [CONTRIBUTING.md](../../CONTRIBUTING.md)'s two scans
 — the repo-wide `find . -path ./node_modules -prune -o -name '*-probe*' -print` and the tracked-vs-untracked
@@ -92,6 +114,30 @@ not caught by the next measurement, it is *quoted* by the next reader.
 empty-tree checks, `git diff-index --quiet HEAD`, an empty `git stash list`, and `uptime`. Push state is
 `git ls-remote --heads origin <branch>` (empty = no remote ref).
 
+**State a check as a PROPERTY of the invariant, not as a LITERAL snapshot.** A brief that required
+`git log --oneline -1` to equal one sha made its own check unsatisfiable the moment the first group committed, so
+the writer had to measure the check's **intent** instead — the base is an ancestor, exactly one commit sits above
+it, the diff is docs-only — and ask for a ruling. A literal is a claim about a **moment** and can contradict the
+design it was written to protect; a property is a claim about the **invariant** and stays true as the work grows.
+Read it with §3: by §3's own 2×2 a snapshot literal is a claim **true when written and able to rot without an
+edit** — the fourth cell — whose remedy is the **union**, wording (state the invariant) plus binding (the property
+that stays checkable as the tranche grows). **Two sections, one rule.**
+
+**Name the invariant before the instrument, then state the pass condition in its terms.** Three times in this
+tranche a detector was right and its **pass condition** was wrong, and the three failures share one shape: the pass
+condition was stated as a convenient property of the **instrument** rather than of the **invariant** being
+defended. Read off them:
+
+| invariant | pass condition | the failure it would have caught |
+|---|---|---|
+| **existence** — "this must not be present" | **emptiness** of a detector that names individual things | the gitignored scratch file: `git status` was empty, and the file was there |
+| **invariance** — "this must not change" | a **baseline diff**, captured **before** the window | the added-line count: the pass condition was the filter's own output, not a diff against the pre-window baseline |
+| **attribution** — "this difference has one cause" | a **matrix over axes**, never a pair | the `Changes:` trailer: one pair, two layers varied, the wrong variable named |
+
+The mapping is for **reaching for** the right pass condition, not only for recognising a failed one — and the order
+it implies is the actual defect: **the invariant is named before the instrument is chosen**, because the failure
+mode is choosing the instrument first, for convenience, and then naming whichever invariant it happens to defend.
+
 ## 2 · Claims
 
 - **Reach ≤ competence.** Claim only what your artifact can see.
@@ -103,9 +149,24 @@ empty-tree checks, `git diff-index --quiet HEAD`, an empty `git stash list`, and
 - **An inherited claim is an unmeasured claim.** The #90 report forwarded a child's `Changes:` attribution as a
   measured environment finding, and a two-minute probe refuted both halves of it.
 
+**Scope mis-calibration runs both ways, with different symptoms and different remedies.** **Over-reach** — the
+claim asserts more than the evidence supports — shows up as a claim nobody can check, and the remedy is to narrow
+it (measure, then state): the byte-frozen claim and the inherited `Changes:` attribution are this tranche's
+instances. **Under-scope** — the claim excludes applications that exist — shows up as a rule that reads as
+**advice**, because no instance of it can be found inside the stated scope, and the remedy is to widen it to where
+the rule was actually used, which may be **outside the page**: §4's rules were applied by the author to the work
+that produced this doc, not by the doc to itself.
+
+The spine's claims-side twin, in one line: **a check must be able to fail for the reason it exists; a rule's scope
+must admit the applications that exist.** Both say the thing must be able to be right *for the reason it exists*,
+so a check that cannot fail and a rule that cannot be exemplified are the same defect — one in logic, one in prose.
+
 **Enforcement: mixed.** The comment gate — `harness/no-comments`, an oxlint jsPlugin configured in
-`.oxlintrc.json` — forces every non-JSDoc comment to carry an allowlisted tag (`WHY:`, `SAFETY:`, `Invariant:`,
-`See ADR-`), so the *reason* has a place to live; the *content* is **convention**.
+`.oxlintrc.json` — forces every non-JSDoc comment to carry an allowlisted tag, so the *reason* has a place to live;
+the *content* is **convention**. The tag list is not this sentence: it is `ALLOWLIST_RE` (with its Gherkin branch)
+in `scripts/oxlint-plugin-comment-gate.js`, and the four tags named here — `WHY:`, `SAFETY:`, `Invariant:`, `See
+ADR-` — are **among others** in it, as are `via https://`, `TODO(#<digits>):`, `HACK:` and the Gherkin keywords.
+An enumeration in a doc decays; the path and the symbol do not.
 
 ## 3 · Decay
 
@@ -123,8 +184,9 @@ The fourth cell needs the **union** of both remedies, and #90 has the instance:
 > that could also **rot** (the scheduling site can move). The fix re-pointed at the module's own behaviour and
 > dropped the location claim — both remedies, one edit. (Pre-fix wording at `5736d71^` on `origin/feat/90-store-janitor-gc`.)
 
-**Order by invisibility to review, not by severity.** Review is a **writing-time** instrument; decay fails at
-**reading** time. That is why every decay instance in this tranche survived review.
+**Review cannot see decay.** Review is a **writing-time** instrument; decay fails at **reading** time, which is
+why every decay instance in this tranche survived review — and why a superseded example here was replaced rather
+than left beside the corrected one.
 
 **The preventive form: bind the thing that can move.** A **symbol** rather than a line range for a dependency; a
 **sha** rather than "the tip"; a **reason** beside a bound; a **superseding commit** rather than silence.
@@ -142,6 +204,22 @@ Batch by **invalidation**, not by discovery. A gate is superseded by **any** com
 groups land before one gate, not one gate per group.
 
 **Enforcement: convention.**
+
+## 5 · Self-application
+
+**Every section should be able to point at the place where this doc applies it to itself** — a rule that cannot
+point at itself is probably **advice**, and advice is the failure mode this file exists to avoid. The kind of
+pointer differs, and naming the kind says more than a pass:
+
+| section | who applies it | where |
+|---|---|---|
+| 1 · Checks | this doc, to itself | the command-resolution row (preventive) and the properties rule |
+| 2 · Claims | this doc, to itself | the enforcement-site field — refusing to claim enforcement it cannot name |
+| 3 · Decay | this doc, to itself | the allowlist snapshot in §2 and the superseded-attribution rule in §1 |
+| 4 · Pricing | the author, to the work that produced this doc | *enumerate the obligation set before pricing it* (the obsolete-on-arrival stop) and *batch by invalidation* (the bundle decision) |
+
+Both kinds are self-application; only the second lives outside the page. The test is a **convention** — no test
+reddens — and a doc in which every section passes by construction is the version to distrust.
 
 ## The commands this repo's gate actually uses
 
