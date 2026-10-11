@@ -481,6 +481,13 @@ describe("hash-store — anchor_generation rename (issue #20)", () => {
         "INSERT INTO file_undo (path, content, bom, ending, hashes, result_content, snapshot_hash, updated_at, canon_version) VALUES (?,?,?,?,?,?,?,?,?)",
       ).run("/old.ts", "old", "", "\n", '["UVWW"]', "new", "3:deadbeef", Date.now(), 3);
       db.close();
+      // WHY: (#87c) a pre-rename release wrote no open stamp either, so the simulation is only honest
+      // WHY: with the stamp gone: the reopen must take the SLOW path, which is the one that sweeps the
+      // WHY: pre-rename rows this test asserts are gone.
+      const preStamp = new DatabaseSync(sqlitePath(home), { defensive: false } as any);
+      preStamp.exec("PRAGMA user_version = 0");
+      preStamp.exec("DELETE FROM meta WHERE key = 'store_stamp'");
+      preStamp.close();
       // WHY: the pre-rename store still opens — the guarded rename preserves stamped values.
       const reopened = await loadHashStore();
       const snapCols = (
@@ -800,6 +807,13 @@ describe("hash-store — v7 CAS schema (issue #79)", () => {
       let db = new DatabaseSync(sqlitePath(home), { defensive: false } as any);
       seedV7Rows(db);
       const seeded = v7Rows(db);
+      db.close();
+      // WHY: (#87c) the seeded rows are anchor state of an unknown generation, and what removes them is
+      // WHY: the sweep — which a matching stamp now skips. A store holding such rows is by definition
+      // WHY: not the store its stamp describes, so the seeding moves the stamp with them; the repeated
+      // WHY: opens below then find the fast path, which is the idempotence this test pins.
+      db = new DatabaseSync(sqlitePath(home), { defensive: false } as any);
+      db.exec("PRAGMA user_version = 0");
       db.close();
 
       for (let i = 0; i < 3; i++) {

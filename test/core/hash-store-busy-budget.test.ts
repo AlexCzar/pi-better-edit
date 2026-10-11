@@ -88,13 +88,20 @@ function sqlitePath(home: string): string {
  * Build the store, drop the cached handle, then take the write lock on a second connection. The
  * rival is opened with `timeout: 0` so it never waits on anything itself: it owns the lock until
  * this process COMMITs it, which is what makes the contention deterministic.
+ *
+ * (#87c) THE STAMP IS DROPPED, and that is what makes the harness still test what it claims: only a
+ * SLOW-path open takes a write lock any more, so an open of a store whose stamp matches would sail
+ * past this rival's lock without spending a microsecond of the budget under test (asserted as the
+ * discriminator in `test/core/hash-store-open-stamp.test.ts`). Dropping the stamp puts the open back
+ * on the path this budget governs — the shape a released pre-stamp store takes on every open.
  */
 async function withLockedStore(
   home: string,
   run: (rival: DatabaseSync) => Promise<void>,
 ): Promise<void> {
   shutdownHashStore();
-  await loadHashStore();
+  const store = await loadHashStore();
+  store.db.exec("PRAGMA user_version = 0");
   shutdownHashStore();
   const rival = new DatabaseSync(sqlitePath(home), { timeout: 0 });
   rival.exec("BEGIN IMMEDIATE");

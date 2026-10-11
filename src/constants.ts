@@ -58,11 +58,45 @@ export const HASH_STORE_BUSY_TIMEOUT = 250;
 // WHY: `canon_version` breaks fail-closed, and the DROP fallback may leave both columns, inert
 // WHY: (see ADR-0031 §4 and `renameGenerationColumn`). Record-only marker; schema evolution itself
 // WHY: is additive or rename-preserving, never a drop.
+// WHY: (#87c) BUMP THIS CONSTANT whenever any owner's schema-ensure or gated open work changes — a
+// WHY: new table, column or index, a changed ensure, or a changed gate. It is the schema half of the
+// WHY: open stamp (`storeGenerationStamp` in `src/hash-store.ts`), so bumping it invalidates every
+// WHY: stamp already on disk BY CONSTRUCTION and forces the next open down the slow path, which runs the
+// WHY: ensure and re-stamps. A change that does NOT bump it is invisible to a running build — which is
+// WHY: exactly how a store ends up stamped current while missing the object the change added.
+// WHY: A change to the stamp's FIELD LIST instead of its content is `STAMP_FORMAT_VERSION`'s business
+// WHY: (also in `src/hash-store.ts`); an ADDITIONAL open hook is covered by the hook count in the stamp.
 export const HASH_STORE_VERSION = 9;
 export const EDITS_MAX_ITEMS = 32;
 // WHY: the served-lease session TTL: an un-retired lease pins its snapshot for this long, and
 // WHY: the LRU vacuum's active-pin cutoff (spec §3.6.1) is measured with the same window.
 export const SERVED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// WHY: (#87c) the served-mirror TTL prune is a PERIODIC open item, not a per-open one: a `DELETE`
+// WHY: takes the store's write lock even when it matches no row, so running it on every open made a
+// WHY: healthy, stamp-matching open contend for a store it had nothing to change.
+// WHY: WHAT THE TIMER RELAXES, stated rather than implied: retention is now enforced at most four times
+// WHY: a day instead of on every open, so an expired mirror row can live up to `SERVED_TTL_MS` +
+// WHY: `SERVED_PRUNE_INTERVAL_MS` — the 7-day TTL plus the cadence below — and spec §5.1 item 8's
+// WHY: "enforced on every open" no longer holds across the deferred window.
+// WHY: WHY THE TIMER IS THE CHEAPER OF THE TWO: the guard it skips is an existence read with NO usable
+// WHY: index — `served` is keyed `(session_id, path)` and the predicate is on `updated_at` — so when
+// WHY: nothing is expired (the fast path's case) it scans the whole mirror. Measured medians of that
+// WHY: read — n=9 batches of 200 calls, 2026-10-11, Apple M1 Pro, macOS 15.1.1, node v26.8.1, loadavg
+// WHY: 3.44 4.85 6.04, 2.96 4.64 5.94 and 3.13 4.57 5.88 at the start of the three runs, rows as the
+// WHY: mirror holds them (`hashes` `'[]'`, session id and path as the mirror writes them: 73 B/row of
+// WHY: store file at the short end, 164 at the long end, the `(session_id, path)` index included) —
+// WHY: 0.037ms at 1,000 rows, 0.72ms at 20,000, and 2.1-2.5ms at 50,000, versus 0.0014ms when something
+// WHY: IS expired (that scan stops at the first hit). The 50,000 figure is quoted as the RANGE it moves
+// WHY: through rather than as a point, because it tracks the row size: the same three runs measured
+// WHY: 2.08ms at 73 B/row, 2.34-2.35ms at 132-133 B/row and 2.46-2.52ms at 164 B/row, and the single
+// WHY: 2.36ms an earlier version of this comment carried did not reproduce as a value. The statement
+// WHY: for every figure is
+// WHY: `SELECT 1 AS one FROM served WHERE updated_at < ? LIMIT 1`. The timer bounds that per-open cost
+// WHY: however large the mirror grew, which is the property a lock-free open needs.
+// WHY: #90 owns the cadence: it is handed this constant as a knob, and its GC design (lifecycle events,
+// WHY: throttled, never on the tool-call open path) is where the number should finally be tuned.
+export const SERVED_PRUNE_INTERVAL_MS = SERVED_TTL_MS / 28;
 
 // WHY: §3.6.2 post-write failure semantics — the bytes are already on disk when the store commit
 // WHY: fails, so the tool reports success and names the deferred synchronization in one wording

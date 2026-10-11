@@ -7,7 +7,7 @@ import { join, dirname } from "node:path";
 import { errCode } from "./utils.js";
 import { initHasher } from "./hashline/hasher.js";
 import { HASH_STORE_VERSION, HASH_STORE_BUSY_TIMEOUT } from "./constants.js";
-import { ANCHOR_GENERATION } from "./hashline/hash-identity.js";
+import { ANCHOR_GENERATION, CANON_VERSION } from "./hashline/hash-identity.js";
 
 function homeBase(): string {
   const envHome = process.env.HOME;
@@ -291,9 +291,37 @@ export interface HashStore {
   readonly engine: "node:sqlite";
 }
 
+/**
+ * One open of the store FILE: the connection, plus the stamp-due decision `buildStore` made for it — the
+ * persisted stamp did not match, so this open built, migrated and swept the store. `openStore` owes the
+ * stamp write exactly when it is true, and pays it after the hooks; see `writeStoreStamp`.
+ */
+interface OpenedDb {
+  readonly db: DatabaseSync;
+  readonly stampDue: boolean;
+}
+
 let cachedDb: { path: string; db: DatabaseSync } | null = null;
 let opening: { path: string; promise: Promise<HashStore> } | null = null;
 let exitHandlerRegistered = false;
+
+/**
+ * The stamp-due decision of the open that OWNS this connection right now, or `null` between opens:
+ * `openStore` moves `buildStore`'s decision here for the hook phase, and the snapshot-store hook's
+ * re-entrant `ensureSnapshotSchema` consults it instead of the persisted stamp. The persisted stamp
+ * cannot answer for the hook phase — `openStore` writes it only after the LAST hook — so on the slow path
+ * a row-based gate would sweep a SECOND time: every slow open, every upgrade, would pay two sweeps. The
+ * decision is spent by the time the hooks run (the sweep's own site, `buildStore`, applies it first), so
+ * a call from the hook phase only ever SKIPS the sweep. Cleared when the hook phase ends, so a caller
+ * outside an open — the exported seam, a test that moves the stamp — decides from the row.
+ * One slot is enough because opens are serialized: `loadHashStore` keeps one `opening` promise per path.
+ */
+let openStamp: { readonly db: DatabaseSync; readonly due: boolean } | null = null;
+
+/** Whether the open that owns this connection has already settled the generation sweep. */
+function sweepSettledByOpen(db: DatabaseSync): boolean {
+  return openStamp !== null && openStamp.db === db;
+}
 
 export type StoreOpenHook = (db: DatabaseSync, info: { existed: boolean }) => void | Promise<void>;
 
@@ -303,17 +331,18 @@ export function onStoreOpen(hook: StoreOpenHook): void {
   openHooks.push(hook);
 }
 
-function openDbWithBusyRetry(storePath: string, budget?: BusyBudget): DatabaseSync {
+function openDbWithBusyRetry(storePath: string, budget?: BusyBudget): OpenedDb {
   return withBusyRetry(() => openDb(storePath, budget), budget);
 }
 
-function openDb(storePath: string, budget?: BusyBudget): DatabaseSync {
+function openDb(storePath: string, budget?: BusyBudget): OpenedDb {
   const db = new DatabaseSync(storePath, {
     // WHY: this option IS the busy handler the wiring guard reads back as `PRAGMA busy_timeout`.
     timeout: resolveBusyBudget(budget).timeoutMs,
   });
+  let stampDue: boolean;
   try {
-    buildStore(db);
+    stampDue = buildStore(db);
   } catch (error) {
     try {
       db.close();
@@ -322,7 +351,7 @@ function openDb(storePath: string, budget?: BusyBudget): DatabaseSync {
     }
     throw error;
   }
-  return db;
+  return { db, stampDue };
 }
 
 function tableColumns(db: DatabaseSync, table: string): Set<string> {
@@ -370,6 +399,172 @@ function renameGenerationColumn(db: DatabaseSync, table: string): void {
     }
   }
   db.exec(`ALTER TABLE ${table} ADD COLUMN anchor_generation INTEGER NOT NULL DEFAULT 0`);
+}
+
+// WHY: (#87c) the open stamp — the store's own record that its schema, the generation its persisted
+// WHY: anchors were derived under, and the BUILD that wrote it all agree with the one reading it.
+// WHY: It is carried as the header field `PRAGMA user_version` (free: no query, no lock) plus one
+// WHY: indexed read of `meta`. The version row is part of the gate even though it carries no new
+// WHY: information, because the fast path SKIPS the upsert that maintains it: a gate that ignored the
+// WHY: row could leave a deleted one unrestored for as long as the rest of the stamp matched.
+// WHY: The value is a VERSIONED FORMAT and carries IDENTITY only:
+// WHY:     <format>:<store schema>:<canon>:<anchor generation>:<registered open hooks>
+// WHY: - the LEADING field is the format version: bump it when the field list below changes shape, so
+// WHY:   every stamp written by the old shape is invalid BY CONSTRUCTION rather than by luck.
+// WHY: - `HASH_STORE_VERSION` is the schema half — `constants.ts` says when it must move.
+// WHY: - `CANON_VERSION` and `ANCHOR_GENERATION` are the persisted anchor set's generation.
+// WHY: - the OPEN-HOOK COUNT is the build fingerprint. The registry is built by module top-level
+// WHY:   pushes, so the count is a function of the BUILD: a build that registers an ADDITIONAL hook
+// WHY:   mismatches every stamp an older build wrote, instead of silently suppressing the new hook's
+// WHY:   work. LIMITATION, stated rather than implied: a SWAP (one hook removed, another added) keeps
+// WHY:   the count, so this guards ADDITION only — a semantic change to an existing hook still needs
+// WHY:   the version bump above. The count is preferred over a hash of the hook list: a hash would
+// WHY:   have to be measured free on the bundled artifact to earn its place, and the count is free by
+// WHY:   construction. A module imported lazily that registers a hook later costs one extra slow open:
+// WHY:   the count moves, the stamp mismatches, and the next open re-stamps.
+// WHY: NO TIME-VARYING STATE IS FOLDED IN. Due-ness instants — the periodic served-mirror prune's
+// WHY: last-run row, the janitor's schedule — live in their OWN `meta` rows. Folding one in would
+// WHY: conflate "the store's identity changed" with "maintenance is due", and a reader could not tell
+// WHY: from a mismatch WHY the open took the slow path.
+// WHY: BOTH halves must match, so a half-written stamp can only send the next open down the slow path,
+// WHY: never past it.
+//
+// WHY: the traps this gate is built around, and how each is answered:
+// WHY: (a) A STAMP WITH A MISSING OBJECT: the DDL above runs unconditionally, so a dropped table or
+// WHY:     index is recreated on the very next open. What a matching stamp buys is narrower than
+// WHY:     "everything is present" — it says the SWEEP has run for this provenance, so the sweep is all
+// WHY:     it may skip. Rows the skipped sweep would have removed survive (see (c)); every reader that
+// WHY:     consumes them is generation-gated and fails closed, so the exposure is latency, not safety.
+// WHY: (b) TWO BUILDS SHARING ONE STORE: a build whose stamp differs — including one that writes no
+// WHY:     stamp at all — mismatches, re-sweeps, and re-stamps its own view; the other build then
+// WHY:     mismatches in turn. Fail-safe and merely slower: they alternate between the slow and fast
+// WHY:     paths instead of either one trusting a stamp it did not write.
+// WHY: (c) ROW-LEVEL POISONING: the deliberate trade, and the DURATION of the exposure. The sweep is an
+// WHY:     upgrade/migration action now, not a per-open one, so a row poisoned AFTER the sweep that
+// WHY:     stamped the store is not removed by a stamp-matching reopen. What this changes is WHEN foreign
+// WHY:     rows can exist, never WHETHER they can:
+// WHY:     - TODAY'S BOUND, the only deterministic one: the next stamp-invalidating event — a generation
+// WHY:       or schema bump, an ADDITIONAL open hook, or a fresh store. Nothing else bounds it until the
+// WHY:       periodic bound lands.
+// WHY:     - PERIODIC BOUND: DESIGN-COMMITTED AND NOT YET IMPLEMENTED. Issue #90 records it — GC on
+// WHY:       lifecycle events only, throttled to at most about once a day, never on the tool-call open
+// WHY:       path, with batched deletes, `wal_checkpoint(TRUNCATE)` on close and a live-store guard. That
+// WHY:       design is NOT yet in `docs/` (#90 should land it there or as an ADR before this comment can
+// WHY:       cite it as a commitment rather than as an intention).
+// WHY:     - TRIGGER: operator action only — a hand-edited store, or a copy taken from one. Nothing in
+// WHY:       normal operation reaches it.
+// WHY:     WHY THE TRADE IS SURVIVABLE: no honoring path trusts a stored row without re-deriving from the
+// WHY:       bytes it is about. A lease is generation-gated AT USE TIME (`isCurrentAnchorGeneration` on
+// WHY:       the lease's own 3-part `served_snapshot_hash`, `src/mutation-engine/edit-source.ts`), and its
+// WHY:       resolved span must clear the MVCC contiguity gate (`verifyRebasedSpan` -> `E_STALE_RANGE`,
+// WHY:       `src/hashline/served-verification.ts`), whose line identities come from the CURRENT content's
+// WHY:       own lineage (`positionsByIdentity`). The served mirror decides no identity either: it feeds
+// WHY:       an evidence-only scan of the lines about to be written (`findServedHashEcho`,
+// WHY:       `src/hashline/apply.ts`) and, through `retired`, the set of anchors the RESULT may not be
+// WHY:       ASSIGNED to: `loadBlockedHashes` hands them to the identity as `blockedHashes`, and
+// WHY:       `markHashUsed` pre-marks those slots, so no line of the new content is given one. A
+// WHY:       retired anchor is never refused — only never re-assigned — so it decides no identity
+// WHY:       either. A stale row's worst case is a MISS or a fail-closed refusal, never a wrongly
+// WHY:       honored line identity.
+// WHY: (d) `BEGIN IMMEDIATE` CANNOT NEST: the sweep keeps its own in-transaction guard, so a caller
+// WHY:     already inside a transaction still absorbs the sweep instead of opening a second one.
+// WHY: (e) The open hooks' `existed` flag keeps its meaning — computed once in `openStore`, cleared on
+// WHY:     rebuild — and nothing in this stamp reads or clears it.
+const META_VERSION_KEY = "version";
+const META_STAMP_KEY = "store_stamp";
+
+/** The stamp's format version — the leading field, bumped only when the field list itself changes. */
+const STAMP_FORMAT_VERSION = 1;
+
+/** The value the gate compares against, in the format documented above. */
+function storeGenerationStamp(): string {
+  return [
+    STAMP_FORMAT_VERSION,
+    HASH_STORE_VERSION,
+    CANON_VERSION,
+    ANCHOR_GENERATION,
+    openHooks.length,
+  ].join(":");
+}
+
+/**
+ * Whether this store's stamp is current — the ONE fast-path decision of an open, and read-only by
+ * construction: the header field, then the two `meta` rows, and nothing else. A file that is not one
+ * of ours (no `meta` table yet, a partial build, a corrupt header) has no stamp to match, so the
+ * answer is `false` and the slow path heals it; a read never throws out of the open.
+ */
+function storeStampMatches(db: DatabaseSync): boolean {
+  try {
+    // SAFETY: `node:sqlite` returns untyped rows; this lists SQLite's own integer header field.
+    const header = db.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined;
+    if (header?.user_version !== HASH_STORE_VERSION) return false;
+    // SAFETY: untyped rows again — the SELECT lists exactly `key` and `value`, both TEXT NOT NULL.
+    const rows = db
+      .prepare("SELECT key, value FROM meta WHERE key IN (?, ?)")
+      .all(META_VERSION_KEY, META_STAMP_KEY) as unknown as { key: string; value: string }[];
+    const values = new Map(rows.map((row) => [row.key, row.value]));
+    return (
+      values.get(META_VERSION_KEY) === String(HASH_STORE_VERSION) &&
+      values.get(META_STAMP_KEY) === storeGenerationStamp()
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Write BOTH halves of the stamp: the `meta` row carrying the store's provenance, and the header field
+ * `PRAGMA user_version` that carries the schema half the gate reads. Called ONLY by `openStore`, and only
+ * once EVERY open hook has succeeded, because the stamp certifies the whole open — the build, its
+ * migrations, its sweep AND the hook work that follows them. Written from inside `buildStore`, where it
+ * used to live, it certifies work that has not happened yet: a hook that throws then leaves a
+ * valid-looking stamp over an unfinished store, and the next open takes the fast path over it. The two
+ * statements are independent and each is atomic, so an interruption between them leaves a stamp that does
+ * not match — one extra slow open, never a store that reads current while it is not.
+ */
+function writeStoreStamp(db: DatabaseSync): void {
+  db.prepare(
+    "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run(META_STAMP_KEY, storeGenerationStamp());
+  // SAFETY: HASH_STORE_VERSION is this module's own numeric literal constant, never input.
+  db.exec(`PRAGMA user_version = ${HASH_STORE_VERSION}`);
+}
+
+/**
+ * Whether one PERIODIC open item is due, judged by the last-run instant it stores under `key` — one
+ * indexed single-row read, so ASKING costs no write and no lock. An item with no record, or with a
+ * record that is not an instant, is due: the conservative direction for retention, and the direction
+ * that keeps an item running exactly as it did before this mechanism existed.
+ */
+export function periodicDue(
+  db: DatabaseSync,
+  key: string,
+  intervalMs: number,
+  now: number,
+): boolean {
+  try {
+    const row = db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as
+      | { value?: string }
+      | undefined;
+    if (row?.value === undefined) return true;
+    const lastRun = Number(row.value);
+    return !Number.isFinite(lastRun) || now - lastRun >= intervalMs;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Record that a periodic item ran. Written ONLY by a run that did its work: the record is itself a
+ * write, so a due-but-idle run must not leave one — it stays due and is asked again next open, which
+ * keeps the idle open lock-free and keeps the item's own honesty ("ran" means "did something").
+ */
+export function markPeriodicRun(db: DatabaseSync, key: string, now: number): void {
+  withBusyRetry(() => {
+    db.prepare(
+      "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run(key, String(now));
+  });
 }
 
 // WHY: snapshot-store reads and writes these tables through HashSnapshotIO, so the DDL lives
@@ -430,6 +625,17 @@ export function ensureSnapshotTables(db: DatabaseSync): void {
   // WHY: (`${CANON_VERSION}:${ANCHOR_GENERATION}:${checksum}`) is the anchor generation, so a
   // WHY: canon-only change keeps leases while a generation change sweeps them; pre-rename `3:`
   // WHY: 2-part rows carry no middle component and never match, so they sweep as unknown.
+  // WHY: (#87c) THE FAST PATH, and the reason the check lives HERE: both sweep call sites funnel
+  // WHY: through this one function — `buildStore`'s own call and the snapshot-store open hook's
+  // WHY: re-entrant `ensureSnapshotSchema` — so a single check covers both, and a future caller of the
+  // WHY: sweep cannot forget it.
+  // WHY: (#87d) WHOSE DECISION THIS IS: the store's, read from its stamp — EXCEPT while an open owns this
+  // WHY: connection and is in its hook phase, where `buildStore` has already settled the sweep at the
+  // WHY: sweep's own site and the stamp is not written yet (`openStamp`): re-deciding from the row there
+  // WHY: would sweep a SECOND time on every slow open. Either way the slow path runs ONCE per open.
+  // WHY: the DDL above stays unconditional (and takes no write lock once applied) — see trap (a).
+  if (sweepSettledByOpen(db) || storeStampMatches(db)) return;
+
   const anchorLike = `%:${ANCHOR_GENERATION}:%`;
   // WHY: tables created later in the fresh-build path (served_leases) may not exist
   // WHY: yet when this runs — the sweep touches only what is there.
@@ -540,7 +746,11 @@ export function ensureFileUndoSchema(db: DatabaseSync): void {
   addColumnIfMissing(db, "cut_intent", "direction", "TEXT");
 }
 
-function buildStore(db: DatabaseSync): void {
+function buildStore(db: DatabaseSync): boolean {
+  // WHY: the open's stamp-due decision is made ONCE here and handed back through `openDb`: it gates the
+  // WHY: sweep below and the `version` upsert at the end, and it is what `openStore` owes a stamp write
+  // WHY: for once the last hook has succeeded (see `writeStoreStamp`). Nothing here writes the stamp.
+  const stampDue = !storeStampMatches(db);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec("PRAGMA foreign_keys = ON");
@@ -639,10 +849,20 @@ function buildStore(db: DatabaseSync): void {
   addColumnIfMissing(db, "served", "canons", "TEXT");
   addColumnIfMissing(db, "served", "snapshotId", "TEXT");
   addColumnIfMissing(db, "undo", "result_content", "TEXT NOT NULL DEFAULT ''");
+  // WHY: (#87c) the other half of the fast path: a stamp that is already current records this version
+  // WHY: and this generation, so re-writing either would take the write lock on every open to say what
+  // WHY: the store already says. The upsert stays exactly where it was — LAST, inside the retry loop and
+  // WHY: after the sweep's transaction — so a contended store records its version only once the rest of
+  // WHY: the build has settled.
+  // WHY: (#87d) this row is NOT one of the stamp's two halves — it is the row the gate also reads — and
+  // WHY: its value is a build constant, so it belongs to the build. The halves that certify the WHOLE
+  // WHY: open are owed to `openStore` instead: written here they would certify hook work that has not run.
+  if (!stampDue) return false;
   db.prepare(
     "INSERT INTO meta (key, value) VALUES ('version', ?) " +
       "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
   ).run(String(HASH_STORE_VERSION));
+  return true;
 }
 
 function isHealthy(db: DatabaseSync): boolean {
@@ -684,41 +904,69 @@ async function openStore(storePath: string, budget?: BusyBudget): Promise<HashSt
   await mkdir(hashStoreDir(), { recursive: true });
 
   let existed = existsSync(storePath);
-  let db: DatabaseSync;
+  let opened: OpenedDb;
   try {
-    db = openDbWithBusyRetry(storePath, budget);
+    opened = openDbWithBusyRetry(storePath, budget);
   } catch (error) {
     if (!isCorruptionError(error)) throw error;
     console.error("Hash store failed to open, rebuilding:", error);
     await quarantineStore(storePath);
     existed = false;
-    db = openDbWithBusyRetry(storePath, budget);
+    opened = openDbWithBusyRetry(storePath, budget);
   }
+  let db = opened.db;
   if (!isHealthy(db)) {
     shutdownDb(db);
     await quarantineStore(storePath);
     existed = false;
-    db = openDbWithBusyRetry(storePath, budget);
+    opened = openDbWithBusyRetry(storePath, budget);
+    db = opened.db;
   }
 
-  for (const hook of openHooks) {
-    await hook(db, { existed });
-  }
-
-  cachedDb = { path: storePath, db };
-
-  if (!exitHandlerRegistered) {
-    exitHandlerRegistered = true;
-    process.once("exit", () => shutdownHashStore());
-    for (const sig of ["SIGINT", "SIGTERM"] as const) {
-      process.once(sig, () => {
-        shutdownHashStore();
-        process.kill(process.pid, sig);
-      });
+  // WHY: the open's own stamp decision, in memory from here to the end of the open: the hooks' re-entrant
+  // WHY: ensures consult it (`sweepSettledByOpen`) rather than a stamp this open has not written yet, and
+  // WHY: the stamp write below is owed exactly when it says so.
+  const stamp = { db, due: opened.stampDue };
+  openStamp = stamp;
+  try {
+    for (const hook of openHooks) {
+      await hook(db, { existed });
     }
-  }
 
-  return { db, engine: "node:sqlite" };
+    // WHY: (#87d) THE STAMP IS THE OPEN'S LAST STEP: both halves, written together, and only now that
+    // WHY: EVERY hook has succeeded — they certify the whole open, the build, migrations and sweep that
+    // WHY: `openDb` ran included. Written inside the build they certify work that has not happened yet,
+    // WHY: so a hook that throws leaves a valid-looking stamp over an unfinished store and the next open
+    // WHY: takes the fast path over it. This write is also OUTSIDE `openDbWithBusyRetry`'s envelope (the
+    // WHY: open's last write, after the hook loop), so it carries its own retry: without one, a store that
+    // WHY: is merely busy this instant would fail an open that has already done all of its work.
+    if (stamp.due) withBusyRetry(() => writeStoreStamp(db), budget);
+
+    cachedDb = { path: storePath, db };
+
+    if (!exitHandlerRegistered) {
+      exitHandlerRegistered = true;
+      process.once("exit", () => shutdownHashStore());
+      for (const sig of ["SIGINT", "SIGTERM"] as const) {
+        process.once(sig, () => {
+          shutdownHashStore();
+          process.kill(process.pid, sig);
+        });
+      }
+    }
+
+    return { db, engine: "node:sqlite" };
+  } finally {
+    // WHY: NOT housekeeping, and not defensive tidiness: this clear is what keeps the slot to the hook
+    // WHY: phase. The slot answers one question — "is an open in its hook phase on THIS connection" —
+    // WHY: and leaving it set lets the next ensure on the still-open connection read a spent decision:
+    // WHY: `sweepSettledByOpen` matches the live handle, so an ensure that runs OUTSIDE an open —
+    // WHY: `ensureSnapshotTables` called directly, which is how seven committed tests sweep after moving
+    // WHY: the stamp (`test/integration/undo-generation-bump.test.ts`, "generation bump refuses pre-v3
+    // WHY: anchors") — silently SKIPS the sweep it owes, and the rows it had to remove survive. Delete
+    // WHY: this line and those seven tests fail.
+    openStamp = null;
+  }
 }
 
 /**
