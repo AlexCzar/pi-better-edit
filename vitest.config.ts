@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 /**
  * Test-harness hardening (#84). This suite is I/O- and subprocess-heavy: 204 files, each opening the
@@ -56,5 +56,8 @@ export default defineConfig({
     setupFiles: ["./test/support/isolate-store.ts"],
     testTimeout: 20_000,
     hookTimeout: 30_000,
+    // WHY: (#87) a scratch *.test.ts in an ignored tmp/ or temp/ joined the suite and failed the gate on
+    // WHY: a clean tree. Spread the defaults, never hand-roll: an upgrade cannot silently drop one.
+    exclude: [...configDefaults.exclude, "tmp/**", "temp/**"],
   },
 });
