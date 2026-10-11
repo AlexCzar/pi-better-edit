@@ -53,7 +53,9 @@ const harnessCeilingMs = Math.min(harnessTestTimeoutMs, harnessHookTimeoutMs) / 
  * on host load, and each is refutable by a one-token mutation of the loop: attempt once and the exact
  * count reddens; drop the deadline check and the reduced count reddens; build the deadline from the
  * production model (`busyBudgetMs()` where the loop passes `busyBudgetMs(budget)`) and the jump stops
- * firing, so the episode spends the count and the early-exit count reddens.
+ * firing, so the episode spends the count and the early-exit count reddens. The third scripted clock
+ * settles INSIDE the injected model's reach but past the per-attempt term alone, so a deadline built
+ * as `timeoutMs * maxAttempts` reddens its count — the discrimination the two above leave out.
  *
  * These tests need a REAL second connection holding a real RESERVED lock, so they open the store
  * under a temp HOME (the shape `test/core/hash-store.test.ts` uses) and opt out of the worker-wide
@@ -285,6 +287,88 @@ describe("hash store busy wiring (#87b)", () => {
         expect(attempts, diagnostics).toBeLessThanOrEqual(maxAttempts);
         expect(attempts, diagnostics).toBe(2);
         expect(draws, diagnostics).toBe(1);
+        expect(rival.isOpen).toBe(true);
+      });
+    });
+  });
+
+  /**
+   * The deadline's MAGNITUDE, not just its positivity: the model's backoff sum is part of it. The
+   * early-exit test above jumps past BOTH that model and the bare per-attempt term, and the frozen
+   * clock never reaches any deadline, so neither separates `busyBudgetMs` from `timeoutMs *
+   * maxAttempts` — a deadline built as the latter passed this whole file. This clock settles inside
+   * the window those two expressions open, where only the full model is out of reach, so the count
+   * stays the only terminator and the deadline's size is what the assertion reads.
+   *
+   * The injected budget makes the two expressions differ by construction — 4 x 25ms = 100ms of
+   * internal waiting against a 450ms model (the three backoffs `maxAttempts - 1` grants: 50 + 100 +
+   * 200) — so the jump, 300ms, is 3x above the per-attempt term and 0.67x of the model. A deadline of
+   * `timeoutMs * maxAttempts` throws on the third reading (a count of 2, because 300 >= 100); the full
+   * model leaves the loop to its own count, which is what is asserted below.
+   */
+  it("builds the deadline from the full model, backoff sum included", async () => {
+    await withTempHome(async (home) => {
+      await withLockedStore(home, async (rival) => {
+        let draws = 0;
+        const timeoutMs = 25;
+        const maxAttempts = 4;
+        // Reading 1 sets the deadline and readings 2-4 answer the check after each failed attempt:
+        // 0 keeps the first retry inside either deadline, 300 is past the per-attempt term (so a
+        // backoff-blind deadline ends the episode there) and short of the model (so the correct
+        // deadline does not). The fallback repeats the jump, so a deadline that fails to fire
+        // terminates on the count, never on a hang.
+        const jump = 300;
+        const readings = [0, 0, jump];
+        const budget: BusyBudget = {
+          timeoutMs,
+          maxAttempts,
+          backoffBaseMs: 50,
+          backoffCapMs: 200,
+          backoffJitterMs: 0,
+          now: () => readings.shift() ?? jump,
+          random: () => {
+            draws++;
+            return 0;
+          },
+        };
+        const model = busyBudgetMs(budget);
+        expect(model).toBe(450); // 4 x 25 + (50 + 100 + 200): the injected schedule at max jitter
+        expect(timeoutMs * maxAttempts).toBe(100); // the deadline a backoff-blind model would build
+        // REQUIRED for the discrimination: the jump is only a discriminator if the two deadline
+        // expressions DIFFER and it lies between them.
+        expect(jump).toBeGreaterThan(timeoutMs * maxAttempts);
+        expect(jump).toBeLessThan(model);
+
+        const started = Date.now();
+        let error: unknown;
+        try {
+          await loadHashStore(budget);
+        } catch (caught) {
+          error = caught;
+        }
+        const elapsed = Date.now() - started;
+        const attempts = draws + 1;
+        const diagnostics = JSON.stringify({
+          attempts,
+          elapsed,
+          model,
+          perAttemptTerm: timeoutMs * maxAttempts,
+          jump,
+          production: busyBudgetMs(),
+          perAttempt: Math.round(elapsed / attempts),
+          rivalStillHolds: rival.isOpen,
+        });
+
+        // The ORIGINAL busy error survives the deadline: it changes when the loop stops, not what it
+        // reports.
+        expect(error, diagnostics).toBeInstanceOf(Error);
+        expect((error as Error).message).toMatch(/busy|locked/i);
+        expect((error as { errcode?: number }).errcode).toBe(5);
+        // The COUNT terminates the episode here — the clock never reaches the model — so the exact
+        // count is an invariant, and it is the one reading that separates the deadline's two terms:
+        // dropping the backoff sum throws on the third reading and reads 2 against this 4.
+        expect(attempts, diagnostics).toBeGreaterThanOrEqual(1);
+        expect(attempts, diagnostics).toBe(maxAttempts);
         expect(rival.isOpen).toBe(true);
       });
     });

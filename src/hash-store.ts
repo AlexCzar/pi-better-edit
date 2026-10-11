@@ -237,11 +237,14 @@ export function busyBudgetMs(overrides?: BusyBudget): number {
  * run before the store handle is published and `withStore` refuses without it, so the open path has
  * one transaction while the write path retries its whole body.
  * The ceiling on re-entry is therefore `maxAttempts` and not one attempt — measured 4 -> 8 (2x) on an
- * idempotent, lock-serialized path, with the SAME 2000ms of internal waiting either way, a WASH under
- * sustained contention because a contended attempt blocks at its FIRST lock-taking statement
- * (~287-289ms at timeout 250 under load 68, matching the 303-325ms above) and does no body work —
- * while the INTERLEAVED case, a rival taking the lock BETWEEN statements, can reach that ceiling and
- * is BOUNDED BUT UNMEASURED.
+ * idempotent, lock-serialized path, at the SAME 4300ms TOTAL model either way: the internal waiting
+ * moved with the shape, 8 x 250ms = 2000ms here against 4 x 1000ms = 4000ms there, while the model
+ * that replaced it holds the TOTAL at 4300ms. That is a WASH under sustained contention, because a
+ * contended attempt blocks at its FIRST lock-taking statement — the one-attempt cost the constants
+ * block above records as 303-325ms idle and 299-334ms loaded, re-measured here as ~279-290ms with no
+ * added load (loadavg 7) and ~292-327ms under load (40 CPU hogs on 10 cores, loadavg 89 -> 93) — and
+ * does no body work. The INTERLEAVED case, a rival taking the lock BETWEEN statements, can reach
+ * that ceiling and is BOUNDED BUT UNMEASURED.
  */
 export function withBusyRetry<T>(fn: () => T, overrides?: BusyBudget): T {
   const budget = resolveBusyBudget(overrides);
