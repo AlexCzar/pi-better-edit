@@ -105,25 +105,35 @@ function sleepSync(ms: number): void {
 // WHY: 4300ms model — so the two shapes cannot be told apart by aggregate duration; the tests below
 // WHY: separate them by attempt count and by per-attempt stall, which the shapes DO differ in.
 // WHY: the model is what the constants were chosen against, not what an attempt costs. Measured
-// WHY: against a permanently held lock at timeout 250, ONE attempt spends 303-325ms idle (3 samples)
-// WHY: and 299-334ms under load (8 runs, 8 CPU hogs on 10 cores, load average 46): the 250ms internal
-// WHY: wait plus 53-84ms of connection-open and statement work. A retry pays that ONCE, not once per
-// WHY: lock-taking statement — measured at timeouts 25/50/100/250/500/1000, one attempt costs 33/69/131/
-// WHY: 306/579/1116ms (one sample each), ~1.1-1.4x the timeout and linear in it — so the old 4 x 1000
-// WHY: shape's real ceiling was a measured 4719ms episode — 4 attempts averaging ~1104.75ms plus 300ms
-// WHY: of sleeps — not the >= 21s a per-statement reading suggests; the 4764ms of 4 x 1116 + 3 x 100 is
-// WHY: a back-formation: 1116ms is a STANDALONE sample, not what that episode's attempts averaged.
+// WHY: against a permanently held lock at timeout 250, ONE attempt spends 312-342ms with no load
+// WHY: added by this pass (8 samples, Apple M1 Pro / 10 cores, loadavg 4.36-4.48): that is the ONE
+// WHY: band for this quantity. No loaded band stands beside it — the same measurement under added
+// WHY: load has read three different figures across three passes on this host — and no loaded
+// WHY: maximum is offered instead, so no competing figure is left for a reader to reconcile. The
+// WHY: attempt is the 250ms internal wait plus 62-92ms of connection-open and statement work (band
+// WHY: minus the wait). A retry pays that ONCE, not once per lock-taking statement — measured at
+// WHY: timeouts 25/50/100/500/1000 against the same held lock (250 is the band above), one attempt
+// WHY: costs 38/73/140/603/1137ms (3 samples each, median, loadavg 4.36-4.41), ~1.1-1.5x the
+// WHY: timeout — so the old 4 x 1000 shape's real ceiling was a measured 4843-4897ms episode (3
+// WHY: runs, loadavg 3.83-4.77) — 4 attempts averaging ~1136-1149ms plus 300ms of sleeps — not
+// WHY: the per-statement reading a fixed second of waiting would suggest: the series' standalone
+// WHY: 1137ms sample does reproduce that episode here (4 x 1137 + 300 = 4848ms), but that is a
+// WHY: coincidence, not a derivation: a standalone sample is not what an episode's attempts cost.
 // WHY: the deadline is the backstop, not the usual terminator: it is checked AFTER each attempt, so it
 // WHY: can only end an episode between attempts — one capped sleep plus one already-running attempt past
-// WHY: it. At these constants the COUNT ends the episode first: 8 attempts on every run — 4595-4662ms
-// WHY: with no budget injected, idle (6 runs), and 4650-4811ms under load (8 runs) — i.e. +295..+511ms
-// WHY: OVER the 4300ms model, because each attempt costs ~303-334ms rather than its modelled 250ms.
-// WHY: a budget injected with exactly these values measures the same episode (4621-4815ms, 11 runs),
-// WHY: which is why the contention test below injects nothing: an injected budget replaces every
-// WHY: constant it would be guarding.
+// WHY: it. At these constants the COUNT ends the episode first: 8 attempts on every run — 4710-4840ms
+// WHY: with no load added by this pass (12 runs: 6 with no budget injected, 6 with these exact
+// WHY: values injected; loadavg 3.48-4.62, same host and process as the band above) — i.e.
+// WHY: +410..+540ms OVER the 4300ms model. That overshoot is the band's 62-92ms per-attempt excess
+// WHY: times 8 (496..736ms) less the 175ms by which the model's maximum jitter (7 x 50ms) exceeds
+// WHY: the fixed 0.5 draw these runs paid (7 x 25ms): 321..561ms, which brackets the measured
+// WHY: 410..540ms. The injected and uninjected halves are ONE band, not two: a budget injected with
+// WHY: exactly these values measures the same episode, which is why the contention test below
+// WHY: injects nothing — an injected budget replaces every constant it would be guarding.
 // WHY: scoped to THESE constants: an injected budget carries its own, larger model — maxAttempts 100
-// WHY: models 68.7s and measured 68.9s over 95 attempts (the DEADLINE, not the count, ended that one)
-// WHY: — so what is bounded is the episode's own model, never 'one episode is capped at 4300ms'.
+// WHY: models 68.7s (code-derived: 100 x 250ms plus 43.7s of capped backoff and jitter) and measured
+// WHY: 69.5s over 93 attempts in ONE sample, loadavg 5.24 (the DEADLINE, not the count, ended it) —
+// WHY: so what is bounded is the episode's own model, never 'one episode is capped at 4300ms'.
 // WHY: 4300ms is 21.5% of the harness `testTimeout` (20000ms) and 14% of `hookTimeout` (30000ms), so
 // WHY: contention surfaces as the busy error rather than as a killed test. The corrupt-store rebuild
 // WHY: path can spend three budgets (3 x 4300 = 12.9s), but only immediately after quarantine
@@ -240,9 +250,10 @@ export function busyBudgetMs(overrides?: BusyBudget): number {
  * idempotent, lock-serialized path, at the SAME 4300ms TOTAL model either way: the internal waiting
  * moved with the shape, 8 x 250ms = 2000ms here against 4 x 1000ms = 4000ms there, while the model
  * that replaced it holds the TOTAL at 4300ms. That is a WASH under sustained contention, because a
- * contended attempt blocks at its FIRST lock-taking statement — the one-attempt cost the constants
- * block above records as 303-325ms idle and 299-334ms loaded, re-measured here as ~279-290ms with no
- * added load (loadavg 7) and ~292-327ms under load (40 CPU hogs on 10 cores, loadavg 89 -> 93) — and
+ * contended attempt blocks at its FIRST lock-taking statement — the ONE per-attempt band the
+ * constants block above keeps, quoted there with its n, host and loadavg; no second band is cited
+ * here, and the same pass counted the attempts each shape stops at: 4 on every old-shape run, 8 on
+ * every run of these constants — and
  * does no body work. The INTERLEAVED case, a rival taking the lock BETWEEN statements, can reach
  * that ceiling and is BOUNDED BUT UNMEASURED.
  */
