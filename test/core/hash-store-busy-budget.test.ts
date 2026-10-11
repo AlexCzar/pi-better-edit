@@ -48,10 +48,12 @@ const harnessCeilingMs = Math.min(harnessTestTimeoutMs, harnessHookTimeoutMs) / 
  * ORIGINAL busy error rethrown, the rival's lock still held — and carry every wall-clock reading as a
  * diagnostic in the assertion MESSAGE. Where an exact count IS asserted, the clock is injected through
  * the optional `BusyBudget.now`: FROZEN, so the deadline cannot fire and the count terminates alone
- * (the nominal branch), or jumped PAST the deadline, so the documented backstop ends the episode between
- * attempts (the early-exit branch). Neither branch depends on host load, and each is refutable by a
- * one-token mutation of the loop: attempt once and the exact count reddens; drop the deadline check and
- * the reduced count reddens.
+ * (the nominal branch), or jumped PAST the INJECTED deadline but BELOW the production model, so the
+ * documented backstop ends the episode between attempts (the early-exit branch). Neither branch depends
+ * on host load, and each is refutable by a one-token mutation of the loop: attempt once and the exact
+ * count reddens; drop the deadline check and the reduced count reddens; build the deadline from the
+ * production model (`busyBudgetMs()` where the loop passes `busyBudgetMs(budget)`) and the jump stops
+ * firing, so the episode spends the count and the early-exit count reddens.
  *
  * These tests need a REAL second connection holding a real RESERVED lock, so they open the store
  * under a temp HOME (the shape `test/core/hash-store.test.ts` uses) and opt out of the worker-wide
@@ -199,30 +201,57 @@ describe("hash store busy wiring (#87b)", () => {
    * still held. This is the branch a loaded host reached by accident (a 150ms model against attempts
    * that really cost ~40-50ms each) and the former exact-count assertion called a failure; with a
    * scripted clock the reduced count is an invariant, not a race.
+   *
+   * WHY the jump is 1000ms, and why the injected budget keeps the PRODUCTION backoff schedule: this
+   * test's discrimination is a property of two MODELS, not of the wall clock. The injected budget differs
+   * from the production one in exactly the two fields that bound the episode — the 25ms timeout and the
+   * 4 attempts — so it models 4 x 25 + (100 + 150 + 250) = 600ms, while every NON-EQUIVALENT override of
+   * the `busyBudgetMs` argument lands at or above the production timeout term: dropping the injected
+   * timeout models 250 x 4 + the same 500ms of sleeps = 1500ms, dropping the attempt count 2500ms and
+   * dropping the argument 4300ms, with nothing resolvable between this budget's 600ms and 1500ms. 1000ms
+   * sits inside that gap — 1.67x above the model the loop must have spent and 1.5x under the smallest
+   * model it must not have — so an episode that spent the production constants never fires at the jump
+   * and runs on to the count the assertion below pins.
    */
   it("ends the episode at the deadline when the clock says the budget is spent", async () => {
     await withTempHome(async (home) => {
       await withLockedStore(home, async (rival) => {
         let draws = 0;
         const maxAttempts = 4;
-        const pastDeadline = Number.MAX_SAFE_INTEGER;
+        const production = resolveBusyBudget();
+        // The JUMP is this test's discriminator, and the only value that can be one lies between the two
+        // models this budget can resolve to (doc comment above): past the INJECTED 600ms model, so the
+        // injected deadline fires on reading 3, and short of the 1500ms the smallest non-equivalent
+        // override of the `busyBudgetMs` argument carries, so a deadline that ignored the injection
+        // cannot reach it. The PRODUCTION backoff fields below are what make that window wide: injected
+        // backoff constants would put the injected model at 150ms and leave 160-600ms overrides inside
+        // the same window, below any jump that still reads as "past the deadline". Under `busyBudgetMs()`
+        // the deadline is 4300ms, this jump does not fire, and the episode spends the COUNT instead —
+        // which is what reddens the exact count below. The former `Number.MAX_SAFE_INTEGER` was
+        // distinguishable by NO deadline (it ended the episode under the mutant too, which is exactly how
+        // that mutant survived a six-mutation sweep).
+        const jump = 1_000;
         // Reading 1 sets the deadline (0 + cap), reading 2 still reports the same instant so the loop
-        // retries once, reading 3 is past the deadline and ends the episode.
-        const readings = [0, 0, pastDeadline];
+        // retries once, reading 3 is past the INJECTED deadline and ends the episode. The fallback
+        // repeats the jump, so a deadline that fails to fire terminates on the count, never on a hang.
+        const readings = [0, 0, jump];
         const budget: BusyBudget = {
           timeoutMs: 25,
           maxAttempts,
-          backoffBaseMs: 10,
-          backoffCapMs: 20,
-          backoffJitterMs: 0,
-          now: () => readings.shift() ?? pastDeadline,
+          // The PRODUCTION schedule deliberately — the injected budget must differ from the production
+          // one in the two fields that bound the episode (and not in the backoff constants, or an
+          // override of the `busyBudgetMs` argument could resolve between the two models).
+          backoffBaseMs: production.backoffBaseMs,
+          backoffCapMs: production.backoffCapMs,
+          backoffJitterMs: production.backoffJitterMs,
+          now: () => readings.shift() ?? jump,
           random: () => {
             draws++;
             return 0;
           },
         };
         const cap = busyBudgetMs(budget);
-        expect(cap).toBe(150); // 4 x 25 + (10 + 20 + 20)
+        expect(cap).toBe(600); // 4 x 25 + (100 + 150 + 250): the production backoff at max jitter
 
         const started = Date.now();
         let error: unknown;

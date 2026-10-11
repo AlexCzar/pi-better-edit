@@ -173,7 +173,12 @@ export interface BusyBudget {
 export function resolveBusyBudget(overrides?: BusyBudget): Required<BusyBudget> {
   return {
     timeoutMs: overrides?.timeoutMs ?? HASH_STORE_BUSY_TIMEOUT,
-    // SAFETY: at least one attempt, so the loop always runs once and can never spin on 0 or -1.
+    // SAFETY: DEFENSIVE, not the mechanism: the loop's own `attempt >= maxAttempts - 1` guard throws
+    // SAFETY: after the FIRST failed attempt for any maxAttempts <= 1, so the single attempt belongs to
+    // SAFETY: the loop. MEASURED by dropping this floor and injecting 0 and -1: each still makes exactly
+    // SAFETY: ONE attempt and rethrows the ORIGINAL error object unchanged (errcode 5). What the floor
+    // SAFETY: buys is a sane RESOLVED model — `resolveBusyBudget` 0 -> 1 attempt and -1 -> 1, and
+    // SAFETY: `busyBudgetMs` 0 -> 250ms and -250 -> 250ms — so no caller reads a non-positive deadline.
     maxAttempts: Math.max(1, Math.trunc(overrides?.maxAttempts ?? BUSY_MAX_ATTEMPTS)),
     backoffBaseMs: overrides?.backoffBaseMs ?? BUSY_BACKOFF_BASE_MS,
     backoffCapMs: overrides?.backoffCapMs ?? BUSY_BACKOFF_CAP_MS,
@@ -221,6 +226,22 @@ export function busyBudgetMs(overrides?: BusyBudget): number {
  * undo-store and the served session — so this budget and its deadline apply to all of them, not just
  * to the open. On exhaustion the ORIGINAL error is rethrown unchanged, so every caller keeps
  * classifying busy against corrupt exactly as it did before.
+ * A retried open re-enters the WHOLE `buildStore` sequence from the top, because the open is not one
+ * transaction: `buildStore` is many independent statement sites — the PRAGMAs, the `CREATE
+ * TABLE/INDEX IF NOT EXISTS` set, the conditional DROP of the pre-session-keyed served shell, the meta
+ * version INSERT, the `addColumnIfMissing` and rename helpers and the two `ensure*` helpers (one of
+ * which owns the generation sweep) — every one autocommit, so partial progress survives a failed
+ * attempt and the only transaction on the OPEN path is the sweep's own `BEGIN IMMEDIATE`. A retried
+ * write re-enters the WHOLE caller body for the same reason, because this budget wraps `withStore`'s
+ * `BEGIN IMMEDIATE ... COMMIT` too, and that transaction cannot serve the open instead: the open hooks
+ * run before the store handle is published and `withStore` refuses without it, so the open path has
+ * one transaction while the write path retries its whole body.
+ * The ceiling on re-entry is therefore `maxAttempts` and not one attempt — measured 4 -> 8 (2x) on an
+ * idempotent, lock-serialized path, with the SAME 2000ms of internal waiting either way, a WASH under
+ * sustained contention because a contended attempt blocks at its FIRST lock-taking statement
+ * (~287-289ms at timeout 250 under load 68, matching the 303-325ms above) and does no body work —
+ * while the INTERLEAVED case, a rival taking the lock BETWEEN statements, can reach that ceiling and
+ * is BOUNDED BUT UNMEASURED.
  */
 export function withBusyRetry<T>(fn: () => T, overrides?: BusyBudget): T {
   const budget = resolveBusyBudget(overrides);
