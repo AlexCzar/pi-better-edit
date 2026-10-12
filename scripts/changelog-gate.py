@@ -8,8 +8,13 @@
 Validates the `## [Unreleased]` block in CHANGELOG.md:
 - Heading and section integrity (conventional commit types)
 - Well-formedness of bullets (markdown syntax, no placeholders, no empty bullets)
+- Entry shape budget (max 100 words / 4 lines per bullet, no raw benchmark telemetry,
+  scope label on current-PR entries) and the squash-title/entry-scope alignment audit
 - Duplicate entry detection
 - Provenance and attribution (#PR)
+- PR-boundary coverage: the current PR must carry an entry, exempt when
+  --squash-title carries a hidden Conventional Commit type (docs, chore, style,
+  test, ci, build) without a breaking `!`
 - Permits multiple curated entries per PR
 
 Usage:
@@ -17,6 +22,8 @@ Usage:
   uv run scripts/changelog-gate.py ledger --pr 123
   uv run scripts/changelog-gate.py ledger --pr 123 --waiver "reason"
   uv run scripts/changelog-gate.py ledger --pr 123 --landing squash
+  uv run scripts/changelog-gate.py ledger --pr 123 --squash-title "feat(scope): subject"
+  uv run scripts/changelog-gate.py ticket   # pre-merge shape-only phase over the ledger
 """
 
 from __future__ import annotations
@@ -37,9 +44,32 @@ EMPTY_BULLET_RE = re.compile(r"^[*+-]\s*$")
 ENTRY_RE = re.compile(r"^\* (?:\*\*[^*]+:\*\* )?\S")
 SCOPED_RE = re.compile(r"^\* \*\*[^*]+:\*\* \S")
 PLACEHOLDER_RE = re.compile(r"\bTBD\b|\bTODO\b|<[^>]+>")
+CODE_SPAN_RE = re.compile(r"`[^`]+`")
 ANNOTATION_RE = re.compile(r"\s*\(#\d+\)\s*$|\s*\(BREAKING CHANGE\)\s*$")
 ATTRIBUTION_RE = re.compile(r"\(#(?P<pr>\d+)\)(?:\s*\(BREAKING CHANGE\))?\s*$")
 PR_REF_RE = re.compile(r"#(\d+)")
+
+# Entry shape floor: one bullet stays a summary, not an essay or a telemetry dump.
+SHAPE_MAX_WORDS = 100
+SHAPE_MAX_LINES = 4
+STRUCTURE_HINT = (
+    "keep the entry as `**scope:** imperative summary, optional 1-2 sentence rationale, "
+    "closing with `(#N)`; paste command output, timings, and benchmark telemetry into the "
+    "PR's Evidence section, never the ledger"
+)
+LOADAVG_RE = re.compile(r"\bload[ _-]?avg\b", re.IGNORECASE)
+PERCENTILE_RE = re.compile(r"\bp\d{2}\b", re.IGNORECASE)
+SUBSECOND_RE = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)?\s*(?:ns|ps|µs|μs|us)\b")
+RATE_RE = re.compile(r"\b[\w-]+/(?:s|sec|min)\b", re.IGNORECASE)
+ERROR_CODE_RE = re.compile(
+    r"\b(?:err|error|errno|exit|status)[ _-]?(?:code|no|num)?\s*[=:]\s*-?\d+\b"
+    r"|\b0x[0-9a-fA-F]{6,}\b",
+    re.IGNORECASE,
+)
+ENTRY_SCOPE_RE = re.compile(r"^\* \*\*(?P<scope>[^*:]+):\*\* \S")
+TITLE_SCOPE_RE = re.compile(r"^[A-Za-z]+(?:\((?P<scope>[^()]+)\))?!?:")
+HIDDEN_TYPES = frozenset({"docs", "chore", "style", "test", "ci", "build"})
+HIDDEN_TITLE_RE = re.compile(r"^(?P<type>[a-z]+)(?P<bang>!)?(\([^)]*\))?:")
 
 KNOWN_SECTIONS = frozenset(
     {
@@ -156,9 +186,113 @@ def check_entries(block: str) -> list[Finding]:
             findings.append(
                 Finding("well-formedness", f"not in the renderer's bullet grammar: {text!r}")
             )
-        if PLACEHOLDER_RE.search(text):
+        if PLACEHOLDER_RE.search(CODE_SPAN_RE.sub("", text)):
             findings.append(Finding("placeholders", f"placeholder text: {text!r}"))
     return findings
+
+
+def iter_entry_blocks(block: str) -> list[list[str]]:
+    """Each bullet grouped with its continuation lines (a wrapped entry stays one entry)."""
+    entries: list[list[str]] = []
+    current: list[str] | None = None
+    for line in block.splitlines():
+        if BULLET_RE.match(line):
+            current = [line]
+            entries.append(current)
+        elif current is not None and line.strip() and not line.lstrip().startswith("#"):
+            current.append(line.rstrip())
+        else:
+            current = None
+    return entries
+
+
+def _telemetry_hit(text: str) -> str | None:
+    """The first raw-telemetry construct in the text, or None."""
+    for detector in (LOADAVG_RE, PERCENTILE_RE, RATE_RE, ERROR_CODE_RE):
+        match = detector.search(text)
+        if match is not None:
+            return match.group(0)
+    subsecond = SUBSECOND_RE.findall(text)
+    if len(subsecond) >= 2:
+        return ", ".join(subsecond[:3])
+    return None
+
+
+def check_entry_shape(block: str) -> list[Finding]:
+    """The word/line budget and the telemetry floor over every `## [Unreleased]` entry."""
+    findings: list[Finding] = []
+    for lines in iter_entry_blocks(block):
+        text = " ".join(part.strip() for part in lines)
+        shown = text if len(text) <= 70 else text[:69] + "…"
+        if len(lines) > SHAPE_MAX_LINES:
+            findings.append(
+                Finding(
+                    "entry-shape",
+                    f"entry spans {len(lines)} lines (max {SHAPE_MAX_LINES}): {shown!r}",
+                    hint=STRUCTURE_HINT,
+                )
+            )
+        words = len(text.split())
+        if words > SHAPE_MAX_WORDS:
+            findings.append(
+                Finding(
+                    "entry-shape",
+                    f"entry carries {words} words (max {SHAPE_MAX_WORDS}): {shown!r}",
+                    hint=STRUCTURE_HINT,
+                )
+            )
+        hit = _telemetry_hit(text)
+        if hit is not None:
+            findings.append(
+                Finding(
+                    "entry-shape",
+                    f"entry carries raw machine telemetry ({hit!r}): {shown!r}",
+                    hint=STRUCTURE_HINT,
+                )
+            )
+    return findings
+
+
+def title_is_hidden(title: str) -> bool:
+    """A hidden Conventional Commit type owes no ledger entry: docs, chore, ... without `!`."""
+    match = HIDDEN_TITLE_RE.match(title.strip().casefold())
+    if match is None or match.group("bang") is not None:
+        return False
+    return match.group("type") in HIDDEN_TYPES
+
+
+def check_squash_alignment(
+    entries: list[str], pr: str | None, squash_title: str | None
+) -> list[Finding]:
+    """The squash commit subject and the PR's ledger entries share a scope.
+
+    Audited only when both sides name a scope: a scopeless conventional title or
+    scopeless entries are already handled by the title grammar and the shape floor.
+    """
+    if pr is None or not squash_title:
+        return []
+    title = TITLE_SCOPE_RE.match(squash_title.strip())
+    if title is None or title.group("scope") is None:
+        return []
+    pr_entries = [entry for entry in entries if attributed_pr(entry) == pr]
+    entry_scopes = [
+        match.group("scope") for entry in pr_entries if (match := ENTRY_SCOPE_RE.match(entry))
+    ]
+    if not entry_scopes:
+        return []
+    title_parts = {part.casefold() for part in re.split(r"[/:,\s]+", title.group("scope")) if part}
+    for scope in entry_scopes:
+        parts = {part.casefold() for part in re.split(r"[/:,\s]+", scope) if part}
+        if title_parts & parts:
+            return []
+    return [
+        Finding(
+            "squash-alignment",
+            f"squash title scope {title.group('scope')!r} matches no entry scope under #{pr} "
+            f"(entry scopes: {', '.join(sorted(set(entry_scopes)))!r})",
+            hint="retarget the ledger entries, or reuse one of their scopes in the squash title",
+        )
+    ]
 
 
 def check_duplicates(sections: dict[str, list[str]]) -> list[Finding]:
@@ -219,6 +353,7 @@ def check_ledger(
     baseline_path: Path = DEFAULT_BASELINE,
     update_baseline: bool = False,
     landing: str | None = None,
+    squash_title: str | None = None,
 ) -> list[Finding]:
     if not changelog.exists():
         return [Finding("ledger", f"{changelog} is missing", fixable=False)]
@@ -233,7 +368,7 @@ def check_ledger(
         return findings + [
             Finding("section-integrity", f"no '{UNRELEASED_HEADING}' block to check")
         ]
-    findings += check_sections(block) + check_entries(block)
+    findings += check_sections(block) + check_entries(block) + check_entry_shape(block)
     sections = parse_unreleased_sections(content)
     findings += check_duplicates(sections)
 
@@ -265,6 +400,14 @@ def check_ledger(
                 )
             )
         elif pr is not None and ref == pr:
+            if ENTRY_SCOPE_RE.match(entry) is None:
+                findings.append(
+                    Finding(
+                        "entry-shape",
+                        f"entry for #{pr} carries no `**scope:**` label: {identity!r}",
+                        hint=STRUCTURE_HINT,
+                    )
+                )
             continue
         elif landing == "squash":
             continue  # squash lands as one commit the ledger cannot resolve; shape checked below
@@ -280,7 +423,10 @@ def check_ledger(
     if pr is not None:
         pr_entries = [entry for entry in entries if attributed_pr(entry) == pr]
         if not pr_entries:
-            findings.append(Finding("landing", f"#{pr} carries no entries in {UNRELEASED_HEADING}"))
+            if not (squash_title is not None and title_is_hidden(squash_title)):
+                findings.append(
+                    Finding("landing", f"#{pr} carries no entries in {UNRELEASED_HEADING}")
+                )
     # Declared squash landing without a PR number: the squash commit is unresolvable
     # from the ledger, so reachability is skipped above and only shape is checked.
     elif landing == "squash" and not entries:
@@ -290,7 +436,27 @@ def check_ledger(
                 f"{UNRELEASED_HEADING} carries no entries (landing=squash declares a PR with nothing to land)",
             )
         )
+    findings += check_squash_alignment(entries, pr, squash_title)
     return findings
+
+
+def check_ticket(changelog: Path) -> list[Finding]:
+    """The pre-merge audit phase: the shape-only floor over `## [Unreleased]`.
+
+    Runs after the squash (ADR-0016 ticket boundary), where provenance is not yet
+    resolvable: a missing ledger or block passes, the curated entries themselves must
+    be well-formed and inside the shape budget.
+    """
+    if not changelog.exists():
+        return []
+    try:
+        content = changelog.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        return [Finding("ledger", f"{changelog} is not UTF-8: {error}", fixable=False)]
+    block = unreleased_block(content)
+    if block is None:
+        return []
+    return check_entries(block) + check_entry_shape(block)
 
 
 def exit_code(findings: list[Finding]) -> int:
@@ -321,6 +487,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="recorded reason to accept fixable findings; never rescues a needs-human one",
     )
+    _ = parser.add_argument(
+        "--squash-title",
+        default=None,
+        help="the squash commit subject (== PR title); audits its scope against this PR's entries",
+    )
     ns = parser.parse_args(argv)
     check_name = cast("str", getattr(ns, "check", "ledger"))
     changelog_arg = cast("str", getattr(ns, "changelog", "CHANGELOG.md"))
@@ -329,20 +500,23 @@ def main(argv: list[str] | None = None) -> int:
     update_baseline_arg = cast("bool", getattr(ns, "update_baseline", False))
     waiver_arg = cast("str | None", getattr(ns, "waiver", None))
     landing_arg = cast("str | None", getattr(ns, "landing", None))
+    squash_title_arg = cast("str | None", getattr(ns, "squash_title", None))
     if landing_arg is not None and landing_arg not in ("squash", "merge"):
         parser.error("--landing must be squash or merge")
+    if squash_title_arg is not None and pr_arg is None:
+        parser.error("--squash-title needs --pr: alignment is audited at the PR boundary")
 
     if check_name == "ticket":
-        print("ticket: pass")
-        return 0
-
-    findings = check_ledger(
-        Path(changelog_arg),
-        pr_arg,
-        Path(baseline_arg),
-        update_baseline_arg,
-        landing_arg,
-    )
+        findings = check_ticket(Path(changelog_arg))
+    else:
+        findings = check_ledger(
+            Path(changelog_arg),
+            pr_arg,
+            Path(baseline_arg),
+            update_baseline_arg,
+            landing_arg,
+            squash_title_arg,
+        )
 
     waiver_clean = waiver_arg.strip() if waiver_arg is not None else None
     if waiver_arg is not None and not waiver_clean:
