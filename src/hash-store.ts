@@ -8,6 +8,7 @@ import { errCode } from "./utils.js";
 import { initHasher } from "./hashline/hasher.js";
 import { HASH_STORE_VERSION, HASH_STORE_BUSY_TIMEOUT } from "./constants.js";
 import { ANCHOR_GENERATION, CANON_VERSION } from "./hashline/hash-identity.js";
+import { DomainError } from "./domain-errors.js";
 
 function homeBase(): string {
   const envHome = process.env.HOME;
@@ -368,10 +369,14 @@ function openDb(storePath: string, budget?: BusyBudget): OpenedDb {
   return { db, stampDue };
 }
 
+function readTableColumns(db: DatabaseSync, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  return new Set(rows.map((row) => row.name));
+}
+
 function tableColumns(db: DatabaseSync, table: string): Set<string> {
   try {
-    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-    return new Set(rows.map((row) => row.name));
+    return readTableColumns(db, table);
   } catch {
     // WHY: the empty set answers TWO questions at once — "this table is not there yet" and "this
     // WHY: schema could not be read" — and the first is the intended one: PRAGMA table_info returns
@@ -381,13 +386,10 @@ function tableColumns(db: DatabaseSync, table: string): Set<string> {
     // WHY: `renameGenerationColumn` go on to attempt their ALTER and fail LOUDLY (`duplicate column
     // WHY: name`, `no such table`) rather than silently, and `buildStore`'s pre-session-keyed
     // WHY: `served` shell guard reads `size > 0` as false and so skips its DROP — the safe direction.
-    // WHY: The one SILENT consumer is `hasTable` in `ensureSnapshotTables`, where a failed read makes
-    // WHY: `hasLeases` false and the sweep skips its two lease deletes: a PARTIAL sweep that reports
-    // WHY: success. That residue is the exposure the stamp gate's own trade already accepts — a
-    // WHY: surviving lease is generation-gated at use, so its worst case is a MISS or a fail-closed
-    // WHY: refusal, never a wrongly honored identity — and the next stamp-invalidating open or the
-    // WHY: janitor's throttled periodic sweep removes it, running the same two predicates
-    // WHY: unconditionally.
+    // WHY: `hasTable` in `ensureSnapshotTables` does NOT take this path: it reads through
+    // WHY: `readTableColumns` and throws on a failed read (#105 Q1), because a failed read there
+    // WHY: would make `hasLeases` false and skip the sweep's two lease deletes — a PARTIAL sweep
+    // WHY: reporting success.
     return new Set<string>();
   }
 }
@@ -699,7 +701,19 @@ export function ensureSnapshotTables(db: DatabaseSync): void {
 
   // WHY: tables created later in the fresh-build path (served_leases) may not exist
   // WHY: yet when this runs — the sweep touches only what is there.
-  const hasTable = (table: string): boolean => tableColumns(db, table).size > 0;
+  // WHY: (#105 Q1) the ONE loud reader: a failed read throws instead of answering "absent",
+  // WHY: because "absent" here skips the sweep's two lease deletes while reporting success.
+  const hasTable = (table: string): boolean => {
+    try {
+      return readTableColumns(db, table).size > 0;
+    } catch (error) {
+      const err = error as { name?: string; message?: string };
+      throw new DomainError("E_UNKNOWN", {
+        errorName: err.name ?? "Error",
+        message: `failed to read columns of table "${table}": ${err.message ?? String(error)}`,
+      });
+    }
+  };
   const hasLeases = hasTable("served_leases");
   const sweepGenerations = (): void => {
     if (hasLeases) {
