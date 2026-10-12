@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, it, expect } from "vitest";
+import { beforeAll, describe, it, expect } from "vitest";
 
 // WHY: pi resolves `pi.extensions` strictly from the package root. For package sources
 // (npm, git) a declared path that is missing on disk is dropped silently — the package
@@ -41,6 +41,18 @@ const isIgnoredByGit = (path: string): boolean => {
     return false;
   }
 };
+
+// WHY: the entry is gitignored build output, so a fresh checkout has no file to assert on.
+// Building it here (exists -> no-op) keeps the file self-contained; a real build writes a
+// real directory, so the symlinked-dist traversal failure cannot recur. `execFileSync`
+// throws on a failed build, so a broken build fails the suite rather than the assertion.
+beforeAll(() => {
+  for (const entry of entries) {
+    if (!existsSync(join(process.cwd(), entry))) {
+      execFileSync("node", ["scripts/build-dist.mjs"], { stdio: "inherit" });
+    }
+  }
+});
 
 describe("extension entry is installable from every source", () => {
   it("declares a single entry", () => {
