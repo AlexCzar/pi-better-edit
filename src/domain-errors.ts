@@ -250,15 +250,11 @@ export interface CodeSpec<P> {
 }
 
 /** SAFETY: exact heading for an unverified fresh-read serve — machine-checkable. */
-export const FRESH_READ_HEADING = "Current range (fresh read):";
+const FRESH_READ_HEADING = "Current range (fresh read):";
 
 /** SAFETY: one general headline clause for an unplaceable bound — no narration. */
 export const UNVERIFIED_HEADLINE =
   "a bound of this range no longer resolves to the line identity it was served with.";
-
-/** SAFETY: recovery sentence for a target-lost rejection — the only retry is a read. */
-export const TARGET_LOST_RECOVERY =
-  "The line you targeted was deleted or replaced; your anchors describe a version of this file that no longer exists. Read the file and re-target.";
 
 // WHY: the anchor width is owned by `HASH_LEN` (`./hashline/alphabet.js`, a
 // WHY: dependency-free leaf), so this module derives the count word instead of
