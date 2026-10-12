@@ -21,7 +21,7 @@
  */
 
 /** Stable symbol key — identical across module reloads in one process. */
-export const IO_BRIDGE_KEY = "pi-lens:io-bridge";
+const IO_BRIDGE_KEY = "pi-lens:io-bridge";
 
 /** Bridge API version this integration speaks. A mismatch means unsupported. */
 export const IO_BRIDGE_VERSION = 2;
@@ -33,7 +33,7 @@ export const IO_BRIDGE_CONSUMER = "pi-better-edit";
 export type IOBridgeRange = [start: number, end: number];
 
 /** Read facet this integration sends: caller evidence, never `disk` by default. */
-export interface IOBridgeRead {
+interface IOBridgeRead {
   ranges: IOBridgeRange[];
   content?: string;
   evidence?: "caller" | "disk";
@@ -43,7 +43,7 @@ export interface IOBridgeRead {
 export type IOBridgeMutate = { kind: "edit"; ranges: IOBridgeRange[] } | { kind: "write" };
 
 /** One `record` entry: at most one facet of each kind. */
-export interface IOBridgeEntry {
+interface IOBridgeEntry {
   filePath: string;
   consumer?: string;
   mutate?: IOBridgeMutate;
@@ -51,10 +51,10 @@ export interface IOBridgeEntry {
 }
 
 /** One facet outcome. `record` never throws; refusals arrive as outcomes. */
-export type IOBridgeOutcome = { accepted: true } | { accepted: false; reason: string };
+type IOBridgeOutcome = { accepted: true } | { accepted: false; reason: string };
 
 /** Per-facet outcomes of one `record` call. */
-export interface IOBridgeResult {
+interface IOBridgeResult {
   read?: IOBridgeOutcome;
   mutate?: IOBridgeOutcome;
 }
