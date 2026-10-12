@@ -94,10 +94,10 @@ describe("rejectUnknownFields", () => {
     expect(() => rejectUnknownFields(obj, allowed, "Request")).not.toThrow();
   });
 
-  it("throws [E_BAD_PAYLOAD] for a single unknown field", () => {
+  it("throws [E_INTERNAL_INVARIANT] for a single unknown field", () => {
     const obj = { path: "test.txt", unknown_field: "value" };
     const allowed = new Set(["path"]);
-    expect(() => rejectUnknownFields(obj, allowed, "Request")).toThrow(/\[E_BAD_PAYLOAD\]/);
+    expect(() => rejectUnknownFields(obj, allowed, "Request")).toThrow(/\[E_INTERNAL_INVARIANT\]/);
   });
 
   it("includes the unknown field name in the error message", () => {

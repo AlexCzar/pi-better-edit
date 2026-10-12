@@ -369,7 +369,7 @@ export function applyEdit(
     precomputedHashes ??
     (filePath === undefined
       ? (() => {
-          throw new DomainError("E_BAD_PAYLOAD", {
+          throw new DomainError("E_INTERNAL_INVARIANT", {
             message: "applyEdit requires precomputed hashes or a file path.",
           });
         })()

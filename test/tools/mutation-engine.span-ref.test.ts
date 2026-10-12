@@ -610,13 +610,13 @@ describe("MutationEngine — reference payloads at the engine seam (ticket-04 re
         );
         // WHY: `parseEdits` reads only `payload.mode` (pipeline.ts:386-388), so a disagreeing
         // nested `span.mode` validates silently and ships whichever arm `payload.mode` names.
-        // The nested mode must be validated against the top-level one — loud E_BAD_PAYLOAD.
+        // The nested mode must be validated against the top-level one — loud E_INTERNAL_INVARIANT.
         expect(
           isMutationFailure(result),
           `span.mode ${spanMode} vs mode ${payloadMode} must be refused, not validated silently`,
         ).toBe(true);
         if (!isMutationFailure(result)) continue;
-        expect(result.code).toBe("E_BAD_PAYLOAD");
+        expect(result.code).toBe("E_INTERNAL_INVARIANT");
         await expect(readFile(`${cwd}/sample.txt`, "utf-8")).resolves.toBe("a\nb\nc\nd\ne\n");
       }
     });
@@ -727,7 +727,7 @@ describe("MutationEngine — reference payloads at the engine seam (ticket-04 re
           : "zero-line literal must be refused",
       ).toBe(true);
       if (!isMutationFailure(result)) return;
-      expect(result.code).toBe("E_BAD_PAYLOAD");
+      expect(result.code).toBe("E_INTERNAL_INVARIANT");
       expect(result.message).toContain('"text"');
       expect(result.message).toContain("must carry at least one line");
       await expect(readFile(`${cwd}/sample.txt`, "utf-8")).resolves.toBe("a\nb\nc\nd\ne\n");

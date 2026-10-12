@@ -344,6 +344,6 @@ describe("anchor file scope", () => {
     // WHY: no pathless file materialization — the programmer error fires before
     // WHY: any content-only derivation could serve a file's rows.
     const edit = resEdit({ anchor_from: "AAAA", anchor_to: "AAAA", text: "X" });
-    expect(() => applyEdit("a\n", edit)).toThrow(/E_BAD_PAYLOAD/);
+    expect(() => applyEdit("a\n", edit)).toThrow(/E_INTERNAL_INVARIANT/);
   });
 });

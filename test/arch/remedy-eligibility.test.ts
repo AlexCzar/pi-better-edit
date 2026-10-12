@@ -29,7 +29,8 @@ type RemedyFreeCode =
   | "E_FOREIGN_ANCHOR"
   | "E_UNVERIFIED_RANGE"
   | "E_STALE_RANGE"
-  | "E_NOOP_LOOP";
+  | "E_NOOP_LOOP"
+  | "E_INTERNAL_INVARIANT";
 
 const REMEDY_FREE: RemedyFreeCode[] = [
   "E_UNKNOWN",
@@ -38,6 +39,7 @@ const REMEDY_FREE: RemedyFreeCode[] = [
   "E_UNVERIFIED_RANGE",
   "E_STALE_RANGE",
   "E_NOOP_LOOP",
+  "E_INTERNAL_INVARIANT",
 ];
 
 const FREE_EXAMPLES: { [K in RemedyFreeCode]: ErrorPayloadMap[K] } = {
@@ -64,6 +66,7 @@ const FREE_EXAMPLES: { [K in RemedyFreeCode]: ErrorPayloadMap[K] } = {
     servedRows: [{ position: 0, hash: "abc" }],
     servedBlock: "abcc│alpha",
   },
+  E_INTERNAL_INVARIANT: { message: "Path contains null byte" },
 };
 
 // WHY: an intent-guessing suggestion steers the model's next action, so a

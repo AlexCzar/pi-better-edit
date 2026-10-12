@@ -25,7 +25,7 @@ export function rejectUnknownFields(
   const unknown = Object.keys(obj).filter((key) => !allowed.has(key));
   if (unknown.length > 0) {
     const suffix = hint ? ` ${hint}` : "";
-    throw new DomainError("E_BAD_PAYLOAD", {
+    throw new DomainError("E_INTERNAL_INVARIANT", {
       message: `${label} contains unknown or unsupported fields: ${unknown.join(", ")}.${suffix}`,
     });
   }

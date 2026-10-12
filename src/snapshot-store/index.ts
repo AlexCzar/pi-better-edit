@@ -393,7 +393,7 @@ export async function adoptPinnedSnapshotFor(
   // WHY: were derived under another anchor generation. Fail closed (programmer error),
   // WHY: never adopt verbatim.
   if (!isCurrentAnchorGeneration(descriptor.snapshotHash)) {
-    throw new DomainError("E_BAD_PAYLOAD", {
+    throw new DomainError("E_INTERNAL_INVARIANT", {
       message: `Refusing to adopt snapshot from another anchor generation: ${JSON.stringify(descriptor.snapshotHash)}.`,
     });
   }

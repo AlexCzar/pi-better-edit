@@ -60,9 +60,10 @@ describe("E_BAD_PAYLOAD names the invoking tool (#86)", () => {
           ctx,
         ),
       );
-      expect(text).toContain("[E_BAD_PAYLOAD]");
-      expect(text).toContain("The read payload is not valid:");
+      expect(text).toContain("[E_INTERNAL_INVARIANT]");
+      expect(text).toContain("The read invariant failed:");
       expect(text).not.toContain("The edit payload");
+      expect(text).not.toContain("Fix the payload fields and retry.");
     });
   });
 
@@ -85,11 +86,12 @@ describe("E_BAD_PAYLOAD names the invoking tool (#86)", () => {
       const text = await modelVisibleText(() =>
         undoTool.execute("u1", { path: "nul\u0000byte.ts" }, undefined, undefined, ctx),
       );
-      expect(text).toContain("[E_BAD_PAYLOAD]");
-      expect(text).toContain("The undo_last_edit payload is not valid:");
+      expect(text).toContain("[E_INTERNAL_INVARIANT]");
+      expect(text).toContain("The undo_last_edit invariant failed:");
       // WHY: the model reads `undo_last_edit` in its tool list; a `The undo payload` clause would
       // WHY: name a tool that does not exist.
       expect(text).not.toContain("The undo payload");
+      expect(text).not.toContain("Fix the payload fields and retry.");
     });
   });
   it("stamps an engine-level edit refusal the engine had to route as a failure", async () => {
@@ -175,7 +177,7 @@ describe("E_BAD_PAYLOAD renders the neutral wording with no subject (#86)", () =
   });
 });
 
-describe("withPayloadSubject is transparent except for E_BAD_PAYLOAD (#86)", () => {
+describe("withPayloadSubject re-wraps payload-shaped refusals only (#86, #93)", () => {
   it("returns the same object for a foreign domain failure and for a non-domain throw", () => {
     const stale = new DomainError("E_STALE_ANCHOR", {
       headline: "anchor gone.",

@@ -70,7 +70,7 @@ function resolveServedRange(input: ComputeDriftInput): {
 } {
   const range = input.range;
   if (!range)
-    throw new DomainError("E_BAD_PAYLOAD", {
+    throw new DomainError("E_INTERNAL_INVARIANT", {
       message: "computeDrift requires range or intervals",
     });
   const startPositions = servedPositionsOf(input.served, range.startHash);

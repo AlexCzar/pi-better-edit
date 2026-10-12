@@ -243,7 +243,7 @@ describe("generation bump refuses pre-v3 anchors", () => {
           hashes: contentOnlyHashes(PRE),
           content: PRE,
         }),
-      ).rejects.toThrow(/E_BAD_PAYLOAD/);
+      ).rejects.toThrow(/E_INTERNAL_INVARIANT/);
       expect(await anchorsForSnapshotHash(absP, "2:deadbeef")).toBeUndefined();
       const { getTool, ctx } = setupIntegrationTest(cwd);
       const readTool = getTool("read");
