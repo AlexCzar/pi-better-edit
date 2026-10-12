@@ -30,11 +30,11 @@ import {
 } from "../served-session/session.js";
 import { pairSnapshots, type LineDescriptor } from "../hashline/patience-pairing.js";
 import { vacuumSnapshots } from "./vacuum.js";
-import type { VacuumOptions, VacuumResult } from "./vacuum.js";
+import type { VacuumResult } from "./vacuum.js";
 import { migrateLegacyStore } from "./migrate.js";
 
 export { vacuumSnapshots };
-export type { VacuumOptions, VacuumResult };
+export type { VacuumResult };
 // WHY: the vacuum budgets are the store's retention policy constants, so the module entry keeps
 // WHY: them on the public surface; consumers must never reach into the eviction module directly.
 export {
@@ -55,7 +55,7 @@ interface SnapshotRef {
   anchor_generation: number;
 }
 
-export interface SnapshotStmts {
+interface SnapshotStmts {
   findSnapshot: (path: string, snapshotHash: string) => SnapshotRef | undefined;
   lineageAnchors: (snapshotId: number) => { anchor: string }[];
   latestSnapshot: (path: string) => { snapshot_id: number } | undefined;
@@ -87,7 +87,7 @@ export interface SnapshotStmts {
 
 const stmtsCache = new WeakMap<DatabaseSync, SnapshotStmts>();
 
-export function snapshotStmts(db: DatabaseSync): SnapshotStmts {
+function snapshotStmts(db: DatabaseSync): SnapshotStmts {
   return getCached(db, stmtsCache, buildStmts);
 }
 
@@ -361,7 +361,7 @@ export function upsertSnapshot(
  * path, the diff rows on the edit path, the restored rows on the undo path. Carried by
  * `SnapshotAdoptOptions` so the grant shares the transaction instead of running as a second one.
  */
-export interface LeaseGrant {
+interface LeaseGrant {
   sessionKey: string;
   rows: ReadonlyArray<{ position: number; hash: string | null }>;
 }
@@ -744,7 +744,7 @@ function materializeBatch(
   return snapshotIds;
 }
 
-export function upsertSnapshots(store: HashStore, entries: readonly SnapshotEnrollment[]): void {
+function upsertSnapshots(store: HashStore, entries: readonly SnapshotEnrollment[]): void {
   materializeBatch(
     store,
     entries.map((entry) => entry.descriptor),

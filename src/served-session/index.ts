@@ -7,16 +7,12 @@
  * Two adapters justify the seam: SQLiteSnapshotStore (prod) vs MemoryStore (tests).
  */
 
-export type { SessionHandle, ServedEntry, ServeRecordPolicy, ServeRecordingPlan } from "./types.js";
-
 export {
   createSessionHandle,
   sessionFromContext,
   sessionKeyFor,
   ensureServedSchema,
   wipeSession,
-  deleteServedByPath,
-  deleteServedByPathAsync,
   getServed,
   upsertServed,
   getReported,
@@ -30,11 +26,7 @@ export {
   loadBlockedHashes,
   loadCanonDigests,
   loadEpochId,
-  retireAnchors,
-  loadLease,
   loadLeases,
-  retireAbsentLeases,
-  type ServedLease,
 } from "./session.js";
 
 export { servedPositionsOf } from "../hashline/served.js";
