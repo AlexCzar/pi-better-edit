@@ -8,8 +8,7 @@
 import type { LineEnding } from "../edit-diff.js";
 import type { ResolvedRange } from "../hashline/served.js";
 import type { HashStore } from "../hash-store.js";
-import type { BatchSection, EditDetails, RMetrics } from "../edit-response.js";
-import type { NormalizedEditRequest } from "../payload-contract.js";
+import type { EditDetails, RMetrics } from "../edit-response.js";
 import type { DomainErrorCode, RangeCause } from "../domain-errors.js";
 import type { ServedRow } from "../domain-errors.js";
 
@@ -152,6 +151,3 @@ export function isMutationSuccess(r: MutationResult): r is MutationSuccess {
 export function isMutationFailure(r: MutationResult): r is MutationFailure {
   return r.ok === false;
 }
-
-// WHY: Also re-export batch section for callers that build tool results.
-export type { BatchSection, NormalizedEditRequest };

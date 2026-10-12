@@ -13,7 +13,7 @@ const normalizedEdit = Symbol("normalizedEdit");
  * them. Both modes apply to this file AND to another served file (ticket-04b): a foreign-source
  * `"cut"` commits the insert and the source retirement as one correlated transaction (ADR-0028).
  */
-export type SpanRef = {
+type SpanRef = {
   anchor_from: string;
   anchor_to: string;
   file?: string;
@@ -34,7 +34,7 @@ export type EditItem = {
   text_ref?: SpanRef;
 };
 
-export type EditMode = "general" | "literal";
+type EditMode = "general" | "literal";
 
 /**
  * Internal normalized vocabulary owned by the admission boundary (ticket-01, renamed ticket-04).
@@ -46,13 +46,18 @@ export type Placement = "in-place" | "before" | "after";
 // WHY: (§9.12) the wire `at` union and the engine seam's placement union are one vocabulary by
 // WHY: contract, not by copy: this compile-time mutual-assignability assertion fails
 // WHY: `pnpm run typecheck` the moment the two unions drift apart.
+/**
+ * @public Intentional surface (knip): the tuple type is the wire/engine
+ * vocabulary check, so the binding is never imported — its reason to exist
+ * is the typecheck failure it produces when the unions drift.
+ */
 export const _placementVocabularyAgreement: [
   Placement extends EditPlacement ? true : never,
   EditPlacement extends Placement ? true : never,
 ] = [true, true];
 
 /** The anchor pair an item targets — placement and payload are relative to its resolved span. */
-export type AnchorSpan = { anchor_from: string; anchor_to: string };
+type AnchorSpan = { anchor_from: string; anchor_to: string };
 
 export type DesiredContent =
   | { kind: "literal"; text: string }
@@ -102,7 +107,7 @@ export const editFileSchema = Type.String({
   description: "Path to the text file to edit (a file, never a directory)",
 });
 
-export const editAtSchema = Type.Union(
+const editAtSchema = Type.Union(
   [Type.Literal("in-place"), Type.Literal("before"), Type.Literal("after")],
   {
     description:
@@ -110,7 +115,7 @@ export const editAtSchema = Type.Union(
   },
 );
 
-export const textRefSchema = Type.Object(
+const textRefSchema = Type.Object(
   {
     anchor_from: anchorFromSchema,
     anchor_to: anchorToSchema,
