@@ -189,6 +189,7 @@ const LIVE_CODES: DomainErrorCode[] = [
   "E_UNDO_REVERT_FAILED",
   "E_UNKNOWN",
   "E_LARGE_FILE",
+  "E_INTERNAL_INVARIANT",
 ];
 
 const EXAMPLES: { [K in DomainErrorCode]: ErrorPayloadMap[K] } = {
@@ -256,6 +257,7 @@ const EXAMPLES: { [K in DomainErrorCode]: ErrorPayloadMap[K] } = {
   E_UNDO_REVERT_FAILED: { path: "probe.ts" },
   E_UNKNOWN: { errorName: "Error", message: "boom\nsecond line" },
   E_LARGE_FILE: { path: "probe.ts", limitKind: "lines", lineCount: 99, limit: 5 },
+  E_INTERNAL_INVARIANT: { message: "Path contains null byte" },
 };
 
 describe("domain error registry: closed contract, not a list", () => {

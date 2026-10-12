@@ -25,7 +25,8 @@
  * model's anchors, the disk, or the tool's own record is wrong — the model
  * decides from the fresh read), and `E_NOOP_LOOP` (the refusal
  * pins the fact that the range already contains the text, but not the
- * model's intent).
+ * model's intent), and `E_INTERNAL_INVARIANT` (a tool-facing invariant
+ * failure names no field the model could fix, so it carries no remedy).
  */
 
 import { HASH_LEN } from "./hashline/alphabet.js";
@@ -53,7 +54,8 @@ export type DomainErrorCode =
   | "E_LOSSY_TEXT"
   | "E_UNDO_REVERT_FAILED"
   | "E_UNKNOWN"
-  | "E_LARGE_FILE";
+  | "E_LARGE_FILE"
+  | "E_INTERNAL_INVARIANT";
 
 /**
  * The registered tool whose call produced an `E_BAD_PAYLOAD`. WHY the registered name: the model
@@ -241,6 +243,16 @@ export interface ErrorPayloadMap {
     lineCount?: number;
     limit: number;
   };
+  E_INTERNAL_INVARIANT: {
+    message: string;
+    /**
+     * The invoking tool, when the boundary knows it. WHY optional: the same
+     * attribution channel as `E_BAD_PAYLOAD` — an absent subject renders the
+     * neutral wording, while a required field would force every producer to
+     * claim a writer it cannot prove.
+     */
+    subject?: PayloadSubject;
+  };
 }
 
 export interface CodeSpec<P> {
@@ -354,6 +366,18 @@ export const ERROR_REGISTRY: { [K in DomainErrorCode]: CodeSpec<ErrorPayloadMap[
         : `The payload is not valid: ${message}`,
     // WHY remedy: validation rejected the payload before any resolution, so the field fix is the only next action. See ADR-0021.
     remedy: "Fix the payload fields and retry.",
+  },
+  E_INTERNAL_INVARIANT: {
+    audience: "MODEL",
+    // WHY: one code covers all internal guards: every re-homed site is a tool-facing
+    // WHY: invariant failure with no model-actionable field fix, so one remedy-free
+    // WHY: rendering serves all of them. The optional subject keeps the payload
+    // WHY: attribution channel, stamped by the same `withPayloadSubject` helper that
+    // WHY: stamps `E_BAD_PAYLOAD` — a re-homed refusal changes code and remedy only.
+    format: ({ message, subject }) =>
+      isPayloadSubject(subject)
+        ? `The ${subject} invariant failed: ${message}`
+        : `An internal invariant failed: ${message}`,
   },
   E_EMPTY_RANGE: {
     audience: "MODEL",
@@ -708,6 +732,20 @@ function badPayloadOf(error: unknown): ErrorPayloadMap["E_BAD_PAYLOAD"] | undefi
   // SAFETY: the code gate above selects the registry member whose shape `payload` holds.
   return error.payload as ErrorPayloadMap["E_BAD_PAYLOAD"];
 }
+/**
+ * The raw `{ message, subject? }` payload of a refusal on the payload-subject attribution
+ * channel. WHY one cast for two codes: `E_BAD_PAYLOAD` and `E_INTERNAL_INVARIANT` share the
+ * shape exactly, so the code gate fixes which member's payload this is — which the type system
+ * cannot see through the payload union — with no second mechanism.
+ */
+function subjectPayloadOf(
+  error: unknown,
+): { message: string; subject?: PayloadSubject } | undefined {
+  if (!(error instanceof DomainError)) return undefined;
+  if (error.code !== "E_BAD_PAYLOAD" && error.code !== "E_INTERNAL_INVARIANT") return undefined;
+  // SAFETY: the code gate above selects a registry member whose payload holds this shape.
+  return error.payload as { message: string; subject?: PayloadSubject };
+}
 
 /**
  * The raw `message` of an `E_BAD_PAYLOAD`, for a seam that must re-attribute a refusal the engine
@@ -719,15 +757,22 @@ export function badPayloadMessageOf(error: unknown): string | undefined {
 }
 
 /**
- * Attribute an `E_BAD_PAYLOAD` to the tool that raised it. WHY a re-wrap: the model-visible header
- * is composed inside the constructor, so the subject must sit in the payload before construction.
- * WHY transparent: a foreign failure of any kind comes back as the SAME object, so a boundary can
- * wrap its whole body without changing abort or any other path.
+ * Attribute a payload-shaped refusal to the tool that raised it. WHY a re-wrap: the model-visible
+ * header is composed inside the constructor, so the subject must sit in the payload before
+ * construction. WHY both codes: `E_INTERNAL_INVARIANT` shares the payload-subject attribution
+ * channel — a re-homed refusal changes code and remedy only, never its tool name. WHY
+ * transparent: a foreign failure of any other kind comes back as the SAME object, so a boundary
+ * can wrap its whole body without changing abort or any other path.
  */
 export function withPayloadSubject<T>(
   error: T,
   subject: PayloadSubject,
-): T | DomainError<"E_BAD_PAYLOAD"> {
+): T | DomainError<"E_BAD_PAYLOAD" | "E_INTERNAL_INVARIANT"> {
+  if (error instanceof DomainError && error.code === "E_INTERNAL_INVARIANT") {
+    const payload = subjectPayloadOf(error);
+    if (payload === undefined) return error;
+    return new DomainError("E_INTERNAL_INVARIANT", { ...payload, subject });
+  }
   const payload = badPayloadOf(error);
   if (payload === undefined) return error;
   return new DomainError("E_BAD_PAYLOAD", { ...payload, subject });

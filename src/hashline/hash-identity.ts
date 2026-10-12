@@ -251,7 +251,7 @@ function nearestNew(candidates: number[], target: number): number {
 // WHY: refuse a reserved fast-path index, so the reservation is safe in the full space.
 export function canonicalAnchorPath(path: string): string {
   if (!isAbsolute(path)) {
-    throw new DomainError("E_BAD_PAYLOAD", {
+    throw new DomainError("E_INTERNAL_INVARIANT", {
       message: `Anchor derivation requires an absolute file path, got ${JSON.stringify(path)}.`,
     });
   }

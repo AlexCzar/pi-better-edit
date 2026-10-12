@@ -163,7 +163,7 @@ export function rawCodeOf(source: unknown): string | undefined {
 export function attributePayloadSubject<T>(
   error: T,
   subject: PayloadSubject,
-): T | DomainError<"E_BAD_PAYLOAD"> {
+): T | DomainError<"E_BAD_PAYLOAD" | "E_INTERNAL_INVARIANT"> {
   const attributed = withPayloadSubject(error, subject);
   if (attributed !== error) return attributed;
   const envelope = readEnvelope(error);

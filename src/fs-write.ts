@@ -17,7 +17,7 @@ import { errCode } from "./utils.js";
 
 export async function resolveTarget(path: string): Promise<string> {
   if (path.includes("\0"))
-    throw new DomainError("E_BAD_PAYLOAD", {
+    throw new DomainError("E_INTERNAL_INVARIANT", {
       message: "Path contains null byte. Pass a plain file string and retry.",
     });
   // SAFETY: resolve normalizes ".." and sep; result is absolute and null-byte validated — editing scope intentionally allows any absolute path, OS permissions enforced by valAccess.
@@ -127,7 +127,7 @@ async function syncDir(dir: string): Promise<void> {
  */
 export async function readBytes(path: string): Promise<Buffer> {
   if (path.includes("\0"))
-    throw new DomainError("E_BAD_PAYLOAD", {
+    throw new DomainError("E_INTERNAL_INVARIANT", {
       message: "Path contains null byte. Pass a plain file string and retry.",
     });
   // SAFETY: resolveTarget returns an absolute, null-byte-validated, symlink-resolved path — the
@@ -142,7 +142,7 @@ export async function readBytes(path: string): Promise<Buffer> {
  */
 export async function writeAtomic(path: string, content: string | Buffer): Promise<void> {
   if (path.includes("\0"))
-    throw new DomainError("E_BAD_PAYLOAD", {
+    throw new DomainError("E_INTERNAL_INVARIANT", {
       message: "Path contains null byte. Pass a plain file string and retry.",
     });
   const targetPath = await resolveTarget(path);

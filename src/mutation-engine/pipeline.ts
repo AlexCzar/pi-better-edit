@@ -389,7 +389,7 @@ function parseEdits(items: NormalizedEditRequest["edits"], path: string): Parsed
           // WHY: only engine-seam construction can). Mirror item (iv): refuse LOUD at the seam,
           // WHY: naming the wire field `"text"` with the admission message verbatim.
           if (payload.text === "") {
-            throw new DomainError("E_BAD_PAYLOAD", {
+            throw new DomainError("E_INTERNAL_INVARIANT", {
               message:
                 `Edit request edits[${index}] "text" must carry at least one line; ` +
                 `"text": "" is the deletion payload. Nothing was written.`,
@@ -403,7 +403,7 @@ function parseEdits(items: NormalizedEditRequest["edits"], path: string): Parsed
           // WHY: refused, not silently resolved in favor of one arm. Admission always folds the
           // WHY: wire `text_ref` verbatim, so this fires only on a directly-constructed payload.
           if (payload.span.mode !== payload.mode) {
-            throw new DomainError("E_BAD_PAYLOAD", {
+            throw new DomainError("E_INTERNAL_INVARIANT", {
               message:
                 'The "text_ref" payload is inconsistent: its "mode" disagrees with the mode carried by the span it names. Nothing was written.',
             });
@@ -612,7 +612,7 @@ async function materializeForeignItem(
   // WHY: (keel F3) same agreement rule as the parse seam — check before anything else consumes
   // WHY: the mode, so a disagreement can never decide between the arms implicitly.
   if (payload.span.mode !== payload.mode) {
-    throw new DomainError("E_BAD_PAYLOAD", {
+    throw new DomainError("E_INTERNAL_INVARIANT", {
       message:
         'The "text_ref" payload is inconsistent: its "mode" disagrees with the mode carried by the span it names. Nothing was written.',
     });

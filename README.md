@@ -322,6 +322,7 @@ referenced span is retired — the current word is `cut`.
 | `[E_UNDO_UNAVAILABLE]` | Cannot persist undo history to the hash store. The edit was not applied. The file is unchanged. | Retry the edit. If the store cannot be recovered, use `write`. |
 | `[E_UNDO_REVERT_FAILED]` | A correlated cut-undo revert was interrupted mid-transaction and could not be completed; no undo history was cleared. | Fix the file access failure. The next run repairs the interrupted revert. |
 | `[E_LARGE_FILE]` | A served read or edit load exceeds the served admission budget (200,000 lines, `SERVED_MAX_LINES`) or the 14,766,336-line ceiling of allocatable 4-char anchors; `mode: "verbatim"` reads are not capped. | Split the file or use a non-line-based approach for very large files. |
+| `[E_INTERNAL_INVARIANT]` | Internal tool invariant failure (the message names the failed invariant). | No remedy; check the error message details. |
 | `[E_UNKNOWN]` | Unknown filesystem or invariant failure (first message line reported). | Check the error message details. |
 
 ### Applied Warnings (`[W_*]`)

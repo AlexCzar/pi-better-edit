@@ -143,7 +143,7 @@ export function genDiff(
     newContentHashes ??
     (filePath === undefined
       ? (() => {
-          throw new DomainError("E_BAD_PAYLOAD", {
+          throw new DomainError("E_INTERNAL_INVARIANT", {
             message: "genDiff requires precomputed hashes or a file path.",
           });
         })()
