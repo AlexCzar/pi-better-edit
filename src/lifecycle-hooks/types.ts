@@ -57,11 +57,3 @@ export type LifecycleDeps = {
   };
   visLines: (s: string) => string[];
 };
-
-export type WriteResult =
-  | { handled: false }
-  | { handled: true; content: Array<{ type: string; text: string }> };
-
-export type EditResult =
-  | { handled: false }
-  | { handled: true; content?: Array<{ type: string; text: string }> };

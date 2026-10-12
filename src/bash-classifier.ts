@@ -68,7 +68,7 @@ export interface BashSearch {
 }
 
 /** The only two intercepted search programs (spec §3.2). */
-export type SearchProgram = "grep" | "rg";
+type SearchProgram = "grep" | "rg";
 
 export type BashClass =
   | { kind: "pureView"; view: BashView }

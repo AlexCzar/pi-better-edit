@@ -17,7 +17,7 @@ import { execute as engineExecute, preview as enginePreview } from "./mutation-e
 import { isMutationSuccess } from "./mutation-engine/types.js";
 import { attachEnvelope } from "./error-envelope.js";
 
-export type EditToolContext = {
+type EditToolContext = {
   cwd: string;
   sessionManager?: { getSessionId(): string };
 };
@@ -26,7 +26,7 @@ export type PreviewContext = {
   sessionManager?: { getSessionId(): string };
 };
 
-export type PreviewResult = { diff: string } | { error: string };
+type PreviewResult = { diff: string } | { error: string };
 
 export interface EditTool {
   /** SAFETY: Execute a validated edit; returns pi tool_result or throws on failure. Admission: params validated by normReq/assertReq. */

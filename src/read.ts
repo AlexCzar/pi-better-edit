@@ -51,16 +51,16 @@ function readGuide(): string[] {
 type ReadRenderArgs = { file?: string; path?: string };
 
 /** Render mode of one file: `served` (anchored rows) or `verbatim` (plain text, no leases). */
-export type RenderMode = "served" | "verbatim";
+type RenderMode = "served" | "verbatim";
 
 /** A line window of one file, in the reader's 1-indexed terms (spec §4.1). */
-export interface OffsetWindow {
+interface OffsetWindow {
   offset: number;
   limit: number;
 }
 
 /** A window anchored to a line identity this session served (spec §4.1). */
-export interface AnchorWindow {
+interface AnchorWindow {
   /** The anchor this window centres on, `${HASH_LEN}` characters wide. */
   anchor: string;
   /** Lines before and after the anchor's line. */
