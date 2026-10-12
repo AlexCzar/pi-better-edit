@@ -205,6 +205,14 @@ describe("session_start lifecycle", () => {
     }
   });
 
+  it("registers the lens command through the host seam", async () => {
+    const { pi, commands } = makeLifecyclePi();
+    await registerExtension(pi);
+    const registration = commands.get("pi-better-edit");
+    expect(registration).toBeDefined();
+    expect(typeof registration?.handler).toBe("function");
+  });
+
   it("keeps served state at session start", async () => {
     await withTempDir("lifecycle-served-", async (dir) => {
       const { writeFile } = await import("fs/promises");
