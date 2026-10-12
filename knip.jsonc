@@ -35,19 +35,18 @@
     // `_/husky.sh` (core.hooksPath=.husky/_), so nothing credits the devDependency.
     "husky",
   ],
-  // The unused export/type surface is real and large (34 unused exports + 50 unused exported types)
-  // and deliberately NOT pruned here: un-exporting dozens of symbols across ~23 modules is a
-  // source-behaviour change that is out of scope for a toolchain ticket. The findings stay VISIBLE
-  // in knip's output — nothing is silenced or class-exempted — and every one of them is still counted
-  // as an error. The enforced baseline is the --max-issues cap on the CLI in package.json
-  // (`knip --max-issues 84`), which is a ratchet: the 84 known findings are tolerated, but ANY new
-  // finding pushes the total above the cap and fails the run mechanically (and is named in output).
+  // The unused export/type surface was pruned to zero in this tranche, so the
+  // count is 0 and NOTHING is tolerated: no finding is silenced or class-exempted,
+  // and every finding is still counted as an error. The enforced baseline is the
+  // --max-issues 0 cap on the CLI in package.json, which is a ratchet-only-down
+  // tripwire: ANY new finding pushes the total above the cap and fails the run
+  // mechanically (and is named in output). Keep `--max-issues 0` in both `lint`
+  // and `lint:knip`: do NOT delete the flag — at 0 findings its failure semantics
+  // equal bare knip, but it names the count and keeps the tripwire explicit.
   // knip's config schema has no maxIssues key, so the cap must live on the command line.
   //
-  // LOWER the number as the debt is pruned; the follow-up pruning ticket should drive it to 0 and
-  // then delete the flag entirely.
-  //
-  // Consequence, deliberate and documented: bare `knip` (no cap) exits 1 on this repo — it is not a
-  // bug and must not be "fixed" by reintroducing a `rules` downgrade. The enforced entry points are
-  // `pnpm run lint` and `pnpm run lint:knip`.
+  // Consequence, deliberate and documented: bare `knip` (no cap) exits 0 with empty
+  // output on this repo as observed — it agrees with the capped run while the count
+  // stays 0, which is exactly why the explicit cap stays: it names the count so a
+  // future finding fails the enforced entry points, `pnpm run lint` and `pnpm run lint:knip`.
 }

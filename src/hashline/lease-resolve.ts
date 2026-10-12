@@ -50,7 +50,7 @@ import {
   type FileSnapshotContext,
 } from "./served-verification.js";
 
-export type ReversedAnchorsHeal = {
+type ReversedAnchorsHeal = {
   /** The submitted `anchor_from` slot value whose resolved line ran after `toHash`. */
   fromHash: string;
   /** The submitted `anchor_to` slot value whose resolved line ran before `fromHash`. */

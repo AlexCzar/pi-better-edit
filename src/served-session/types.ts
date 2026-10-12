@@ -15,10 +15,6 @@ export type ServedEntry = { position: number; hash: string | null };
 
 export type ServeRecordPolicy = "live" | "preview";
 
-export type ServeRecordingPlan =
-  | { mode: "plain" }
-  | { mode: "truncated"; lineCount: number; clearFrom: number };
-
 /**
  * SAFETY: SessionHandle — deep interface for one (session, path) pair.
  *
@@ -26,6 +22,9 @@ export type ServeRecordingPlan =
  * patchServed healing, truncation, reported-set, TTL) stay inside.
  * External seam is 3 conceptual ops: load / record / checkDrift,
  * expanded to 7 typed methods for current call sites without widening to 25.
+ * @public Intentional surface (knip): the handle contract returned by
+ * createSessionHandle — consumers hold it via inference, so no static import
+ * names it, but the signature is the seam external call sites program against.
  */
 export interface SessionHandle {
   /** SAFETY: Canonical absolute path this handle owns. */

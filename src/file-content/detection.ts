@@ -63,7 +63,7 @@ export interface FileStats {
   ctimeMs: number;
 }
 
-export interface LFileText {
+interface LFileText {
   kind: "text";
   text: string;
   // WHY: the load path already stat'd this path; handing the result to the caller keeps the read

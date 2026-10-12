@@ -43,7 +43,7 @@ function isErrorContext(ctx: unknown): boolean {
   return (ctx as unknown as { isError: boolean }).isError;
 }
 
-export function makeRenderCall(preview: DebouncedPreview) {
+function makeRenderCall(preview: DebouncedPreview) {
   return (args: unknown, theme: unknown, context: unknown) => {
     const ctx = context as {
       lastComponent: unknown;
@@ -66,7 +66,7 @@ export function makeRenderCall(preview: DebouncedPreview) {
   };
 }
 
-export function makeRenderResult(preview: DebouncedPreview) {
+function makeRenderResult(preview: DebouncedPreview) {
   return (result: unknown, opts: { isPartial: boolean }, theme: unknown, context: unknown) => {
     const ctx = context as {
       lastComponent: unknown;

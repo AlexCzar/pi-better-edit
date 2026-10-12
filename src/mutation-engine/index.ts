@@ -11,19 +11,7 @@
  * no `isError` flag checks, no threading of `sessionKey`/`store` details.
  */
 
-// WHY: Public typed boundary — validated at admission, trusted inside.
-export type {
-  PipelineOptions,
-  ProcessedEditFile,
-  MutationSuccess,
-  MutationFailure,
-  MutationResult,
-} from "./types.js";
 export { isMutationSuccess, isMutationFailure } from "./types.js";
 
 // WHY: Deep seam — small interface.
 export { execute, preview } from "./engine.js";
-
-// WHY: Prefer `execute`/`preview` with `MutationResult` for new code.
-export { previewEdits, apply, execEdits } from "./pipeline.js";
-export type { ProcessedEditFile as PipelineFile } from "./pipeline.js";

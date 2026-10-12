@@ -12,7 +12,6 @@ import {
   lineHashes,
   fmtRegion,
   HASH_SEP,
-  MAX_HASH_LINES,
   type AnchorWalk,
 } from "../hashline/index.js";
 import type { ServedRow } from "../hashline/served.js";
@@ -640,6 +639,3 @@ export async function fmtReadPreview(
     lineTotals: totals,
   };
 }
-
-// WHY: Re-export constants for callers that need them
-export { MAX_HASH_LINES, HASH_SEP };

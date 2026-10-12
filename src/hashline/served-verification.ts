@@ -26,8 +26,6 @@ import { HASH_SEP } from "./hash.js";
 import { SERVED_ROWS_CAP } from "../constants.js";
 import {
   DomainError,
-  FRESH_READ_HEADING,
-  TARGET_LOST_RECOVERY,
   UNVERIFIED_HEADLINE,
   type RangeCause,
   type ServedRow,
@@ -38,15 +36,7 @@ import type { LeaseIdentityView } from "./resolve.js";
 // WHY: Public contracts — mirrors served.ts so it can re-export without identity split
 // WHY: ---------------------------------------------------------------------------
 
-export type ServedCode = "E_STALE_RANGE" | "E_UNVERIFIED_RANGE" | "E_TARGET_LOST";
-
-export {
-  FRESH_READ_HEADING,
-  TARGET_LOST_RECOVERY,
-  UNVERIFIED_HEADLINE,
-  type RangeCause,
-  type ServedRow,
-};
+export { UNVERIFIED_HEADLINE, type RangeCause, type ServedRow };
 
 export interface FileSnapshotContext {
   fileHashes: string[];

@@ -14,19 +14,9 @@ import {
   findServedHashEcho,
   buildServedWriteMessage,
   trackServedWriteRefusal,
-  type ServedHashEchoMatch,
 } from "./hashline/served-guard.js";
 
-export interface ServedHashEcho {
-  /** SAFETY: One-based candidate line carrying the reproduced served row. */
-  line: number;
-  /** SAFETY: The exact anchor served for this session, path, and served line. */
-  hash: string;
-  /** SAFETY: 1-based served position whose content the candidate reproduces. */
-  servedLine: number;
-}
-
-export { findServedHashEcho, type ServedHashEchoMatch };
+export { findServedHashEcho };
 
 export interface WriteHookIO {
   resolve(path: string, cwd: string, signal?: AbortSignal): Promise<string>;

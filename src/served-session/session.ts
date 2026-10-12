@@ -1183,20 +1183,6 @@ export async function loadEpochId(sessionKey: string, path: string): Promise<str
   return getEpochIdInner(store, sessionKey, path);
 }
 
-export async function retireAnchors(
-  sessionKey: string,
-  path: string,
-  hashes: Iterable<string>,
-): Promise<void> {
-  const store = await loadHashStore();
-  await retireAnchorsInner(store, sessionKey, path, hashes);
-}
-
-export async function deleteServedByPathAsync(path: string): Promise<void> {
-  const store = await loadHashStore();
-  deleteServedByPath(store, path);
-}
-
 export function deleteServedByPath(store: HashStore, path: string): void {
   const stmts = servedStmts(store.db);
   stmts.servedDeletePath(path);
