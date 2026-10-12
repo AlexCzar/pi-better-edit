@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "fs/promises";
+import { mkdirSync } from "node:fs";
 import { join } from "path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -76,6 +77,9 @@ vi.mock("fs/promises", async (importOriginal) => {
 let tmpHome: string;
 
 beforeAll(async () => {
+  // WHY: the `fs/promises` mock below replaces `mkdir` with fixture state for the module
+  // under test, so the fixture creates its own parent through the unmocked `node:fs` seam.
+  mkdirSync(join(process.cwd(), ".tmp"), { recursive: true });
   tmpHome = await mkdtemp(join(process.cwd(), ".tmp", "hash-store-open-errors-"));
   vi.stubEnv("HOME", tmpHome);
   vi.stubEnv("XDG_CONFIG_HOME", "");
