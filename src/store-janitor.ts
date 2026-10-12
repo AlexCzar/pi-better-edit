@@ -118,15 +118,18 @@ function skipped(reason: "off" | "throttled"): JanitorOutcome {
  *
  * WHY `rowid IN (SELECT rowid ... LIMIT ?)`: `DELETE ... LIMIT` needs a SQLite build option this
  * runtime does not guarantee, while every table here is an ordinary rowid table, so the bounded
- * delete is spelled with a subquery instead. `table` is one of this module's own call sites' string
- * literals, never input.
+ * delete is spelled with a subquery instead. `table` admits only `JanitorTable` members, so the
+ * two interpolated table slots cannot name a table no call site passes (#105 rider).
  *
  * A short final batch ends the loop: no statement re-reads rows it could have deleted twice, because
  * nothing in this store re-creates foreign-generation or expired rows while a janitor run is open.
  */
+/** The only tables the janitor's batched deletes may name (#105 rider). */
+type JanitorTable = "file_snapshots" | "line_lineage" | "served_leases";
+
 function deleteInBatches(
   db: DatabaseSync,
-  table: string,
+  table: JanitorTable,
   predicate: string,
   params: readonly (string | number)[],
   batchSize: number,
