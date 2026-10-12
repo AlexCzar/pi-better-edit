@@ -4,4 +4,3 @@
  * New code should import from `src/file-content/index.js`.
  */
 export * from "./file-content/loader.js";
-export { fmtReadPreview } from "./file-content/preview.js";
