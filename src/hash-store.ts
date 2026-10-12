@@ -8,6 +8,7 @@ import { errCode } from "./utils.js";
 import { initHasher } from "./hashline/hasher.js";
 import { HASH_STORE_VERSION, HASH_STORE_BUSY_TIMEOUT } from "./constants.js";
 import { ANCHOR_GENERATION, CANON_VERSION } from "./hashline/hash-identity.js";
+import { DomainError } from "./domain-errors.js";
 
 function homeBase(): string {
   const envHome = process.env.HOME;
@@ -368,10 +369,34 @@ function openDb(storePath: string, budget?: BusyBudget): OpenedDb {
   return { db, stampDue };
 }
 
-function tableColumns(db: DatabaseSync, table: string): Set<string> {
+// WHY: (#105 Q2, option B) the closed identifier set the DDL helpers resolve through. Each
+// WHY: `(table, column, definition)` triple lives here once, so an ALTER site cannot name a table,
+// WHY: column or definition that is not a member: the helper signatures below admit only members,
+// WHY: and the interpolated fragments in their statements come from those members.
+const MIGRATION_COLUMNS = {
+  cut_intent: { direction: "TEXT" },
+  file_undo: { snapshot_hash: "TEXT", transaction_id: "TEXT", raw_pre: "TEXT" },
+  served: { retired: "TEXT", canons: "TEXT", snapshotId: "TEXT" },
+  undo: { result_content: "TEXT NOT NULL DEFAULT ''" },
+} as const;
+
+/** Tables carrying a migrated column from the map above. */
+type MigrationTable = keyof typeof MIGRATION_COLUMNS;
+
+/** Tables carrying the `anchor_generation` generation column. */
+type GenerationTable = "file_snapshots" | "file_undo";
+
+/** Every table the DDL helpers may name. */
+type DdlTable = MigrationTable | GenerationTable | "served_leases";
+
+function readTableColumns(db: DatabaseSync, table: DdlTable): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  return new Set(rows.map((row) => row.name));
+}
+
+function tableColumns(db: DatabaseSync, table: DdlTable): Set<string> {
   try {
-    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-    return new Set(rows.map((row) => row.name));
+    return readTableColumns(db, table);
   } catch {
     // WHY: the empty set answers TWO questions at once — "this table is not there yet" and "this
     // WHY: schema could not be read" — and the first is the intended one: PRAGMA table_info returns
@@ -381,29 +406,27 @@ function tableColumns(db: DatabaseSync, table: string): Set<string> {
     // WHY: `renameGenerationColumn` go on to attempt their ALTER and fail LOUDLY (`duplicate column
     // WHY: name`, `no such table`) rather than silently, and `buildStore`'s pre-session-keyed
     // WHY: `served` shell guard reads `size > 0` as false and so skips its DROP — the safe direction.
-    // WHY: The one SILENT consumer is `hasTable` in `ensureSnapshotTables`, where a failed read makes
-    // WHY: `hasLeases` false and the sweep skips its two lease deletes: a PARTIAL sweep that reports
-    // WHY: success. That residue is the exposure the stamp gate's own trade already accepts — a
-    // WHY: surviving lease is generation-gated at use, so its worst case is a MISS or a fail-closed
-    // WHY: refusal, never a wrongly honored identity — and the next stamp-invalidating open or the
-    // WHY: janitor's throttled periodic sweep removes it, running the same two predicates
-    // WHY: unconditionally.
+    // WHY: `hasTable` in `ensureSnapshotTables` does NOT take this path: it reads through
+    // WHY: `readTableColumns` and throws on a failed read (#105 Q1), because a failed read there
+    // WHY: would make `hasLeases` false and skip the sweep's two lease deletes — a PARTIAL sweep
+    // WHY: reporting success.
     return new Set<string>();
   }
 }
 
-function addColumnIfMissing(
+function addColumnIfMissing<T extends MigrationTable>(
   db: DatabaseSync,
-  table: string,
-  column: string,
-  definition: string,
+  table: T,
+  column: keyof (typeof MIGRATION_COLUMNS)[T] & string,
 ): void {
+  const definitions: Readonly<Record<string, string>> = MIGRATION_COLUMNS[table];
+  const definition = definitions[column];
   if (!tableColumns(db, table).has(column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 }
 
-function renameGenerationColumn(db: DatabaseSync, table: string): void {
+function renameGenerationColumn(db: DatabaseSync, table: GenerationTable): void {
   const cols = tableColumns(db, table);
   if (cols.has("anchor_generation")) return;
   if (cols.has("canon_version")) {
@@ -699,7 +722,19 @@ export function ensureSnapshotTables(db: DatabaseSync): void {
 
   // WHY: tables created later in the fresh-build path (served_leases) may not exist
   // WHY: yet when this runs — the sweep touches only what is there.
-  const hasTable = (table: string): boolean => tableColumns(db, table).size > 0;
+  // WHY: (#105 Q1) the ONE loud reader: a failed read throws instead of answering "absent",
+  // WHY: because "absent" here skips the sweep's two lease deletes while reporting success.
+  const hasTable = (table: DdlTable): boolean => {
+    try {
+      return readTableColumns(db, table).size > 0;
+    } catch (error) {
+      const err = error as { name?: string; message?: string };
+      throw new DomainError("E_UNKNOWN", {
+        errorName: err.name ?? "Error",
+        message: `failed to read columns of table "${table}": ${err.message ?? String(error)}`,
+      });
+    }
+  };
   const hasLeases = hasTable("served_leases");
   const sweepGenerations = (): void => {
     if (hasLeases) {
@@ -788,16 +823,16 @@ const CUT_INTENT_DDL =
 // WHY: "one indexed SELECT" said otherwise and is corrected there, not here.
 export function ensureFileUndoSchema(db: DatabaseSync): void {
   db.exec(FILE_UNDO_DDL);
-  addColumnIfMissing(db, "file_undo", "snapshot_hash", "TEXT");
-  addColumnIfMissing(db, "file_undo", "transaction_id", "TEXT");
-  addColumnIfMissing(db, "file_undo", "raw_pre", "TEXT");
+  addColumnIfMissing(db, "file_undo", "snapshot_hash");
+  addColumnIfMissing(db, "file_undo", "transaction_id");
+  addColumnIfMissing(db, "file_undo", "raw_pre");
   // WHY: versions the persisted anchor set — existing rows keep 0 (never current),
   // WHY: so a pre-bump store is refused, not migrated, on first open after upgrade.
   // WHY: `canon_version` (pre-rename builds) is renamed in place, preserving stamped values.
   renameGenerationColumn(db, "file_undo");
   db.exec("CREATE INDEX IF NOT EXISTS idx_file_undo_transaction_id ON file_undo (transaction_id)");
   db.exec(CUT_INTENT_DDL);
-  addColumnIfMissing(db, "cut_intent", "direction", "TEXT");
+  addColumnIfMissing(db, "cut_intent", "direction");
 }
 
 function buildStore(db: DatabaseSync): boolean {
@@ -899,10 +934,10 @@ function buildStore(db: DatabaseSync): boolean {
       ")",
   );
   // WHY: non-destructive column migrations keep pre-existing databases aligned without wipes.
-  addColumnIfMissing(db, "served", "retired", "TEXT");
-  addColumnIfMissing(db, "served", "canons", "TEXT");
-  addColumnIfMissing(db, "served", "snapshotId", "TEXT");
-  addColumnIfMissing(db, "undo", "result_content", "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, "served", "retired");
+  addColumnIfMissing(db, "served", "canons");
+  addColumnIfMissing(db, "served", "snapshotId");
+  addColumnIfMissing(db, "undo", "result_content");
   // WHY: (#87c) the other half of the fast path: a stamp that is already current records this version
   // WHY: and this generation, so re-writing either would take the write lock on every open to say what
   // WHY: the store already says. The upsert stays exactly where it was — LAST, inside the retry loop and
