@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createReadToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createReadTool, createReadToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TruncationResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -446,6 +446,20 @@ function isPrepared(result: FileResult): result is PreparedTarget {
   return "prepared" in result;
 }
 
+/** An image block the builtin read owns: this repo routes it, never decodes it. */
+interface DelegatedImageBlock {
+  type: "image";
+  data: string;
+  mimeType: string;
+}
+
+/** One entry of the call's `content` array: rendered text, or a routed image block. */
+type RoutedContent = { type: "text"; text: string } | DelegatedImageBlock;
+
+/** One target's outcome in request order: a rendered file (or its refusal), or routed image blocks. */
+type OrderedOutcome =
+  | { kind: "file"; entry: FileResult }
+  | { kind: "image"; blocks: RoutedContent[] };
 /**
  * The message one failed file contributes. WHY: every `DomainError` format already names its path
  * ("File not found: x."), and it is byte-identical to what a lone failing read throws — inventing a
@@ -478,6 +492,30 @@ function sectionText(entry: FileResult): string {
   return isPrepared(entry) ? preparedSection(entry) : entry.message;
 }
 
+/**
+ * The call's `content` array when an image is present: consecutive text sections stay joined as
+ * one text block, and the builtin's own note-plus-image blocks land in request order between them.
+ */
+function routedContent(ordered: OrderedOutcome[]): RoutedContent[] {
+  const blocks: RoutedContent[] = [];
+  let pending: string[] = [];
+  const flush = (): void => {
+    if (pending.length > 0) {
+      blocks.push({ type: "text", text: pending.join("\n\n") });
+      pending = [];
+    }
+  };
+  for (const outcome of ordered) {
+    if (outcome.kind === "image") {
+      flush();
+      blocks.push(...outcome.blocks);
+      continue;
+    }
+    pending.push(sectionText(outcome.entry));
+  }
+  flush();
+  return blocks;
+}
 /** One file's rows for the served-state channels: nothing when the file rendered no page. */
 function servedRowsOf(entry: PreparedTarget): ServedRow[] {
   return entry.plan.omittedAll ? [] : entry.prepared.served;
@@ -529,7 +567,15 @@ export function regRead(pi: ExtensionAPI): void {
             target.windows?.some((window) => window.kind === "anchor") === true,
         );
         const store = needsStore ? await loadHashStore() : undefined;
-        const results: FileResult[] = [];
+        const ordered: OrderedOutcome[] = [];
+        // WHY: delegation, not reimplementation — the builtin owns image bytes, so this repo only
+        // WHY: routes `prepared.kind === "image"` to it. Built lazily so a text-only call pays nothing
+        // WHY: and its path stays untouched.
+        let builtinImageRead: ReturnType<typeof createReadTool> | undefined;
+        const readImageViaBuiltin = async (absolutePath: string) => {
+          builtinImageRead ??= createReadTool(cwd);
+          return builtinImageRead.execute(_toolCallId, { path: absolutePath }, signal);
+        };
         // WHY: spec §4.2 — the budget is CALL-WIDE: every served file draws on the same 200,000 lines,
         // WHY: so the file that cannot afford what is left is refused inline instead of every prepared
         // WHY: file's anchors, normalized text and hashes staying alive until the return.
@@ -598,22 +644,34 @@ export function regRead(pi: ExtensionAPI): void {
               render: mode,
               ...(preloaded === undefined ? {} : { preloadedFile: preloaded }),
             });
+            if (prepared.kind === "image") {
+              // WHY: the interception point — the image never becomes a `results` entry, so no image
+              // WHY: content enters the served / hash / snapshot / lease paths below. A lone image
+              // WHY: delegates directly to the builtin and returns its image block.
+              const imageResult = await readImageViaBuiltin(prepared.absolutePath);
+              if (request.files.length === 1) return imageResult;
+              ordered.push({ kind: "image", blocks: imageResult.content as RoutedContent[] });
+              continue;
+            }
             if (prepared.kind !== "text") throw unsupportedFile(target, prepared);
-            results.push({
-              file: target.file,
-              mode,
-              plan,
-              prepared,
-              ...(plan.omittedAll
-                ? {}
-                : {
-                    ...(prepared.truncation !== undefined
-                      ? { truncation: prepared.truncation }
-                      : {}),
-                    ...(prepared.nextOffset !== undefined
-                      ? { nextOffset: prepared.nextOffset }
-                      : {}),
-                  }),
+            ordered.push({
+              kind: "file",
+              entry: {
+                file: target.file,
+                mode,
+                plan,
+                prepared,
+                ...(plan.omittedAll
+                  ? {}
+                  : {
+                      ...(prepared.truncation !== undefined
+                        ? { truncation: prepared.truncation }
+                        : {}),
+                      ...(prepared.nextOffset !== undefined
+                        ? { nextOffset: prepared.nextOffset }
+                        : {}),
+                    }),
+              },
             });
             // WHY: a served file draws the WHOLE file's line count off the shared budget, not its page —
             // WHY: the paged walk retained one anchor per hashed line, which is what the budget bounds.
@@ -627,14 +685,19 @@ export function regRead(pi: ExtensionAPI): void {
             if (request.files.length === 1 || signal?.aborted) throw error;
             // WHY: the inline section carries no header, so the subject is stamped here too — the
             // WHY: read tool raised this refusal and its own name is what the model must repair.
-            results.push({
-              file: target.file,
-              message: failureMessage(target.file, withPayloadSubject(error, "read")),
+            ordered.push({
+              kind: "file",
+              entry: {
+                file: target.file,
+                message: failureMessage(target.file, withPayloadSubject(error, "read")),
+              },
             });
           }
         }
+        const results: FileResult[] = ordered.flatMap((outcome) =>
+          outcome.kind === "file" ? [outcome.entry] : [],
+        );
         const preparedFiles = results.filter(isPrepared);
-
         for (const entry of preparedFiles) {
           if (entry.mode !== "served" || entry.plan.omittedAll) continue;
           try {
@@ -655,7 +718,11 @@ export function regRead(pi: ExtensionAPI): void {
           (entry) => entry.truncation !== undefined,
         )?.truncation;
         const anyTruncated = firstTruncation !== undefined;
-        const content = [{ type: "text" as const, text: results.map(sectionText).join("\n\n") }];
+        // WHY: a text-only call keeps the one joined text section byte-identical; with an image
+        // WHY: present the blocks aggregate in request order around the builtin's own blocks.
+        const content: RoutedContent[] = ordered.every((outcome) => outcome.kind === "file")
+          ? [{ type: "text", text: results.map(sectionText).join("\n\n") }]
+          : routedContent(ordered);
         const metrics = {
           truncated: anyTruncated,
           ...(single?.nextOffset !== undefined ? { next_offset: single.nextOffset } : {}),
