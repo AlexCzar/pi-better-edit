@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.12.0] - 2026-10-13
+
 ### Features
 * **store:** render the store's own section in `/pi-better-edit lens status` with configuration ladder provenance (`default` | `global` | `project` | `env`) and resolved path. The settings resolve through `resolveStoreJanitorSettingsWithSources` per key, while `isHealthy` and `shutdownDb` retain their explicit health check and checkpoint boundaries. (#90) (#103)
 * **store:** run the store janitor on non-hot-path lifecycle events (`session_start`, `session_shutdown`) with batched deletes and deep quick_check recovery. Foreign generation and expired rows are purged in statements bounded by `store.janitorBatchSize` under the throttled `janitor_at` timestamp. (#90) (#103)
