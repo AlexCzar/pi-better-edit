@@ -3,3 +3,4 @@
 - read: served rows may cover an expanded window when AST symbol expansion is active (small reads widen to the enclosing symbol) — anchors always match the rows shown, so copy them from this response.
 - read: pass `mode: "verbatim"` for plain content with no anchors when you will not edit the file — a config value, docs, a README, or skill content (a SKILL.md or any file in its directory) for reference; omit it when you intend to edit so the rows carry anchors.
 - read: send every file as `files: [{ file }, ...]`, like `edit` does; a file's own `mode` overrides the top-level one, and every file renders its own header and continuation footer.
+- read: PNG/JPG images are returned as image attachments for multimodal models — request them with `files` like any other file.
