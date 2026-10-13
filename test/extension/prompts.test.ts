@@ -78,8 +78,10 @@ describe("prompts/read.md (model-facing contract)", () => {
   });
 
   it("documents file-kind handling", () => {
-    // WHY: image support removed — read is plain-text only, so Images must not reappear here.
-    expect(readPrompt).not.toMatch(/Images/);
+    // WHY: image support recovered (PR #52) — PNG/JPG read as image attachments for multimodal
+    // WHY: models, while binary/directory stay rejected.
+    expect(readPrompt).toMatch(/PNG\/JPG/);
+    expect(readPrompt).toMatch(/image attachment/);
     expect(readPrompt).toMatch(/Binary/);
     expect(readPrompt).toMatch(/directory/);
   });
@@ -173,6 +175,14 @@ describe("read tool guidelines", () => {
     expect(guidelines.some((g) => g.includes("never served"))).toBe(true);
     expect(guidelines.some((g) => g.includes("re-read"))).toBe(false);
     expect(guidelines.some((g) => g.includes("call before `edit`"))).toBe(false);
+  });
+
+  it("documents image-attachment return for multimodal models (PR #52)", () => {
+    const { pi, getTool } = makeFakePiRegistry();
+    regRead(pi);
+    const tool = getTool("read");
+    const guidelines = tool.promptGuidelines as string[];
+    expect(guidelines.some((g) => g.includes("image attachment"))).toBe(true);
   });
 });
 
