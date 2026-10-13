@@ -138,6 +138,14 @@ describe("registerLensCommand", () => {
       "lens on",
       "lens off",
       "lens status",
+      "bash-view",
+      "bash-view on",
+      "bash-view off",
+      "bash-view status",
+      "bash",
+      "bash on",
+      "bash off",
+      "bash status",
     ]);
     expect(options.getArgumentCompletions?.("lens z")).toEqual([]);
   });
