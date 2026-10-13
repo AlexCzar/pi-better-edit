@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 
 const SEAM = join("src", "json-config.ts");
 const SETTINGS_OWNERS = [
+  join("src", "bash-view-config.ts"),
   join("src", "integrations", "pi-lens", "config.ts"),
   join("src", "store-config.ts"),
 ];

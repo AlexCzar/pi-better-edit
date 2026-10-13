@@ -21,6 +21,13 @@
         "janitorBatchSize": { "type": "integer", "minimum": 1, "default": 64 }
       },
       "additionalProperties": true
+    },
+    "bash": {
+      "type": "object",
+      "properties": {
+        "view": { "type": "string", "enum": ["on", "off"], "default": "on" }
+      },
+      "additionalProperties": true
     }
   },
   "additionalProperties": true
