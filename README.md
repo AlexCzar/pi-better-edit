@@ -289,6 +289,13 @@ referenced span is retired — the current word is `cut`.
 - Opt-in: `/pi-better-edit lens` (`auto` by default when pi-lens is detected, else off; override via `PI_BETTER_EDIT_LENS_BRIDGE=auto|on|off`). Core editing never depends on pi-lens — with the bridge off or absent, behavior is unchanged.
 - **Removal recipe**: delete `src/integrations/pi-lens/`, drop its two imports plus the `registerLensCommand(pi)` and `attachIOBridgeAdapter()` calls from `index.ts`, and drop the `content` argument from the seam producers (`src/read.ts`, and the write and bash auto-read paths in `src/lifecycle-hooks/index.ts`). The seams stay domain-neutral and need no other change; `test/arch/lens-bridge-boundary.test.ts` fails until the directory and the wiring are gone.
 
+### Bash View
+
+Pure single-file views (`cat`, `head`, `tail`, `sed -n` prints, and the admitted `grep`/`rg` search shapes) are intercepted: the raw stdout is swapped for the same lines as `HASH│content` rows under a frozen header, and the rows carry working leases, so the next `edit` anchors with no re-read round trip ([ADR-0033](docs/adr/0033-bash-view-interception.md)). Anything else — pipelines with transforms, compounds, multi-file shapes, errors, truncation — passes through byte-identical.
+
+- **Option**: `bash.view` in `.pi/agents/pi-better-edit.json` (`on` by default; `off` passes every view and search through raw). Resolves per key through env `PI_BETTER_EDIT_BASH_VIEW` over project file over global file over the default, with the same rung-source reporting as the other settings.
+- **Slash command**: `/pi-better-edit bash-view [on|off|status] [project|global]` (alias `/pi-better-edit bash ...`). Bare invocation offers the five-option picker (`On`/`Off` per scope, `Status`); headless hosts get the combined status text instead.
+- **First notice**: the first interception of each session warns once — naming the round trip saved and the off-ramp — and later interceptions stay silent until the next session.
 ---
 
 ## Error and Warning Contract

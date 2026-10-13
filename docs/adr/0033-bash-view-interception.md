@@ -21,6 +21,17 @@ expanded for Tier 1 to include boundary matching (`-w`, `-x`), match limit
 (`--color=never`, `--colour=never`), bundled short flags (`-nw`, `-nm 3`), and
 flags placed at any position before `--`.
 
+Amended 2026-10-13 (bash view config option): interception is now operator-gated.
+The `bash.view` key of the shared config file defaults to `on` and resolves per key
+through env `PI_BETTER_EDIT_BASH_VIEW` over project file over global file over the
+default, with rung-source reporting beside the other settings. Effective `off`
+passes both the view and the search branches through byte-identical at the hook
+entry; effective `on` keeps every D-gate above unchanged. The switch is writable via
+`/pi-better-edit bash-view [on|off|status] [project|global]` (alias `bash`), with a
+five-option picker on headed hosts and the combined status text on headless ones.
+The first successful interception of each session warns once — naming the round trip
+saved and the off-ramp — tracked per session key and re-armed by `session_start`;
+later interceptions stay silent.
 
 ## Context
 

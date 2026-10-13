@@ -12,6 +12,7 @@ import { splitLines } from "../utils.js";
 import { denseServeRows, fmtServedRows, type ServedRow } from "../hashline/served.js";
 import { notifyServedSpans, servedRowsToSpans, type ServedSpan } from "../served-spans.js";
 import { notifyMutatedFile } from "../mutated-files.js";
+import { resolveBashViewMode } from "../bash-view-config.js";
 import { pruneMissingAll as defaultPruneMissingAll } from "../snapshot-store";
 import { clearUndo as defaultClearUndo } from "../edit-undo.js";
 import { stripBOM, toLF } from "../edit-diff.js";
@@ -112,6 +113,33 @@ function toChangedRanges(first: number | undefined, last: number | undefined): S
   return [{ startLine: first, lineCount: last - first + 1 }];
 }
 
+/**
+ * Sessions already shown the first-interception notice, keyed by `deps.sessionKeyFor`.
+ * Module scope, not per hooks instance: a session outlives any one hooks object, and the
+ * notice is once per session. Cleared in `handleSessionStart`, which re-arms it.
+ */
+const warnedBashViewSessions = new Set<string>();
+
+/** First-interception notice: names the round saved and the off-ramp. */
+const BASH_VIEW_FIRST_NOTICE =
+  "Bash view replaced this output with anchored lines, saving a re-read round trip. " +
+  "Turn it off with /pi-better-edit bash-view off, or pick a scope via /pi-better-edit bash-view.";
+
+/**
+ * Warn once per session about the interception. A context without a notify surface falls
+ * back to the console — the same degradation the command's notify uses, inlined here so
+ * the editing path imports no command module for three lines.
+ */
+function notifyBashViewOnce(ctx: ToolContext, sessionKey: string): void {
+  if (warnedBashViewSessions.has(sessionKey)) return;
+  warnedBashViewSessions.add(sessionKey);
+  const ui = ctx.ui as { notify: (message: string, level: string) => void } | undefined;
+  if (ui !== undefined) {
+    ui.notify(BASH_VIEW_FIRST_NOTICE, "warning");
+    return;
+  }
+  console.log(BASH_VIEW_FIRST_NOTICE);
+}
 export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
   onSessionStart: (event: unknown, ctx: ToolContext) => Promise<void>;
   onToolResult: (
@@ -152,6 +180,8 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
   }
 
   async function handleSessionStart(_event: unknown, ctx: ToolContext): Promise<void> {
+    // WHY: a new session re-arms the first-interception notice the last one consumed.
+    warnedBashViewSessions.clear();
     await deps.initHasher();
     try {
       await deps.pruneMissingAll();
@@ -443,6 +473,10 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
     ctx: ToolContext,
   ): Promise<{ content: Array<{ type: string; text: string }>; details?: unknown } | undefined> {
     if (event.toolName !== "bash") return undefined;
+    // WHY: the off switch bypasses BOTH branches below — view and search — so raw output
+    // WHY: passes through byte-identical. The default is on, so an unconfigured session
+    // WHY: never reaches this return.
+    if (resolveBashViewMode(ctx.cwd) === "off") return undefined;
     if (event.isError) return undefined;
     const rawInput = event.input as Record<string, unknown> | undefined;
     const command = rawInput?.command;
@@ -566,6 +600,9 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
       // WHY: FULL replacement (not append): the raw stdout is unanchored bytes the
       // WHY: model already paid for once — swapping it for the anchored slice is
       // WHY: the zero-bloat interception point (ADR-0033 D4).
+      // WHY: FIRST-notice: the interception landed, so the session is told once what saved
+      // WHY: the round trip and where the off switch lives; later interceptions stay silent.
+      notifyBashViewOnce(ctx, sessionKey);
       return {
         content: [{ type: "text", text: `--- Bash view (hashline anchors) ---\n${preview.text}` }],
       };
@@ -655,6 +692,7 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
     // WHY: names the interception seam, and the bracketed count uses the singular for one match.
     const count = servedRows.length;
     const header = `--- Bash search (hashline anchors) ---\n[${search.filePath} (${count} ${count === 1 ? "match" : "matches"})]`;
+    notifyBashViewOnce(ctx, sessionKey);
     return {
       content: [{ type: "text", text: `${header}\n${fmtServedRows(servedRows, diskLines)}` }],
     };
