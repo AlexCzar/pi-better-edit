@@ -1262,7 +1262,11 @@ function guardStatement(
         if (property === "iterate") {
           return (...args: unknown[]) => {
             try {
-              return guardIterator(raw(...args) as IterableIterator<unknown>, generation, storePath);
+              return guardIterator(
+                raw(...args) as IterableIterator<unknown>,
+                generation,
+                storePath,
+              );
             } catch (error) {
               triggerUseTimeHeal(generation, storePath, error);
               throw error;
