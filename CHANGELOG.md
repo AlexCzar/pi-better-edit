@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 ### Bug Fixes
-* **store:** quarantine and rebuild the hash store on the first statement that fails with a corruption error, instead of leaving the damage for the next open or janitor run. The guarded handle rethrows the original error, so callers still fail loud. (#100)
+* **store:** quarantine and rebuild the hash store on the first statement that fails with a corruption error, instead of leaving the damage for the next open or janitor run. The guarded handle rethrows the original error, so callers still fail loud. (#100) (#119)
 
 ## [2.12.0] - 2026-10-13
 
