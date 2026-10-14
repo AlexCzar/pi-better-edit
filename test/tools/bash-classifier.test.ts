@@ -418,7 +418,6 @@ describe("bash-classifier search matrix (I1a)", () => {
       "grep -r pat f",
       "grep -R pat f",
       "grep -P pat f",
-      "grep -e pat f",
       "grep -f pats f",
       "grep -n5 pat f",
       "grep --line-number=x pat f",
@@ -609,5 +608,180 @@ describe("applySliceOps interval algebra", () => {
       { kind: "first", n: 4 },
     ] as const;
     expect(applySliceOps([...ops], 100)).toEqual([{ lo: 10, hi: 13 }]);
+  });
+});
+
+describe("bash-classifier search -e matrix (Tier-2 item 6)", () => {
+  it("admits separate `-e PAT` in every flag position", () => {
+    expect(searchOf("grep -e pat f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    expect(searchOf("rg -e pat f")).toEqual({
+      program: "rg",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    // WHY: flags are admitted at any position before `--` (Tier-1 shape (d)), and `-e` is
+    // WHY: a flag — between pattern-slot and file, and after the file, alike.
+    expect(searchOf("grep -i -e pat f").pattern).toBe("pat");
+    expect(searchOf("grep -e pat -i f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    expect(searchOf("grep -i f -e pat")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    // WHY: the point of `-e`: a `-`-leading value is the pattern, no `--` required.
+    expect(searchOf("grep -e -pat f")).toEqual({
+      program: "grep",
+      pattern: "-pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    // WHY: a consumed `-e` value is never re-parsed as a flag — `-n` here is the pattern.
+    expect(searchOf("grep -e -n f")).toEqual({
+      program: "grep",
+      pattern: "-n",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    // WHY: `--` still ends flag parsing, so the file may itself be `-n`.
+    expect(searchOf("grep -e pat -- -n")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "-n",
+      lineNumbered: false,
+    });
+  });
+
+  it("admits attached `-ePAT` without decomposing the pattern letters", () => {
+    expect(searchOf("grep -epat f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    expect(searchOf("rg -epat f").program).toBe("rg");
+    expect(searchOf("grep -e-pat f").pattern).toBe("-pat");
+    expect(searchOf("grep -i -epat f").pattern).toBe("pat");
+    expect(searchOf("grep -epat -i f").filePath).toBe("f");
+  });
+
+  it("admits cluster-close `-e` mirroring `-m` (must close, consumes next)", () => {
+    expect(searchOf("grep -ine pat f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: true,
+    });
+    expect(searchOf("grep -ne pat f").lineNumbered).toBe(true);
+    expect(searchOf("grep -ie pat f").pattern).toBe("pat");
+    expect(searchOf("rg -ine pat f").program).toBe("rg");
+  });
+
+  it("admits the `-e` + `-m` interplay (each value-taker consumes exactly one argument)", () => {
+    expect(searchOf("grep -e pat -m 3 f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    expect(searchOf("grep -m 3 -e pat f").pattern).toBe("pat");
+    expect(searchOf("grep -nm 3 -e pat f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: true,
+    });
+    expect(searchOf("grep -ine pat -m 3 f").pattern).toBe("pat");
+    expect(searchOf("rg -m 1 -e pat f").program).toBe("rg");
+  });
+
+  it("fails closed on missing `-e` values in every spelling", () => {
+    for (const command of [
+      "grep -e",
+      "grep -e pat",
+      "grep pat f -e",
+      "grep -m 3 -e",
+      "grep -ine",
+      "grep -ine pat",
+      "rg -e",
+    ]) {
+      expect(reasonOf(command)).toBe(
+        command.startsWith("rg") ? "unsupported-command:rg" : "unsupported-command:grep",
+      );
+    }
+  });
+
+  it("fails closed on doubled `-e` and on pattern-both-ways", () => {
+    for (const command of [
+      "grep -e a -e b f",
+      "grep -ea -eb f",
+      "grep -e a -eb f",
+      "grep -ea -e b f",
+      "grep -e pat -e pat f",
+      "grep -ine a -e b f",
+      "grep -ine a -ine b f",
+      // WHY: operands must then be exactly `[FILE]` — a positional pattern plus `-e` is both ways.
+      "grep -e a b f",
+      "grep b -e a f",
+      "grep -ea b f",
+      "grep b -ea f",
+      "grep -e a -- b f",
+    ]) {
+      expect(reasonOf(command)).toBe("unsupported-command:grep");
+    }
+  });
+
+  it("fails closed on `-e`-as-cluster misreadings and `-e`+`-m` collisions", () => {
+    for (const command of [
+      // WHY: any token starting `-e` is the attached form, so `-ei` is pattern `i` plus two
+      // WHY: operands (`pat`, `f`) — both-ways, not a cluster.
+      "grep -ei pat f",
+      "grep -en pat f",
+      // WHY: `m` anywhere but last fails closed, even beside `e`.
+      "grep -me pat f",
+      "grep -iem pat f",
+      "grep -emi pat f",
+      // WHY: `-e` swallows `-m` as its pattern value, leaving two operands (`3`, `f`).
+      "grep -e -m 3 f",
+      // WHY: bad `-m` values still fail with `-e` present.
+      "grep -e pat -m 0 f",
+      "grep -e pat -m3 f",
+      "grep -e pat -nm3 f",
+    ]) {
+      expect(reasonOf(command)).toBe("unsupported-command:grep");
+    }
+  });
+
+  it("keeps `-f` denied in every spelling", () => {
+    for (const command of ["grep -f pats f", "grep -ffoo f", "grep --file=x f", "rg -f pats f"]) {
+      expect(reasonOf(command)).toBe(
+        command.startsWith("rg") ? "unsupported-command:rg" : "unsupported-command:grep",
+      );
+    }
+  });
+
+  it("rewrites `-e` searches with the line-number splice after the program name", () => {
+    expect(withSearchLineNumbers("grep -e pat f")).toBe("grep -n -e pat f");
+    expect(withSearchLineNumbers("grep -epat f")).toBe("grep -n -epat f");
+    expect(withSearchLineNumbers("grep -e pat -m 3 f")).toBe("grep -n -e pat -m 3 f");
+    // WHY: `-ne`/`-ine` already carry `n`, so the injection skips byte-identically.
+    expect(withSearchLineNumbers("grep -ne pat f")).toBe("grep -ne pat f");
+    expect(withSearchLineNumbers("grep -ine pat f")).toBe("grep -ine pat f");
+    // WHY: `-e -n` is NOT numbered (`-n` is the pattern), so the splice still applies.
+    expect(withSearchLineNumbers("grep -e -n f")).toBe("grep -n -e -n f");
+    // WHY: denied `-e` shapes pass through the rewriter byte-identical.
+    expect(withSearchLineNumbers("grep -e a -e b f")).toBe("grep -e a -e b f");
+    expect(withSearchLineNumbers("grep -e a b f")).toBe("grep -e a b f");
   });
 });

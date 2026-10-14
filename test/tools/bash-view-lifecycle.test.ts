@@ -944,7 +944,6 @@ describe("bash search interception (I1a #73)", () => {
         "grep -r pat .",
         "grep -R pat .",
         "grep -P pat f.txt",
-        "grep -e pat f.txt",
         "grep -f pats f.txt",
         "grep -n5 pat f.txt",
         "grep --line-number=x pat f.txt",

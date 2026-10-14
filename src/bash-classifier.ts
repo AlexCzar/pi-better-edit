@@ -113,9 +113,11 @@ const SEARCH_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
 
 /** The letters a bundled single-dash cluster may contain (spec §3.2). Any digit or unknown
  * letter anywhere in the cluster fails closed, so `-n5`, `-inQ` and `-x5` stay raw bash.
- * `m` is special-cased: it may only close the cluster and consumes the next argument
- * (`-nm 3`), while the attached forms (`-m3`, `-nm3`) fail closed. */
-const SEARCH_SHORT_LETTERS: ReadonlySet<string> = new Set(["n", "i", "F", "E", "w", "x", "m"]);
+ * `m` and `e` are special-cased: each may only close the cluster and consumes the next
+ * argument (`-nm 3`, `-ine pat`), while the attached `-m` forms (`-m3`, `-nm3`) fail closed.
+ * (`-ePAT` never reaches the cluster loop: any token starting `-e` is the attached
+ * explicit-pattern form and is handled before decomposition.) */
+const SEARCH_SHORT_LETTERS: ReadonlySet<string> = new Set(["n", "i", "F", "E", "w", "x", "m", "e"]);
 
 /** The attached long match-limit form only: `--max-count=N`. A bare `--max-count` (value as
  * a separate argument) fails closed — spec §3.2 admits the separate-argument spelling for
@@ -313,13 +315,20 @@ function parseSourceStage(shape: StageShape): SourceStage | undefined {
  * before the pattern, between pattern and file, and after the file — because GNU grep/rg
  * accept post-operand options and the benchmark issues them (`grep pat -i f`). A bundled
  * single-dash cluster (`-in`, `-wF`) is decomposed and EVERY letter must be admitted; the
- * value-taking `m` may only close it (`-nm 3`). `--` ends flag parsing, so `grep pat -- -n`
- * names the file `-n`. Fail closed: attached short values (`-m3`, `-nm3`), any digit in a
- * cluster (`-n5`), an unknown letter (`-inQ`), every `=`-long form but `--max-count=N`
- * (`--line-number=x`, `--color=always`), a value that is not a strictly positive integer or
- * not exactly `never`, `-e`/`-f`, a `-`-leading pattern with no `--`, zero operands (stdin)
- * and two-or-more operands (filename prefixes break the `^\d+:` geometry). Globs, tildes and
- * expansions never reach here because `stageShape`/`literalValue` reject them first.
+ * value-taking `m` may only close it (`-nm 3`). The explicit-pattern `-e` is admitted in
+ * three spellings — separate (`-e PAT`), attached (`-ePAT`, handled before cluster
+ * decomposition since `PAT` letters are not admitted), and cluster-close (`-ine PAT`,
+ * mirroring `m`: must close, consumes the next argument) — exactly once; its value becomes
+ * THE pattern so the operands must then be exactly `[FILE]`. `--` ends flag parsing, so
+ * `grep pat -- -n` names the file `-n`. Fail closed: attached short values (`-m3`, `-nm3`),
+ * any digit in a cluster (`-n5`), an unknown letter (`-inQ`), every `=`-long form but
+ * `--max-count=N` (`--line-number=x`, `--color=always`), a value that is not a strictly
+ * positive integer or not exactly `never`, `-f` (stays denied: file-input patterns break
+ * the single-`PATTERN FILE` geometry), `-e` with no value, `-e` twice, a pattern both via
+ * `-e` and positionally, a `-`-leading pattern with no `--` (unless given via `-e`), zero
+ * operands (stdin) and two-or-more operands (filename prefixes break the `^\d+:` geometry).
+ * Globs, tildes and expansions never reach here because `stageShape`/`literalValue` reject
+ * them first.
  * Directory operands are deliberately NOT detected here: this module is pure and zero-fs, so
  * the lifecycle layer re-checks the resolved file kind.
  */
@@ -329,6 +338,7 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
   const operands: string[] = [];
   let lineNumbered = false;
   let separatorSeen = false;
+  let explicitPattern: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (!separatorSeen && arg === "--") {
@@ -349,8 +359,28 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
       }
       // WHY: every other `--…` token is an unlisted long option (`--json`, `--color=always`).
       if (arg.startsWith("--")) return undefined;
+      // WHY: explicit `-e` takes its pattern separately (`-e PAT`): exactly once, must have
+      // WHY: a next argument, which becomes THE pattern (so operands must then be `[FILE]`).
+      // WHY: a `-`-leading value is admitted here — that is the point of `-e`.
+      if (arg === "-e") {
+        if (explicitPattern !== undefined) return undefined;
+        const value = args.at(index + 1);
+        if (value === undefined) return undefined;
+        explicitPattern = value;
+        index += 1;
+        continue;
+      }
+      // WHY: attached `-ePAT` is handled BEFORE letter decomposition: `PAT...` letters are
+      // WHY: not admitted flags, so decomposing would misread the pattern as a cluster
+      // WHY: (`-efoo` is pattern `foo`, not flags `e`+`f`+`o`+`o`).
+      if (arg.startsWith("-e")) {
+        if (explicitPattern !== undefined) return undefined;
+        explicitPattern = arg.slice(2);
+        continue;
+      }
       // WHY: a single-dash token is a short cluster: every letter must be admitted, and the
-      // WHY: value-taking `m` may only close it, consuming the following argument (`-nm 3`).
+      // WHY: value-taking `m`/`e` may only close it, each consuming the next argument
+      // WHY: (`-nm 3`, `-ine pat`).
       const letters = arg.slice(1).split("");
       if (letters.length === 0) return undefined;
       for (let position = 0; position < letters.length; position++) {
@@ -362,6 +392,14 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
           if (!isPositiveCount(args.at(index + 1))) return undefined;
           index += 1;
         }
+        if (letter === "e") {
+          if (position !== letters.length - 1) return undefined;
+          if (explicitPattern !== undefined) return undefined;
+          const value = args.at(index + 1);
+          if (value === undefined) return undefined;
+          explicitPattern = value;
+          index += 1;
+        }
       }
       continue;
     }
@@ -369,6 +407,21 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
   }
   // WHY: exactly two operands — the pattern and the one file. `grep pat` searches stdin, and
   // WHY: `grep pat a b` prints `file:` prefixes, so both fail closed to raw bash.
+  // WHY: with `-e` the value IS the pattern, so exactly one operand (the file) must remain;
+  // WHY: two operands with `-e` means the pattern came both ways and fails closed.
+  // WHY: (item-9/10 gate preserved: no new operand shape is admitted, only the count shifts
+  // WHY: from 2 to 1 when `-e` supplies the pattern.)
+  if (explicitPattern !== undefined) {
+    if (operands.length !== 1) return undefined;
+    const filePath = operands[0];
+    if (filePath === undefined) return undefined;
+    return {
+      program: stage.name as SearchProgram,
+      pattern: explicitPattern,
+      filePath,
+      lineNumbered,
+    };
+  }
   if (operands.length !== 2) return undefined;
   const [pattern, filePath] = operands;
   return { program: stage.name as SearchProgram, pattern, filePath, lineNumbered };
