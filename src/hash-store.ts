@@ -1298,16 +1298,16 @@ function triggerUseTimeHeal(generation: DatabaseSync, storePath: string, error: 
  */
 async function runUseTimeHeal(storePath: string, generation: DatabaseSync): Promise<void> {
   try {
-    // WHY the heal yields FIRST: the teardown below must not run inside the failing statement's
+    // WHY: the heal yields FIRST — the teardown below must not run inside the failing statement's
     // WHY: own tick. Sibling statements on the same handle — the double-heal race's second
     // WHY: corruption — still throw the ORIGINAL error against the still-open connection instead
     // WHY: of a teardown artifact ("not open"), and only then does the generation guard below
     // WHY: decide whether this generation still owns the cache.
     await Promise.resolve();
-    // The generation guard: heal ONLY if the cache still holds the generation that failed. A
-    // second trigger never gets here (the flag), and a trigger from a handle the cache has
-    // since replaced — notably a heal that already rebuilt the store — bails here instead of
-    // quarantining the FRESH file.
+    // WHY: the generation guard — heal ONLY if the cache still holds the generation that failed.
+    // WHY: a second trigger never gets here (the flag), and a trigger from a handle the cache
+    // WHY: has since replaced — notably a heal that already rebuilt the store — bails here instead
+    // WHY: of quarantining the FRESH file.
     if (cachedDb === null || cachedDb.db !== generation) return;
     shutdownHashStore();
     await quarantineStore(storePath);
@@ -1371,7 +1371,7 @@ async function openStore(storePath: string, budget?: BusyBudget): Promise<HashSt
     // WHY: is merely busy this instant would fail an open that has already done all of its work.
     if (stamp.due) withBusyRetry(() => writeStoreStamp(db), budget);
 
-    // WHY the publish wraps: this is the seam — the guarded handle is what `loadHashStore`
+    // WHY: the publish wraps — this is the seam — the guarded handle is what `loadHashStore`
     // WHY: hands out and what `withStore` frames on, so one wrap covers every consumer.
     const guarded = guardDatabaseHandle(db, storePath);
     cachedDb = { path: storePath, db: guarded };
@@ -1406,7 +1406,7 @@ async function openStore(storePath: string, budget?: BusyBudget): Promise<HashSt
  * callers pass nothing, and a cached open returns immediately without consulting it.
  */
 export function loadHashStore(budget?: BusyBudget): Promise<HashStore> {
-  // WHY the join: a use-time heal armed by a just-thrown statement rebuilds the store beside
+  // WHY: the join — a use-time heal armed by a just-thrown statement rebuilds the store beside
   // WHY: this call. Waiting for it first is what makes the access after a loud failure land on
   // WHY: the FRESH store: without it the caller would get the still-cached damaged handle back.
   // WHY: No cycle: the heal reopens through `openStore` directly, never through here.
