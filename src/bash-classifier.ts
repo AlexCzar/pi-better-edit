@@ -14,6 +14,8 @@
  */
 import { parse } from "unbash";
 import type { AndOr, Command, ParsedScript, Pipeline, Statement, Word } from "unbash";
+import { BASH_SEARCH_MAX_FILES } from "./constants.js";
+import { assertNever } from "./utils.js";
 
 /** Maximum pipeline stages in one view segment (source + filters). */
 export const BASH_VIEW_MAX_PIPELINE_STAGES = 4;
@@ -32,6 +34,65 @@ export type SliceOp =
   | { kind: "from"; n: number }
   | { kind: "range"; from: number; to: number };
 
+/**
+ * WHY: (item 9) a content filter cannot fold over `LineInterval[]` — that algebra is
+ * WHY: count-based over a line count, so a keep/drop stage needs the line bytes. These ops
+ * WHY: carry the filter through the ordered stage array; the lifecycle layer folds them over
+ * WHY: `(true line, stream text)` pairs left to right and byte-gates the recomputed output
+ * WHY: against the observed stdout. Matching is literal substring, so a regex-looking
+ * WHY: pattern simply fails that gate and passes through raw.
+ *
+ * WHY: (item 11) `sortUnique`, `uniq` and `count` are the line-SET consumers. `sortUnique`
+ * WHY: (`sort -u`) dedupes by text keeping the FIRST occurrence's true line, then orders by
+ * WHY: raw bytes; `uniq` collapses ADJACENT equal runs keeping each run head; `count`
+ * WHY: (`wc -l`) is terminal — it consumes the whole stream and emits its length, so
+ * WHY: `parseViewSegment` refuses any stage after it. The first two reorder the stream, which
+ * WHY: is why the render states the order in its header while every lease keeps the true file
+ * WHY: coordinate it was folded from.
+ */
+type ContentOp =
+  | { kind: "keep"; pattern: string }
+  | { kind: "drop"; pattern: string }
+  | { kind: "sortUnique" }
+  | { kind: "uniq" }
+  | { kind: "count" };
+
+/**
+ * WHY: (item 9) one ordered pipeline stage. A single fold-left array keeps `grep|head` and
+ * WHY: `head|grep` distinguishable by position; `SliceOp` is a structural subset, so every
+ * WHY: Tier-1/2 `toEqual` literal still matches.
+ */
+export type ViewOp = SliceOp | ContentOp;
+
+/**
+ * WHY: (item 11) the union split is a total function, not a hand-rolled predicate: every arm is
+ * WHY: named here, so a new `ViewOp` kind fails `pnpm run typecheck` at this switch instead of
+ * WHY: being classified as a slice and folded through the interval algebra by accident.
+ */
+export function isContentOp(viewOp: ViewOp): viewOp is ContentOp {
+  switch (viewOp.kind) {
+    case "keep":
+    case "drop":
+    case "sortUnique":
+    case "uniq":
+    case "count":
+      return true;
+    case "first":
+    case "last":
+    case "dropLast":
+    case "from":
+    case "range":
+      return false;
+    default:
+      return assertNever(viewOp);
+  }
+}
+
+/** The complement of `isContentOp`, derived from it so the split has one authority. */
+export function isSliceOp(viewOp: ViewOp): viewOp is SliceOp {
+  return !isContentOp(viewOp);
+}
+
 /** Ordered disjoint 1-indexed inclusive line intervals over `[1..L]`. */
 export interface LineInterval {
   lo: number;
@@ -46,8 +107,8 @@ export interface BashView {
    * because bash resolves each `cd` against the directory in effect at that point —
    * applying only one of them out of order would lease a path never viewed. */
   baseDir?: string;
-  /** Slice ops in stream order, folded by `applySliceOps` over the line count. */
-  ops: SliceOp[];
+  /** Ordered stages in stream order; see `ViewOp` — folded left, so order matters. */
+  ops: ViewOp[];
   /** Present-and-true only for `cat -n FILE` / `nl -ba FILE`; absent means unnumbered. Optional so Tier-1 `toEqual` literals keep passing. */
   lineNumbered?: boolean;
 }
@@ -72,9 +133,56 @@ export interface BashSearch {
 /** The only two intercepted search programs (spec §3.2). */
 type SearchProgram = "grep" | "rg";
 
+/**
+ * WHY: (item 10) `grep`/`rg PATTERN FILE...` — two or more explicit files, no recursion flag.
+ * WHY: Every operand is a FILE, so the stdout geometry is the `FILE:LINE:content` triple that
+ * WHY: its own serve seam parses; the single-file `BashSearch` above is left byte-identical.
+ */
+export interface BashMultiSearch {
+  program: SearchProgram;
+  /** Match pattern exactly as written; same `-`-leading/`-e` rules as `BashSearch`. */
+  pattern: string;
+  /** Every file operand exactly as written, in operand order; 2..`BASH_SEARCH_MAX_FILES`. */
+  filePaths: string[];
+  lineNumbered: boolean;
+  baseDir?: string;
+}
+
+/** WHY: (item 10) `grep -r PATTERN DIR` — exactly one explicit dir (or file) operand. */
+export interface BashRecursiveSearch {
+  program: SearchProgram;
+  pattern: string;
+  /** The one operand exactly as written; a file operand recurses over just that file. */
+  dirPath: string;
+  lineNumbered: boolean;
+  baseDir?: string;
+}
+
+/** WHY: (item 10) `rg --files [DIR]` — an anchorless, existence-checked path list. */
+export interface BashFilesList {
+  program: "rg";
+  /** Optional explicit list root exactly as written; absent means the effective cwd. */
+  dirPath?: string;
+  baseDir?: string;
+}
+
+/**
+ * WHY: (item 10) the admitted search family, tagged by stdout geometry so each shape gets its
+ * WHY: own serve seam. `pureSearch` is the Tier-1/2 single-file shape and keeps its exact
+ * WHY: `toEqual` contract; the three new tags never reshape it.
+ */
+type SearchFamily =
+  | { kind: "pureSearch"; search: BashSearch }
+  | { kind: "pureMultiSearch"; search: BashMultiSearch }
+  | { kind: "pureRecursiveSearch"; search: BashRecursiveSearch }
+  | { kind: "pureFilesList"; search: BashFilesList };
+
 export type BashClass =
   | { kind: "pureView"; view: BashView }
   | { kind: "pureSearch"; search: BashSearch }
+  | { kind: "pureMultiSearch"; search: BashMultiSearch }
+  | { kind: "pureRecursiveSearch"; search: BashRecursiveSearch }
+  | { kind: "pureFilesList"; search: BashFilesList }
   | { kind: "passThrough"; reason: string };
 
 /** `sed -n` numeric print only — locks out `w`/`e`/`r`/`s`/`;`/`{}`/`/` (R4). */
@@ -120,6 +228,14 @@ const SEARCH_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
  * (`-ePAT` never reaches the cluster loop: any token starting `-e` is the attached
  * explicit-pattern form and is handled before decomposition.) */
 const SEARCH_SHORT_LETTERS: ReadonlySet<string> = new Set(["n", "i", "F", "E", "w", "x", "m", "e"]);
+
+/** Long grep recursion markers (`-R`'s long form is `--dereference-recursive`). */
+const SEARCH_GREP_RECURSIVE_FLAGS: ReadonlySet<string> = new Set([
+  "-r",
+  "-R",
+  "--recursive",
+  "--dereference-recursive",
+]);
 
 /** The attached long match-limit form only: `--max-count=N`. A bare `--max-count` (value as
  * a separate argument) fails closed — spec §3.2 admits the separate-argument spelling for
@@ -327,6 +443,20 @@ function parseSourceStage(shape: StageShape): SourceStage | undefined {
 }
 
 /**
+ * WHY: (item 10) `rg --files [DIR]` — the anchorless path list. The shape is exactly the flag
+ * WHY: plus zero or one non-`-` root; any other token (a pattern, another flag) fails closed,
+ * WHY: because this shape has no match rows and therefore no `LINE:content` geometry at all.
+ */
+function parseFilesListStage(stage: StageShape): BashFilesList | undefined {
+  if (stage.name !== "rg") return undefined;
+  if (stage.args.length === 0 || stage.args.length > 2) return undefined;
+  if (stage.args[0] !== "--files") return undefined;
+  const root = stage.args[1];
+  if (root !== undefined && root.startsWith("-")) return undefined;
+  return { program: "rg", ...(root !== undefined ? { dirPath: root } : {}) };
+}
+
+/**
  * `grep`/`rg` single-file search selector (spec §3.2). Strict default-deny: only the
  * allowlisted flags above survive and the shape must be exactly
  * `[flags] PATTERN [flags] FILE [flags]`. Flags are admitted at any position before `--` —
@@ -344,18 +474,29 @@ function parseSourceStage(shape: StageShape): SourceStage | undefined {
  * positive integer or not exactly `never`, `-f` (stays denied: file-input patterns break
  * the single-`PATTERN FILE` geometry), `-e` with no value, `-e` twice, a pattern both via
  * `-e` and positionally, a `-`-leading pattern with no `--` (unless given via `-e`), zero
- * operands (stdin) and two-or-more operands (filename prefixes break the `^\d+:` geometry).
+ * operands (stdin), and more than `BASH_SEARCH_MAX_FILES` file operands.
  * Globs, tildes and expansions never reach here because `stageShape`/`literalValue` reject
  * them first.
- * Directory operands are deliberately NOT detected here: this module is pure and zero-fs, so
- * the lifecycle layer re-checks the resolved file kind.
+ * WHY: (item 10) the operand arity now spans four shapes — `[PATTERN FILE]` (single-file),
+ * WHY: `[PATTERN FILE...]` (multi-file), `grep -r PATTERN DIR` (recursive walk) and
+ * WHY: `rg --files [DIR]` (anchorless list). Their stdout geometries differ (`LINE:content`,
+ * WHY: `FILE:LINE:content`, a path list), so the family is returned as a tagged union rather
+ * WHY: than one widened interface. Directory operands are still NOT detected here: this module
+ * WHY: is pure and zero-fs, so the lifecycle layer re-checks the resolved file kind — and
+ * WHY: upgrades an `rg` directory operand (rg recurses by default) while a `grep` directory
+ * WHY: operand stays raw (native grep errors without `-r`).
  */
-function parseSearchStage(stage: StageShape): BashSearch | undefined {
+function parseSearchStage(stage: StageShape): SearchFamily | undefined {
+  const filesList = parseFilesListStage(stage);
+  if (filesList) return { kind: "pureFilesList", search: filesList };
   if (!SEARCH_PROGRAMS.has(stage.name)) return undefined;
+  const program = stage.name as SearchProgram;
+  const isGrep = program === "grep";
   const args = stage.args;
   const operands: string[] = [];
   let lineNumbered = false;
   let separatorSeen = false;
+  let recursive = false;
   let explicitPattern: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
@@ -373,6 +514,12 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
         // WHY: `--max-count=N` is the only admitted `=`-long form and N must be a strictly
         // WHY: positive integer literal — `--max-count=0` and `--max-count=` fail closed.
         if (!isPositiveCount(attachedMaxCount[1])) return undefined;
+        continue;
+      }
+      // WHY: (item 10) grep's long recursion markers; rg's `--files` was handled whole above,
+      // WHY: so it can only reach here in a shape that fails the list gate and must stay denied.
+      if (isGrep && SEARCH_GREP_RECURSIVE_FLAGS.has(arg)) {
+        recursive = true;
         continue;
       }
       // WHY: every other `--…` token is an unlisted long option (`--json`, `--color=always`).
@@ -399,19 +546,26 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
       // WHY: a single-dash token is a short cluster: every letter must be admitted, and the
       // WHY: value-taking `m`/`e` may only close it, each consuming the next argument
       // WHY: (`-nm 3`, `-ine pat`).
-      const letters = arg.slice(1).split("");
-      if (letters.length === 0) return undefined;
-      for (let position = 0; position < letters.length; position++) {
-        const letter = letters[position];
+      const cluster = arg.slice(1).split("");
+      if (cluster.length === 0) return undefined;
+      for (let position = 0; position < cluster.length; position++) {
+        const letter = cluster[position];
+        // WHY: (item 10) `r`/`R` are grep's recursion markers and may sit anywhere in a cluster
+        // WHY: (`-rn`); for rg the same letters are `--replace` and stay denied.
+        if (letter === "r" || letter === "R") {
+          if (!isGrep) return undefined;
+          recursive = true;
+          continue;
+        }
         if (!SEARCH_SHORT_LETTERS.has(letter)) return undefined;
         if (letter === "n") lineNumbered = true;
         if (letter === "m") {
-          if (position !== letters.length - 1) return undefined;
+          if (position !== cluster.length - 1) return undefined;
           if (!isPositiveCount(args.at(index + 1))) return undefined;
           index += 1;
         }
         if (letter === "e") {
-          if (position !== letters.length - 1) return undefined;
+          if (position !== cluster.length - 1) return undefined;
           if (explicitPattern !== undefined) return undefined;
           const value = args.at(index + 1);
           if (value === undefined) return undefined;
@@ -423,29 +577,34 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
     }
     operands.push(arg);
   }
-  // WHY: exactly two operands — the pattern and the one file. `grep pat` searches stdin, and
-  // WHY: `grep pat a b` prints `file:` prefixes, so both fail closed to raw bash.
-  // WHY: with `-e` the value IS the pattern, so exactly one operand (the file) must remain;
-  // WHY: two operands with `-e` means the pattern came both ways and fails closed.
-  // WHY: (item-9/10 gate preserved: no new operand shape is admitted, only the count shifts
-  // WHY: from 2 to 1 when `-e` supplies the pattern.)
-  if (explicitPattern !== undefined) {
-    if (operands.length !== 1) return undefined;
-    const filePath = operands[0];
-    if (filePath === undefined) return undefined;
-    return {
-      program: stage.name as SearchProgram,
-      pattern: explicitPattern,
-      filePath,
-      lineNumbered,
-    };
+  // WHY: (item 10) operand arity. Without `-e` the first operand is the PATTERN and the rest
+  // WHY: are FILES; with `-e` the value IS the pattern, so EVERY operand is a file. Counts
+  // WHY: beyond `BASH_SEARCH_MAX_FILES` fail closed HERE (never silent-truncate, invariant 3);
+  // WHY: the total matched-line budget is enforced at serve time against `SEARCH_MAX_MATCHES`.
+  const fileOperands = explicitPattern === undefined ? operands.slice(1) : [...operands];
+  const pattern = explicitPattern ?? operands[0];
+  if (pattern === undefined) return undefined;
+  if (recursive) {
+    // WHY: grep's recursion marker takes exactly one operand — the dir (or file) to walk.
+    // WHY: Recursion and multi-file never mix (`grep -r pat a b` fails the whole stage closed).
+    if (fileOperands.length !== 1) return undefined;
+    const dirPath = fileOperands[0];
+    if (dirPath === undefined) return undefined;
+    return { kind: "pureRecursiveSearch", search: { program, pattern, dirPath, lineNumbered } };
   }
-  if (operands.length !== 2) return undefined;
-  const [pattern, filePath] = operands;
-  return { program: stage.name as SearchProgram, pattern, filePath, lineNumbered };
+  // WHY: zero file operands is a stdin search (`grep pat`) — still denied, unchanged.
+  if (fileOperands.length === 0 || fileOperands.length > BASH_SEARCH_MAX_FILES) return undefined;
+  if (fileOperands.length === 1) {
+    const filePath = fileOperands[0];
+    if (filePath === undefined) return undefined;
+    return { kind: "pureSearch", search: { program, pattern, filePath, lineNumbered } };
+  }
+  return {
+    kind: "pureMultiSearch",
+    search: { program, pattern, filePaths: [...fileOperands], lineNumbered },
+  };
 }
 
-/** Downstream pipe stages: selectors with no file operand (stdin only). */
 /**
  * Downstream pipe stages: selectors with no file operand (stdin only). The `rtk`
  * unwrap applies here too (ADR-0033 D8 as amended): the field issues
@@ -453,7 +612,7 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
  * the transparency claim honest per call. Single unwrap, view commands only —
  * `rtk` around anything else stays `unsafe` via the unchanged rules below.
  */
-function parseFilterStage(shape: StageShape): SliceOp[] | undefined {
+function parseFilterStage(shape: StageShape): ViewOp[] | undefined {
   const stage = unwrapViewWrapper(shape);
   if (!stage) return undefined;
   if (stage.name === "head" || stage.name === "tail") {
@@ -465,6 +624,54 @@ function parseFilterStage(shape: StageShape): SliceOp[] | undefined {
     const selection = parseSedArgs(stage.args);
     if (!selection || selection.file !== undefined) return undefined;
     return selection.ops;
+  }
+  return parseContentFilter(stage);
+}
+
+/**
+ * WHY: (item 9) stdin content filters — `grep PATTERN` keeps, `grep -v PATTERN` drops,
+ * WHY: `rg -N PATTERN` keeps. Exact shapes only: no other flag, exactly one positional
+ * WHY: pattern, and a `-`-leading pattern fails closed (there is no `--` separator
+ * WHY: downstream). Patterns arrive through `stageShape`/`literalValue`, so quoting and
+ * WHY: expansion rules match search patterns. `-v`/`-N` are admitted HERE ONLY —
+ * WHY: `parseSearchStage` and `SEARCH_ALLOWED_FLAGS` are untouched, so `grep -v pat f` and
+ * WHY: `rg -N pat f` stay `unsupported-command:*` at source position.
+ */
+function parseContentFilter(stage: StageShape): ViewOp[] | undefined {
+  if (stage.name === "grep") {
+    const [first, second] = stage.args;
+    if (stage.args.length === 1) {
+      if (first === undefined || first.startsWith("-")) return undefined;
+      return [{ kind: "keep", pattern: first }];
+    }
+    if (stage.args.length === 2 && first === "-v") {
+      if (second === undefined || second.startsWith("-")) return undefined;
+      return [{ kind: "drop", pattern: second }];
+    }
+    return undefined;
+  }
+  // WHY: `rg -N` is the one spelling that pins the no-number geometry; bare `rg PAT` keeps
+  // WHY: its default numbering, which the classifier refuses to guess at.
+  if (stage.name === "rg") {
+    const [first, second] = stage.args;
+    if (stage.args.length === 2 && first === "-N") {
+      if (second === undefined || second.startsWith("-")) return undefined;
+      return [{ kind: "keep", pattern: second }];
+    }
+    return undefined;
+  }
+  // WHY: (item 11) the three line-set consumers, each admitted in exactly ONE spelling: `sort
+  // WHY: -u` is the dedupe (bare `sort`, `-n`, `-r`, `-o FILE`, a file operand and every
+  // WHY: combined flag fail closed), `uniq` takes no flag or operand (adjacent-only, literal),
+  // WHY: and `wc -l` is the count (bare `wc`, `-c`, `-w` and any operand fail closed).
+  if (stage.name === "sort") {
+    return stage.args.length === 1 && stage.args[0] === "-u" ? [{ kind: "sortUnique" }] : undefined;
+  }
+  if (stage.name === "uniq") {
+    return stage.args.length === 0 ? [{ kind: "uniq" }] : undefined;
+  }
+  if (stage.name === "wc") {
+    return stage.args.length === 1 && stage.args[0] === "-l" ? [{ kind: "count" }] : undefined;
   }
   return undefined;
 }
@@ -535,13 +742,13 @@ interface SilentSeg {
 interface ViewSeg {
   kind: "view";
   filePath: string;
-  ops: SliceOp[];
+  ops: ViewOp[];
   lineNumbered?: boolean;
 }
 
 interface SearchSeg {
   kind: "search";
-  search: BashSearch;
+  family: SearchFamily;
 }
 
 type Segment = SilentSeg | ViewSeg | SearchSeg | { kind: "unsafe"; reason: string };
@@ -607,7 +814,7 @@ function parseViewSegment(node: Command | Pipeline): ViewSeg | undefined {
   if (node.commands.length < 2 || node.commands.length > BASH_VIEW_MAX_PIPELINE_STAGES) {
     return undefined;
   }
-  const ops: SliceOp[] = [];
+  const ops: ViewOp[] = [];
   let filePath: string | undefined;
   for (let index = 0; index < node.commands.length; index++) {
     const child = node.commands[index];
@@ -619,18 +826,43 @@ function parseViewSegment(node: Command | Pipeline): ViewSeg | undefined {
     if (!stage) return undefined;
     if (index === 0) {
       const source = parseSourceStage(stage);
-      if (!source) return undefined;
-      // WHY: (item 8) the numbered geometry is full-file display only; any downstream
-      // WHY: filter would silently drop numbered rows while claiming full-file leases.
-      if (source.lineNumbered === true) return undefined;
-      filePath = source.filePath;
-      ops.push(...source.ops);
+      if (source) {
+        // WHY: (item 8) the numbered geometry is full-file display only; any downstream
+        // WHY: filter would silently drop numbered rows while claiming full-file leases.
+        // WHY: (item 9) Tier 3 does NOT lift this guard.
+        if (source.lineNumbered === true) return undefined;
+        filePath = source.filePath;
+        ops.push(...source.ops);
+        continue;
+      }
+      // WHY: (item 9) stage 0 may be a search (`grep pat f | head -5`). An UNNUMBERED
+      // WHY: search proves exactly what a `keep` filter proves — the file's lines matching
+      // WHY: the pattern — so it is translated into one and the content seam byte-gates the
+      // WHY: fold against the observed stdout. A NUMBERED search (`grep -n pat f | head -5`)
+      // WHY: must not be admitted: its injected `LINE:` column is DATA the downstream stage
+      // WHY: inspects, so composing it would change the model's own command's row set (and
+      // WHY: inventing a coordinate the model never asked for). It fails closed here, exactly
+      // WHY: like the item-8 numbered-view guard, and NO command is ever rewritten.
+      const searchSource = parseSearchStage(stage);
+      // WHY: (item 10) only the SINGLE-file, unnumbered shape has bare-content stdout that one
+      // WHY: `keep` over ONE file can model; multi-file and recursive stdout carry `FILE:LINE:`
+      // WHY: prefixes and `rg --files` carries paths, so those compose with nothing downstream.
+      if (searchSource?.kind !== "pureSearch" || searchSource.search.lineNumbered) {
+        return undefined;
+      }
+      filePath = searchSource.search.filePath;
+      ops.push({ kind: "keep", pattern: searchSource.search.pattern });
       continue;
     }
     const filter = parseFilterStage(stage);
     if (!filter) return undefined;
     ops.push(...filter);
   }
+  // WHY: (item 11) `wc -l` is TERMINAL: its stdout is the count, so nothing may consume the
+  // WHY: rows after it (`... | wc -l | head -2` would head a number). The classifier refuses
+  // WHY: the whole pipeline rather than admit a stage order the fold cannot model.
+  const countAt = ops.findIndex((op) => op.kind === "count");
+  if (countAt !== -1 && countAt !== ops.length - 1) return undefined;
   if (filePath === undefined || ops.length === 0) return undefined;
   return { kind: "view", filePath, ops };
 }
@@ -650,7 +882,7 @@ function classifySegment(node: Command | Pipeline, prefixPosition = false): Segm
         ...(source.lineNumbered === true ? { lineNumbered: true } : {}),
       };
     const search = parseSearchStage(stage);
-    if (search) return { kind: "search", search };
+    if (search) return { kind: "search", family: search };
     return { kind: "unsafe", reason: `unsupported-command:${stage.name}` };
   }
   const view = parseViewSegment(node);
@@ -750,7 +982,7 @@ function classifyBash(command: string, located: { searchNameEnd?: number }): Bas
     return { kind: "passThrough", reason: "chain-too-long" };
   }
   let view: ViewSeg | undefined;
-  let searchSeg: BashSearch | undefined;
+  let searchSeg: SearchFamily | undefined;
   let baseDir: string | undefined;
   for (const { node, prefixPosition } of segments) {
     if (node.type !== "Command" && node.type !== "Pipeline") {
@@ -782,7 +1014,7 @@ function classifyBash(command: string, located: { searchNameEnd?: number }): Bas
       if (view !== undefined || searchSeg !== undefined) {
         return { kind: "passThrough", reason: "multi-view" };
       }
-      searchSeg = classified.search;
+      searchSeg = classified.family;
       if (node.type === "Command" && node.name?.end !== undefined) {
         located.searchNameEnd = node.name.end;
       }
@@ -797,12 +1029,7 @@ function classifyBash(command: string, located: { searchNameEnd?: number }): Bas
     }
     view = classified;
   }
-  if (searchSeg) {
-    return {
-      kind: "pureSearch",
-      search: baseDir === undefined ? searchSeg : { ...searchSeg, baseDir },
-    };
-  }
+  if (searchSeg) return applyBaseDir(searchSeg, baseDir);
   if (!view) return { kind: "passThrough", reason: "no-view" };
   return {
     kind: "pureView",
@@ -820,6 +1047,25 @@ function classifyBash(command: string, located: { searchNameEnd?: number }): Bas
             ...(view.lineNumbered === true ? { lineNumbered: true } : {}),
           },
   };
+}
+
+/**
+ * WHY: (item 10) one place applies the chain's single pre-view `cd` to whichever search family
+ * WHY: shape won, so the resolution base cannot be remembered for one shape and forgotten for
+ * WHY: another (the `pureSearch`-only spread this replaces covered the single-file case alone).
+ */
+function applyBaseDir(family: SearchFamily, baseDir: string | undefined): BashClass {
+  if (baseDir === undefined) return family;
+  switch (family.kind) {
+    case "pureSearch":
+      return { kind: "pureSearch", search: { ...family.search, baseDir } };
+    case "pureMultiSearch":
+      return { kind: "pureMultiSearch", search: { ...family.search, baseDir } };
+    case "pureRecursiveSearch":
+      return { kind: "pureRecursiveSearch", search: { ...family.search, baseDir } };
+    case "pureFilesList":
+      return { kind: "pureFilesList", search: { ...family.search, baseDir } };
+  }
 }
 
 function takeFirst(list: LineInterval[], n: number): LineInterval[] {
@@ -904,21 +1150,122 @@ export function applySliceOps(ops: readonly SliceOp[], lineCount: number): LineI
   return intervals;
 }
 
+/** One stream line in a content fold: its TRUE 1-indexed file line and the text stages see. */
+export interface ContentLine {
+  line: number;
+  text: string;
+}
+
+/**
+ * WHY: (item 9) content-aware fold over `(line, text)` pairs, left in stage order. Slice
+ * WHY: stages reuse the interval algebra over stream positions, mapped back to entries so a
+ * WHY: multi-interval `sed -n -e` stage keeps its exact shape; `keep`/`drop` narrow by
+ * WHY: literal substring. Total and pure — an empty result means the caller passes through
+ * WHY: with zero leases, the same contract `applySliceOps` has.
+ *
+ * WHY: (item 11) the fold is a `switch` over the whole union with no fall-through slice arm, so
+ * WHY: the three line-set consumers are handled where they are declared and an unknown kind is
+ * WHY: refused (`assertNever`) instead of silently degrading to a slice.
+ */
+export function applyViewOps(ops: readonly ViewOp[], lines: readonly ContentLine[]): ContentLine[] {
+  let stream = [...lines];
+  for (const op of ops) {
+    switch (op.kind) {
+      case "keep":
+        stream = stream.filter((entry) => entry.text.includes(op.pattern));
+        break;
+      case "drop":
+        stream = stream.filter((entry) => !entry.text.includes(op.pattern));
+        break;
+      case "sortUnique":
+        stream = sortUniqueLines(stream);
+        break;
+      case "uniq":
+        stream = collapseAdjacentRuns(stream);
+        break;
+      case "count":
+        // WHY: (item 11) `wc -l` is terminal: the stream IS the counted set and its length is
+        // WHY: the number, so this arm leaves the rows for the lifecycle layer to lease. No op
+        // WHY: folds after it (`parseViewSegment` refuses one).
+        break;
+      case "first":
+      case "last":
+      case "dropLast":
+      case "from":
+      case "range": {
+        const intervals = applySliceOps([op], stream.length);
+        const next: ContentLine[] = [];
+        for (const iv of intervals) next.push(...stream.slice(iv.lo - 1, iv.hi));
+        stream = next;
+        break;
+      }
+      default:
+        // WHY: (item 11) an unknown op kind must never silently become a slice; the `never`
+        // WHY: binding is what keeps `pnpm run typecheck` exhaustive over `ViewOp`.
+        return assertNever(op);
+    }
+    if (stream.length === 0) return [];
+  }
+  return stream;
+}
+
+/**
+ * WHY: (item 11) `sort -u` dedupes by text keeping the FIRST occurrence's true line — the
+ * WHY: anchor that travels with the row is a real file coordinate, never a renumbered one —
+ * WHY: then orders by raw bytes — the C/POSIX collation `sort` uses under `LC_ALL=C`. A host
+ * WHY: whose locale collation reorders the set (case-folding, accents) folds differently, fails
+ * WHY: the whole-stdout byte gate and passes through raw, never a wrong order.
+ */
+function sortUniqueLines(stream: ContentLine[]): ContentLine[] {
+  const firstByText = new Map<string, ContentLine>();
+  for (const entry of stream) {
+    if (!firstByText.has(entry.text)) firstByText.set(entry.text, entry);
+  }
+  return [...firstByText.values()].sort((left, right) =>
+    Buffer.compare(Buffer.from(left.text, "utf8"), Buffer.from(right.text, "utf8")),
+  );
+}
+
+/**
+ * WHY: (item 11) `uniq` is ADJACENT-only and literal: each run of equal text collapses to its
+ * WHY: head, so the same text may survive at two non-adjacent positions, each keeping its own
+ * WHY: true line. Sorting is never part of it.
+ */
+function collapseAdjacentRuns(stream: ContentLine[]): ContentLine[] {
+  const out: ContentLine[] = [];
+  for (const entry of stream) {
+    const head = out[out.length - 1];
+    if (head === undefined || head.text !== entry.text) out.push(entry);
+  }
+  return out;
+}
+
 /**
  * [spec §3.3] The pure `tool_call` rewrite: inject the line-number flag immediately after the
  * search program name — before any `--` separator, so `grep -- -pat f` becomes
  * `grep -n -- -pat f` — and return the command byte-identically unchanged for everything the
- * allowlist does not admit (a denied flag, a pipeline, a non-search command, or an already
- * numbered search). Zero filesystem access: the rewrite is decided from the AST alone, and the
- * `tool_result` side re-parses the mutated command instead of sharing state with this hook.
+ * allowlist does not admit (a denied flag, a non-search command, or an already numbered
+ * search). WHY no pipeline rewrite (item 9): a search-led pipeline is served from the
+ * model's own command's output — an unnumbered source is translated into a `keep` filter and
+ * a numbered one composes with nothing — so injecting `-n` would change what a downstream
+ * content filter sees. Zero filesystem access: the rewrite is decided from the AST alone, and
+ * the `tool_result` side re-parses the mutated command instead of sharing state with this hook.
  */
 export function withSearchLineNumbers(command: string): string {
   const located: { searchNameEnd?: number } = {};
   const classification = classifyBash(command, located);
-  if (classification.kind !== "pureSearch") return command;
-  if (classification.search.lineNumbered) return command;
+  // WHY: (item 10) multi-file and recursive searches take the same stage-0 splice: their serve
+  // WHY: seams parse `FILE:LINE:content` triples, and with no downstream stage the injected
+  // WHY: column is inert (nothing consumes it), exactly as for a single-file search.
+  const search =
+    classification.kind === "pureSearch" ||
+    classification.kind === "pureMultiSearch" ||
+    classification.kind === "pureRecursiveSearch"
+      ? classification.search
+      : undefined;
+  if (search === undefined || search.lineNumbered) return command;
   const nameEnd = located.searchNameEnd;
   if (nameEnd === undefined) return command;
-  const flag = classification.search.program === "rg" ? "--line-number" : "-n";
+  const flag = search.program === "rg" ? "--line-number" : "-n";
   return `${command.slice(0, nameEnd)} ${flag}${command.slice(nameEnd)}`;
 }

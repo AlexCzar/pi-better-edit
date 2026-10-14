@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "child_process";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, symlink, writeFile } from "fs/promises";
 import { join } from "path";
 import register from "../../index";
 import { lineHashes } from "../../src/hashline";
@@ -941,8 +941,6 @@ describe("bash search interception (I1a #73)", () => {
         "grep -b pat f.txt",
         "grep -H pat f.txt",
         "grep -h pat f.txt",
-        "grep -r pat .",
-        "grep -R pat .",
         "grep -P pat f.txt",
         "grep -f pats f.txt",
         "grep -n5 pat f.txt",
@@ -969,7 +967,6 @@ describe("bash search interception (I1a #73)", () => {
         "grep pat f.txt && cat f.txt",
         "grep pat f.txt || cat f.txt",
         "grep pat f.txt &",
-        "grep pat a.txt f.txt",
         "grep pat",
         "grep pat *.ts",
         "cat f.txt | grep pat",
@@ -1342,6 +1339,1031 @@ describe("bash numbered view lifecycle (Tier-2 item 8)", () => {
       // Unnumbered stdout for a numbered command (and vice versa).
       expect(await bashResult(handler!, "cat -n f.txt", ctx, body)).toBeUndefined();
       expect(await bashResult(handler!, "cat f.txt", ctx, catNumbered(body))).toBeUndefined();
+    });
+  });
+});
+
+describe("bash filter-stage lifecycle (Tier-3 item 9)", () => {
+  it("serves cat|grep -v with file-true anchors and leases only the survivors", async () => {
+    await withTempDir("bash-filter-", async (dir) => {
+      const content = "keep1\nDROP\nkeep2\nDROP\nkeep3\n";
+      await writeFile(join(dir, "f.txt"), content, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-filter-drop" } };
+      const result = await bashResult(
+        handlers.get("tool_result")!,
+        "cat f.txt | grep -v DROP",
+        ctx,
+        "keep1\nkeep2\nkeep3\n",
+      );
+      expect(result).toBeDefined();
+      const rows = rowsOf(result!.content[0]!.text);
+      expect(rows).toHaveLength(3);
+      expect(rows.map((row) => row.split("\u2502")[1])).toEqual(["keep1", "keep2", "keep3"]);
+      // WHY: the dropped line's true anchor was never served, so it grants nothing —
+      // WHY: least privilege, and the witness that the fold binds real file positions.
+      const allHashes = await lineHashes(content, join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[1]!, anchor_to: allHashes[1]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(rows, "keep2"),
+              anchor_to: anchorFor(rows, "keep2"),
+              text: "KEEP2",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("distinguishes subtract-then-head from head-then-subtract", async () => {
+    await withTempDir("bash-filter-", async (dir) => {
+      const content = "K1\nK2\na\nb\n";
+      await writeFile(join(dir, "f.txt"), content, "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      // WHY: subtract-then-head serves file lines 3 and 4.
+      const first = { cwd: dir, sessionManager: { getSessionId: () => "bash-filter-order-a" } };
+      const served = await bashResult(handler!, "cat f.txt | grep -v K | head -2", first, "a\nb\n");
+      expect(served).toBeDefined();
+      expect(rowsOf(served!.content[0]!.text).map((row) => row.split("\u2502")[1])).toEqual([
+        "a",
+        "b",
+      ]);
+      // WHY: head-then-subtract empties (lines 1 and 2 both contain K) — the fold yields
+      // WHY: no windows, so the view passes through with zero leases.
+      const second = { cwd: dir, sessionManager: { getSessionId: () => "bash-filter-order-b" } };
+      expect(
+        await bashResult(handler!, "cat f.txt | head -2 | grep -v K", second, ""),
+      ).toBeUndefined();
+    });
+  });
+
+  it("serves an unnumbered search source through the content fold, mutating nothing", async () => {
+    await withTempDir("bash-filter-", async (dir) => {
+      await writeFile(join(dir, "f.txt"), numberedLines(5), "utf-8");
+      const { pi, handlers, handlersAll, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-filter-search-head" } };
+      // WHY: the command reaches bash byte-identical — the source search became a `keep`, so
+      // WHY: whatever the model's own semantics are is what the fold is gated against.
+      const call = { toolName: "bash", input: { command: "grep line f.txt | head -2" } };
+      for (const handler of handlersAll.get("tool_call") ?? []) await handler(call, ctx);
+      expect(call.input.command).toBe("grep line f.txt | head -2");
+      const result = await bashResult(
+        handlers.get("tool_result")!,
+        call.input.command,
+        ctx,
+        "line1\nline2\n",
+      );
+      expect(result).toBeDefined();
+      expect(result!.content[0]!.text.startsWith("--- Bash view (hashline anchors) ---\n")).toBe(
+        true,
+      );
+      expect(result!.content[0]!.text).toContain("[f.txt (2 lines)]");
+      const rows = rowsOf(result!.content[0]!.text);
+      expect(rows).toHaveLength(2);
+      // WHY: file-true coordinates — the survivors are lines 1 and 2, and both edit cleanly.
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(rows, "line2"),
+              anchor_to: anchorFor(rows, "line2"),
+              text: "LINE2",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("leases sparse survivors row by row instead of passing them through raw", async () => {
+    await withTempDir("bash-filter-", async (dir) => {
+      // WHY: 20 survivors over 40 lines is 20 runs — far past the read tool's 16-window budget —
+      // WHY: yet a search-shaped row lease serves it; the window budget would go raw here.
+      const sparse =
+        Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? `hit${i + 1}` : "miss")).join("\n") +
+        "\n";
+      await writeFile(join(dir, "f.txt"), sparse, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-filter-sparse" } };
+      const stdout = Array.from({ length: 20 }, (_, i) => `hit${i * 2 + 1}`).join("\n") + "\n";
+      const result = await bashResult(
+        handlers.get("tool_result")!,
+        "cat f.txt | grep hit",
+        ctx,
+        stdout,
+      );
+      expect(result).toBeDefined();
+      const rows = rowsOf(result!.content[0]!.text);
+      expect(rows).toHaveLength(20);
+      expect(rows[0]!.split("\u2502")[1]).toBe("hit1");
+      // WHY: the interleaved `miss` line was filtered out, so its true anchor grants nothing.
+      const allHashes = await lineHashes(sparse, join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[1]!, anchor_to: allHashes[1]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(rows, "hit1"),
+              anchor_to: anchorFor(rows, "hit1"),
+              text: "HIT",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("serves exactly the match cap and passes one row over it through raw", async () => {
+    await withTempDir("bash-filter-", async (dir) => {
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const handler = handlers.get("tool_result");
+      // WHY: SEARCH_MAX_MATCHES bounds the content seam exactly as it bounds a search:
+      // WHY: over-cap passes the WHOLE output raw — never a silently truncated render.
+      const fifty = Array.from({ length: 50 }, (_, i) => `hit${i + 1}`).join("\n") + "\n";
+      await writeFile(join(dir, "f.txt"), fifty, "utf-8");
+      const atCap = await bashResult(
+        handler!,
+        "cat f.txt | grep hit",
+        { cwd: dir, sessionManager: { getSessionId: () => "bash-filter-cap-50" } },
+        fifty,
+      );
+      expect(atCap).toBeDefined();
+      expect(rowsOf(atCap!.content[0]!.text)).toHaveLength(50);
+      const over = `${fifty}hit51\n`;
+      await writeFile(join(dir, "f.txt"), over, "utf-8");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-filter-cap-51" } };
+      expect(await bashResult(handler!, "cat f.txt | grep hit", ctx, over)).toBeUndefined();
+      const allHashes = await lineHashes(over, join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[0]!, anchor_to: allHashes[0]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+
+  it("fails closed on a stdout that the disk fold does not reproduce", async () => {
+    await withTempDir("bash-filter-", async (dir) => {
+      const body = numberedLines(5);
+      await writeFile(join(dir, "f.txt"), body, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-filter-gates" } };
+      // WHY: stdout claims every line survived a `-v line3` while the disk fold removes line3 —
+      // WHY: the whole-stdout byte gate refuses the serve (never a partial grant).
+      expect(await bashResult(handler!, "cat f.txt | grep -v line3", ctx, body)).toBeUndefined();
+      // WHY: and the mirror image — stdout claims everything was filtered while the fold keeps
+      // WHY: four lines — also refused, so "no output" can never be manufactured by the seam.
+      expect(await bashResult(handler!, "cat f.txt | grep -v line3", ctx, "")).toBeUndefined();
+      // WHY: zero leases after every refusal.
+      const allHashes = await lineHashes(body, join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[0]!, anchor_to: allHashes[0]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+});
+
+describe("bash multi-file and recursive lifecycle (Tier-3 item 10)", () => {
+  it("serves per-file sections and leases each named file independently", async () => {
+    await withTempDir("bash-multi-", async (dir) => {
+      await writeFile(join(dir, "a.txt"), "alpha1\nalpha2\nalpha3\n", "utf-8");
+      await writeFile(join(dir, "b.txt"), "beta1\nbeta2\nbeta3\n", "utf-8");
+      const { pi, handlers, handlersAll, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-multi" } };
+      // WHY: the model's unnumbered multi-file search is spliced by the same tool_call hook.
+      const call = { toolName: "bash", input: { command: "grep 3 a.txt b.txt" } };
+      for (const handler of handlersAll.get("tool_call") ?? []) await handler(call, ctx);
+      expect(call.input.command).toBe("grep -n 3 a.txt b.txt");
+      const result = await bashResult(
+        handlers.get("tool_result")!,
+        call.input.command,
+        ctx,
+        "a.txt:3:alpha3\nb.txt:3:beta3\n",
+      );
+      expect(result).toBeDefined();
+      const text = result!.content[0]!.text;
+      expect(text.startsWith("--- Bash search (hashline anchors) ---\n")).toBe(true);
+      expect(text).toContain("[a.txt (1 match)]");
+      expect(text).toContain("[b.txt (1 match)]");
+      expect(text.indexOf("[a.txt")).toBeLessThan(text.indexOf("[b.txt"));
+      const rows = rowsOf(text);
+      expect(rows).toHaveLength(2);
+      // WHY: leases are per file, so both files' anchors edit in this one session.
+      for (const [file, content] of [
+        ["a.txt", "alpha3"],
+        ["b.txt", "beta3"],
+      ] as const) {
+        const ok = await editTool.execute(
+          `e-${file}`,
+          {
+            file,
+            edits: [
+              {
+                anchor_from: anchorFor(rows, content),
+                anchor_to: anchorFor(rows, content),
+                text: "X",
+              },
+            ],
+          },
+          undefined,
+          undefined,
+          ctx,
+        );
+        expect(ok.isError).toBeFalsy();
+      }
+    });
+  });
+
+  it("fails the whole multi-file serve closed on a forgery, an outside file or mixed geometry", async () => {
+    await withTempDir("bash-multi-", async (dir) => {
+      await writeFile(join(dir, "a.txt"), "alpha1\nalpha2\nalpha3\n", "utf-8");
+      await writeFile(join(dir, "b.txt"), "beta1\nbeta2\nbeta3\n", "utf-8");
+      await writeFile(join(dir, "evil.txt"), "gamma\n", "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-multi-gates" } };
+      const command = "grep -n 3 a.txt b.txt";
+      // WHY: forged content on a's line 3 — the disk witness refuses the whole serve.
+      expect(
+        await bashResult(handler!, command, ctx, "a.txt:3:forged\nb.txt:3:beta3\n"),
+      ).toBeUndefined();
+      // WHY: a triple naming a file outside the operand set (alias/escape forgery).
+      expect(
+        await bashResult(handler!, command, ctx, "a.txt:3:alpha3\nevil.txt:1:gamma\n"),
+      ).toBeUndefined();
+      // WHY: mixed single + triple geometry is never the admitted shape.
+      expect(await bashResult(handler!, command, ctx, "3:alpha3\nb.txt:3:beta3\n")).toBeUndefined();
+      // WHY: zero leases after every refusal — a's real anchor stays unknown.
+      const hashes = await lineHashes("alpha1\nalpha2\nalpha3\n", join(dir, "a.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          { file: "a.txt", edits: [{ anchor_from: hashes[2]!, anchor_to: hashes[2]!, text: "X" }] },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+
+  it("serves exactly the total match cap across files and passes one over it through raw", async () => {
+    await withTempDir("bash-multi-", async (dir) => {
+      const make = (n: number) =>
+        Array.from({ length: n }, (_, i) => `line${i + 1}`).join("\n") + "\n";
+      await writeFile(join(dir, "a.txt"), make(30), "utf-8");
+      await writeFile(join(dir, "b.txt"), make(20), "utf-8");
+      await writeFile(join(dir, "c.txt"), "line1\n", "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const handler = handlers.get("tool_result");
+      const rows50 =
+        [
+          ...Array.from({ length: 30 }, (_, i) => `a.txt:${i + 1}:line${i + 1}`),
+          ...Array.from({ length: 20 }, (_, i) => `b.txt:${i + 1}:line${i + 1}`),
+        ].join("\n") + "\n";
+      const atCap = await bashResult(
+        handler!,
+        "grep -n line a.txt b.txt",
+        { cwd: dir, sessionManager: { getSessionId: () => "bash-multi-cap" } },
+        rows50,
+      );
+      expect(atCap).toBeDefined();
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-multi-over" } };
+      // WHY: SEARCH_MAX_MATCHES is the TOTAL budget across files — 51 rows pass raw whole.
+      const over = `${rows50}c.txt:1:line1\n`;
+      expect(
+        await bashResult(handler!, "grep -n line a.txt b.txt c.txt", ctx, over),
+      ).toBeUndefined();
+      const hashes = await lineHashes(make(30), join(dir, "a.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          { file: "a.txt", edits: [{ anchor_from: hashes[0]!, anchor_to: hashes[0]!, text: "X" }] },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+
+  it("walks an explicit dir but never node_modules or hidden dirs (present-but-unwalked)", async () => {
+    await withTempDir("bash-walk-", async (dir) => {
+      await mkdir(join(dir, "sub", "node_modules", "dep"), { recursive: true });
+      await mkdir(join(dir, "sub", ".hidden"), { recursive: true });
+      await writeFile(join(dir, "sub", "ok.txt"), "line1\nline2\n", "utf-8");
+      // WHY: the excluded files EXIST with matching content — the walk exclusion, not a missing
+      // WHY: file, is what refuses the lease.
+      await writeFile(
+        join(dir, "sub", "node_modules", "dep", "leak.txt"),
+        "line1\nline2\n",
+        "utf-8",
+      );
+      await writeFile(join(dir, "sub", ".hidden", "s.txt"), "line1\n", "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const handler = handlers.get("tool_result");
+      const good = await bashResult(
+        handler!,
+        "grep -rn line2 sub",
+        { cwd: dir, sessionManager: { getSessionId: () => "bash-walk" } },
+        "sub/ok.txt:2:line2\n",
+      );
+      expect(good).toBeDefined();
+      expect(good!.content[0]!.text).toContain("[sub/ok.txt (1 match)]");
+      // WHY: a triple from the excluded subtree fails the WHOLE serve (zero leases) even though
+      // WHY: its bytes match disk.
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-walk-excl" } };
+      expect(
+        await bashResult(
+          handler!,
+          "grep -rn line2 sub",
+          ctx,
+          "sub/ok.txt:2:line2\nsub/node_modules/dep/leak.txt:2:line2\n",
+        ),
+      ).toBeUndefined();
+      const leakHashes = await lineHashes(
+        "line1\nline2\n",
+        join(dir, "sub", "node_modules", "dep", "leak.txt"),
+      );
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "sub/node_modules/dep/leak.txt",
+            edits: [{ anchor_from: leakHashes[1]!, anchor_to: leakHashes[1]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+
+  it("upgrades an rg directory operand to the walk, while grep's stays raw", async () => {
+    await withTempDir("bash-walk-", async (dir) => {
+      await mkdir(join(dir, "sub"), { recursive: true });
+      await writeFile(join(dir, "sub", "ok.txt"), "line1\nline2\n", "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-rg-dir" } };
+      const served = await bashResult(
+        handler!,
+        "rg --line-number line2 sub",
+        ctx,
+        "sub/ok.txt:2:line2\n",
+      );
+      expect(served).toBeDefined();
+      expect(served!.content[0]!.text).toContain("[sub/ok.txt (1 match)]");
+      // WHY: grep needs its explicit `-r`; a bare directory operand stays raw (native grep
+      // WHY: errors on a directory, and this seam must not "helpfully" walk it).
+      expect(
+        await bashResult(handler!, "grep -n line2 sub", ctx, "grep: sub: Is a directory\n"),
+      ).toBeUndefined();
+    });
+  });
+
+  it("serves rg --files as an anchorless, existence-checked list with no leases", async () => {
+    await withTempDir("bash-files-", async (dir) => {
+      await writeFile(join(dir, "a.txt"), "x\n", "utf-8");
+      await writeFile(join(dir, "b.txt"), "y\n", "utf-8");
+      const { pi, handlers, handlersAll, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-files" } };
+      // WHY: no injection for a path list — the command reaches bash byte-identical.
+      const call = { toolName: "bash", input: { command: "rg --files" } };
+      for (const handler of handlersAll.get("tool_call") ?? []) await handler(call, ctx);
+      expect(call.input.command).toBe("rg --files");
+      const result = await bashResult(
+        handlers.get("tool_result")!,
+        call.input.command,
+        ctx,
+        "a.txt\nb.txt\n",
+      );
+      expect(result).toBeDefined();
+      expect(result!.content[0]!.text.startsWith("--- Bash file list (no anchors) ---\n")).toBe(
+        true,
+      );
+      expect(rowsOf(result!.content[0]!.text)).toHaveLength(0);
+      // WHY: anchorless means anchorless — even a valid content anchor grants nothing.
+      const hashes = await lineHashes("x\n", join(dir, "a.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          { file: "a.txt", edits: [{ anchor_from: hashes[0]!, anchor_to: hashes[0]!, text: "X" }] },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+      // WHY: a listed entry that does not exist on disk fails the whole list closed (invariant 2).
+      expect(
+        await bashResult(handlers.get("tool_result")!, "rg --files", ctx, "a.txt\nghost.txt\n"),
+      ).toBeUndefined();
+      // WHY: the same count cap bounds the list — 11 entries pass the whole output through raw.
+      const eleven = Array.from({ length: 11 }, (_, i) => `f${i}.txt`).join("\n") + "\n";
+      expect(
+        await bashResult(handlers.get("tool_result")!, "rg --files", ctx, eleven),
+      ).toBeUndefined();
+    });
+  });
+});
+
+describe("bash line-set consumer lifecycle (Tier-3 item 11)", () => {
+  it("serves `sort -u` sorted, holding each surviving line's original anchor", async () => {
+    await withTempDir("bash-lineset-", async (dir) => {
+      const content = "beta\nalpha\nbeta\ngamma\n";
+      await writeFile(join(dir, "f.txt"), content, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-lineset-sortu" } };
+      const result = await bashResult(
+        handlers.get("tool_result")!,
+        "cat f.txt | sort -u",
+        ctx,
+        "alpha\nbeta\ngamma\n",
+      );
+      expect(result).toBeDefined();
+      const text = result!.content[0]!.text;
+      expect(text.startsWith("--- Bash view (hashline anchors) ---\n")).toBe(true);
+      expect(text).toContain("[f.txt (3 lines, sorted)]");
+      const rows = rowsOf(text);
+      expect(rows.map((row) => row.split("\u2502")[1])).toEqual(["alpha", "beta", "gamma"]);
+      // WHY: coordinates travel WITH the row — the surviving `beta` is file line 1 (the FIRST
+      // WHY: occurrence), so it holds line 1's anchor even though it renders second, and the
+      // WHY: duplicate line 3 was deduped away so its anchor was never leased.
+      const allHashes = await lineHashes(content, join(dir, "f.txt"));
+      expect(anchorFor(rows, "beta")).toBe(allHashes[0]);
+      expect(anchorFor(rows, "alpha")).toBe(allHashes[1]);
+      expect(anchorFor(rows, "gamma")).toBe(allHashes[3]);
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[2]!, anchor_to: allHashes[2]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(rows, "beta"),
+              anchor_to: anchorFor(rows, "beta"),
+              text: "BETA",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("collapses adjacent runs only for `uniq`, keeping each run head's own anchor", async () => {
+    await withTempDir("bash-lineset-", async (dir) => {
+      const content = "x\nx\ny\nx\n";
+      await writeFile(join(dir, "f.txt"), content, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-lineset-uniq" } };
+      const result = await bashResult(
+        handlers.get("tool_result")!,
+        "cat f.txt | uniq",
+        ctx,
+        "x\ny\nx\n",
+      );
+      expect(result).toBeDefined();
+      const text = result!.content[0]!.text;
+      expect(text).toContain("[f.txt (3 lines, adjacent-dedup)]");
+      const rows = rowsOf(text);
+      expect(rows.map((row) => row.split("\u2502")[1])).toEqual(["x", "y", "x"]);
+      // WHY: `uniq` never sorts — the SECOND `x` run (file line 4) survives beside the first,
+      // WHY: and each run head carries its own true line. Line 2 was the collapsed twin.
+      const allHashes = await lineHashes(content, join(dir, "f.txt"));
+      expect(rows[0]!.split("\u2502")[0]).toBe(allHashes[0]);
+      expect(rows[1]!.split("\u2502")[0]).toBe(allHashes[2]);
+      expect(rows[2]!.split("\u2502")[0]).toBe(allHashes[3]);
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[1]!, anchor_to: allHashes[1]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(rows, "y"),
+              anchor_to: anchorFor(rows, "y"),
+              text: "Y",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("serves `wc -l` as a checkable count over every counted row, in file order", async () => {
+    await withTempDir("bash-lineset-", async (dir) => {
+      const content = numberedLines(5);
+      await writeFile(join(dir, "f.txt"), content, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-lineset-count" } };
+      // WHY: both count spellings are accepted (`4\n` piped, padded when GNU names a
+      // WHY: file), so the padded observed bytes are a legal count.
+      const result = await bashResult(
+        handlers.get("tool_result")!,
+        "cat f.txt | grep -v line3 | wc -l",
+        ctx,
+        "   4\n",
+      );
+      expect(result).toBeDefined();
+      const text = result!.content[0]!.text;
+      expect(text).toContain("[f.txt (count: 4)]");
+      const rows = rowsOf(text);
+      expect(rows.map((row) => row.split("\u2502")[1])).toEqual([
+        "line1",
+        "line2",
+        "line4",
+        "line5",
+      ]);
+      // WHY: the number is checkable because EVERY counted row is leased from the re-read
+      // WHY: snapshot (file order, true coordinates) while the dropped line grants nothing.
+      const allHashes = await lineHashes(content, join(dir, "f.txt"));
+      expect(rows[3]!.split("\u2502")[0]).toBe(allHashes[4]);
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[2]!, anchor_to: allHashes[2]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(rows, "line4"),
+              anchor_to: anchorFor(rows, "line4"),
+              text: "LINE4",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("accepts both `wc -l` output spellings and refuses any other number", async () => {
+    await withTempDir("bash-lineset-", async (dir) => {
+      const content = numberedLines(3);
+      await writeFile(join(dir, "f.txt"), content, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const handler = handlers.get("tool_result");
+      const run = (session: string, stdout: string) =>
+        bashResult(
+          handler!,
+          "cat f.txt | wc -l",
+          { cwd: dir, sessionManager: { getSessionId: () => session } },
+          stdout,
+        );
+      const plain = await run("bash-lineset-count-plain", "3\n");
+      expect(plain).toBeDefined();
+      expect(plain!.content[0]!.text).toContain("[f.txt (count: 3)]");
+      expect(await run("bash-lineset-count-padded", "  3\n")).toBeDefined();
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-lineset-count-gates" } };
+      // WHY: every other observed shape refuses the WHOLE serve with zero leases — a number the
+      // WHY: fold does not produce, a trailing extra field, a non-numeric line, a negative and
+      // WHY: an empty stdout (the count gate never manufactures a number).
+      for (const stdout of ["4\n", "3 4\n", "three\n", "-3\n", ""]) {
+        expect(await bashResult(handler!, "cat f.txt | wc -l", ctx, stdout)).toBeUndefined();
+      }
+      const allHashes = await lineHashes(content, join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[0]!, anchor_to: allHashes[0]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+
+  it("folds stage order: sort-then-head differs from head-then-sort", async () => {
+    await withTempDir("bash-lineset-", async (dir) => {
+      const content = "c\na\nb\na\n";
+      await writeFile(join(dir, "f.txt"), content, "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const allHashes = await lineHashes(content, join(dir, "f.txt"));
+      // WHY: the sorted stream is what the NEXT stage sees, so sort-then-head keeps a(2) and
+      // WHY: b(3) while head-then-sort keeps c(1) and a(2) — same command words, other rows.
+      const sortedFirst = await bashResult(
+        handler!,
+        "cat f.txt | sort -u | head -2",
+        { cwd: dir, sessionManager: { getSessionId: () => "bash-lineset-order-a" } },
+        "a\nb\n",
+      );
+      expect(sortedFirst).toBeDefined();
+      const sortedRows = rowsOf(sortedFirst!.content[0]!.text);
+      expect(sortedRows.map((row) => row.split("\u2502")[1])).toEqual(["a", "b"]);
+      expect(sortedRows[0]!.split("\u2502")[0]).toBe(allHashes[1]);
+      expect(sortedRows[1]!.split("\u2502")[0]).toBe(allHashes[2]);
+      const headFirst = await bashResult(
+        handler!,
+        "cat f.txt | head -2 | sort -u",
+        { cwd: dir, sessionManager: { getSessionId: () => "bash-lineset-order-b" } },
+        "a\nc\n",
+      );
+      expect(headFirst).toBeDefined();
+      const headRows = rowsOf(headFirst!.content[0]!.text);
+      expect(headRows.map((row) => row.split("\u2502")[1])).toEqual(["a", "c"]);
+      expect(headRows[0]!.split("\u2502")[0]).toBe(allHashes[1]);
+      expect(headRows[1]!.split("\u2502")[0]).toBe(allHashes[0]);
+      // WHY: the named pair agrees — dropping then sorting is the same set in the same order as
+      // WHY: sorting then dropping — and both keep b(3) and c(1) as the surviving rows.
+      for (const [session, command] of [
+        ["bash-lineset-order-c", "cat f.txt | grep -v a | sort -u"],
+        ["bash-lineset-order-d", "cat f.txt | sort -u | grep -v a"],
+      ] as const) {
+        const served = await bashResult(
+          handler!,
+          command,
+          { cwd: dir, sessionManager: { getSessionId: () => session } },
+          "b\nc\n",
+        );
+        expect(served).toBeDefined();
+        const rows = rowsOf(served!.content[0]!.text);
+        expect(rows.map((row) => row.split("\u2502")[1])).toEqual(["b", "c"]);
+        expect(rows[0]!.split("\u2502")[0]).toBe(allHashes[2]);
+        expect(rows[1]!.split("\u2502")[0]).toBe(allHashes[0]);
+      }
+    });
+  });
+
+  it("passes a consumer over the row cap through raw with zero leases", async () => {
+    await withTempDir("bash-lineset-", async (dir) => {
+      const over =
+        Array.from(
+          { length: SEARCH_MAX_MATCHES + 1 },
+          (_, i) => `u${String(i).padStart(3, "0")}`,
+        ).join("\n") + "\n";
+      await writeFile(join(dir, "f.txt"), over, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-lineset-cap" } };
+      // WHY: SEARCH_MAX_MATCHES bounds a consumer exactly as it bounds a search or filter — one
+      // WHY: row over the cap passes the WHOLE output through raw, never a truncated render.
+      expect(await bashResult(handler!, "cat f.txt | sort -u", ctx, over)).toBeUndefined();
+      expect(
+        await bashResult(handler!, "cat f.txt | wc -l", ctx, `${SEARCH_MAX_MATCHES + 1}\n`),
+      ).toBeUndefined();
+      const allHashes = await lineHashes(over, join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[0]!, anchor_to: allHashes[0]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+
+  it("refuses a render the disk fold does not reproduce, with zero leases", async () => {
+    await withTempDir("bash-lineset-", async (dir) => {
+      const content = "beta\nalpha\nbeta\n";
+      await writeFile(join(dir, "f.txt"), content, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-lineset-gates" } };
+      // WHY: each of these claims a row set the disk fold does not produce — a foreign row, the
+      // WHY: file's own order instead of byte order, and a duplicated survivor.
+      for (const stdout of ["alpha\ngamma\n", "beta\nalpha\n", "alpha\nalpha\nbeta\n"]) {
+        expect(await bashResult(handler!, "cat f.txt | sort -u", ctx, stdout)).toBeUndefined();
+      }
+      const allHashes = await lineHashes(content, join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[0]!, anchor_to: allHashes[0]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+
+  it("passes an empty fold through raw instead of rendering a count over no rows", async () => {
+    await withTempDir("bash-lineset-", async (dir) => {
+      const content = numberedLines(5);
+      await writeFile(join(dir, "f.txt"), content, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const editTool = getTool("edit");
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-lineset-empty" } };
+      // WHY: a `wc -l` whose fold kept nothing has no row to lease, so the whole stdout passes
+      // WHY: through — a bare `[f.txt (count: 0)]` header would claim a ledger it cannot honour.
+      expect(
+        await bashResult(handler!, "cat f.txt | grep -v line | wc -l", ctx, "0\n"),
+      ).toBeUndefined();
+      expect(
+        await bashResult(handler!, "cat f.txt | grep -v line | sort -u", ctx, ""),
+      ).toBeUndefined();
+      const allHashes = await lineHashes(content, join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[0]!, anchor_to: allHashes[0]!, text: "X" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+});
+
+describe("bash Tier-3 hardening (walk bounds and boundary twins)", () => {
+  it("never admits a symlinked entry, and resolves a symlinked operand shared", async () => {
+    await withTempDir("bash-hard-", async (dir) => {
+      await mkdir(join(dir, "real"), { recursive: true });
+      await writeFile(join(dir, "real", "ok.txt"), "line1\nline2\n", "utf-8");
+      await symlink(join(dir, "real"), join(dir, "linked"), "dir");
+      await symlink(join(dir, "real", "ok.txt"), join(dir, "link-file.txt"), "file");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-hard-symlink" } };
+      // WHY: the OPERAND goes through the shared target resolver — the path authority every other
+      // WHY: seam uses, which resolves symlink components on purpose — so a symlinked root is
+      // WHY: walked as its target and the served display path stays editable through that resolver.
+      const viaRoot = await bashResult(
+        handler!,
+        "grep -rn line2 linked",
+        ctx,
+        "linked/ok.txt:2:line2\n",
+      );
+      expect(viaRoot).toBeDefined();
+      expect(viaRoot!.content[0]!.text).toContain("[linked/ok.txt (1 match)]");
+      // WHY: the walk never admits a symlink ENTRY (a `Dirent` is not followed) but the seam
+      // WHY: matches a stdout entry by RESOLVED identity, so a spelling that resolves into the
+      // WHY: walked set serves the walked file's own display path and true line — the bytes are
+      // WHY: verified against that file, and the render never echoes the link spelling.
+      const viaEntry = await bashResult(
+        handler!,
+        "grep -rn line2 .",
+        ctx,
+        "link-file.txt:2:line2\n",
+      );
+      expect(viaEntry).toBeDefined();
+      expect(viaEntry!.content[0]!.text).toContain("[real/ok.txt (1 match)]");
+      // WHY: an entry that resolves OUTSIDE the walked set still fails the whole serve closed.
+      await writeFile(join(dir, "other.txt"), "line1\nline2\n", "utf-8");
+      expect(
+        await bashResult(handler!, "grep -rn line2 real", ctx, "other.txt:2:line2\n"),
+      ).toBeUndefined();
+      // WHY: the real tree still serves — the refusals above are about links, not about walking.
+      const good = await bashResult(handler!, "grep -rn line2 real", ctx, "real/ok.txt:2:line2\n");
+      expect(good).toBeDefined();
+      expect(good!.content[0]!.text).toContain("[real/ok.txt (1 match)]");
+    });
+  });
+
+  it("bounds the walk by directories queued when a forest holds no files", async () => {
+    await withTempDir("bash-hard-", async (dir) => {
+      // WHY: review F4 — the visit bound must trip on a directory-only forest, where the file
+      // WHY: counter never moves.
+      for (let i = 0; i < 250; i++) await mkdir(join(dir, "d", `n${i}`), { recursive: true });
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-hard-dirs" } };
+      expect(
+        await bashResult(handlers.get("tool_result")!, "grep -rn zz d", ctx, "d/n1/x.txt:1:zz\n"),
+      ).toBeUndefined();
+    });
+  });
+
+  it("bounds the walk by files visited past the visit cap", async () => {
+    await withTempDir("bash-hard-", async (dir) => {
+      for (let i = 0; i < 205; i++) {
+        await writeFile(join(dir, `f${i}.txt`), "line1\nline2\n", "utf-8");
+      }
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-hard-files" } };
+      expect(
+        await bashResult(handlers.get("tool_result")!, "grep -rn line2 .", ctx, "f1.txt:2:line2\n"),
+      ).toBeUndefined();
+    });
+  });
+
+  it("honors an explicitly named excluded root and still skips a nested one", async () => {
+    await withTempDir("bash-hard-", async (dir) => {
+      await mkdir(join(dir, "node_modules", "dep"), { recursive: true });
+      await writeFile(join(dir, "node_modules", "top.txt"), "line1\nline2\n", "utf-8");
+      await writeFile(join(dir, "node_modules", "dep", "deep.txt"), "line1\nline2\n", "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-hard-nm" } };
+      // WHY: the exclusion gates DESCENT, not the operand — naming the root admits it whole,
+      // WHY: including the subtree below it.
+      const deep = await bashResult(
+        handler!,
+        "grep -rn line2 node_modules",
+        ctx,
+        "node_modules/dep/deep.txt:2:line2\n",
+      );
+      expect(deep).toBeDefined();
+      expect(deep!.content[0]!.text).toContain("[node_modules/dep/deep.txt (1 match)]");
+      // WHY: a `node_modules` seen while walking ANOTHER root is skipped (the nested case).
+      await mkdir(join(dir, "other", "node_modules"), { recursive: true });
+      await writeFile(join(dir, "other", "node_modules", "nested.txt"), "line1\nline2\n", "utf-8");
+      await writeFile(join(dir, "other", "ok.txt"), "line1\nline2\n", "utf-8");
+      expect(
+        await bashResult(
+          handler!,
+          "grep -rn line2 other",
+          ctx,
+          "other/ok.txt:2:line2\nother/node_modules/nested.txt:2:line2\n",
+        ),
+      ).toBeUndefined();
+    });
+  });
+
+  it("refuses an `rg --files` entry that is a directory", async () => {
+    await withTempDir("bash-hard-", async (dir) => {
+      await mkdir(join(dir, "sub"), { recursive: true });
+      await writeFile(join(dir, "a.txt"), "x\n", "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-hard-listdir" } };
+      // WHY: only regular files enter the walk's membership, so a directory entry (which native
+      // WHY: `rg --files` never prints) fails the whole list closed.
+      expect(
+        await bashResult(handlers.get("tool_result")!, "rg --files", ctx, "a.txt\nsub\n"),
+      ).toBeUndefined();
+    });
+  });
+
+  it("passes a composed multi-range sed through raw (recorded boundary)", async () => {
+    await withTempDir("bash-hard-", async (dir) => {
+      await writeFile(join(dir, "f.txt"), numberedLines(40), "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-hard-sed" } };
+      // WHY: review F6 — the two `range` ops are COMPOSED by the interval algebra, so the second
+      // WHY: selection resolves against the already-narrowed stream, selects nothing and passes
+      // WHY: the raw output through. Never a wrong slice; recorded in ADR-0033 D10.
+      expect(
+        await bashResult(
+          handlers.get("tool_result")!,
+          "cat f.txt | sed -n -e '1p' -e '30p'",
+          ctx,
+          "line1\nline30\n",
+        ),
+      ).toBeUndefined();
     });
   });
 });

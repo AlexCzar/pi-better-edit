@@ -1,3 +1,5 @@
+import { lstat, readdir } from "node:fs/promises";
+import { join } from "node:path";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -48,11 +50,21 @@ import { fmtReadPreview as defaultFmtReadPreview } from "../read.js";
 import { finalizeToolResult as defaultFinalizeToolResult } from "../edit-response.js";
 import {
   AUTO_READ_MAX,
+  BASH_SEARCH_MAX_FILES,
+  BASH_SEARCH_WALK_MAX_FILES,
   MAX_READ_WINDOWS,
   SEARCH_MAX_MATCHES,
   SERVED_MAX_LINES,
 } from "../constants.js";
-import type { BashSearch } from "../bash-classifier.js";
+import type {
+  BashFilesList,
+  BashMultiSearch,
+  BashRecursiveSearch,
+  BashSearch,
+  ContentLine,
+  ViewOp,
+} from "../bash-classifier.js";
+
 import type { LifecycleDeps, ToolContext, ToolResultEvent } from "./types.js";
 
 export type { ToolContext, ToolResultEvent, LifecycleDeps } from "./types.js";
@@ -75,10 +87,77 @@ function defaultDeps(): LifecycleDeps {
   };
 }
 
+/** WHY: (item 10) one `FILE:LINE:content` row of a multi-file / recursive search. The file
+ * field is non-greedy, so a path that itself contains `:` still parses (`a:b.txt:3:x`). */
+const MULTI_SEARCH_STDOUT_LINE = /^(.+?):(\d+):([\s\S]*)$/;
+
+/**
+ * WHY: (item 10) parse the `FILE:LINE:content` triples of a multi-file or recursive search.
+ * Fails closed (`undefined`) unless EVERY row is a triple with a 1-indexed line — the same
+ * all-or-nothing geometry rule `parseSearchStdout` applies — so a single-geometry row, a
+ * heading, or a match count is never mistaken for the admitted shape.
+ */
+function parseTripleStdout(
+  observed: string,
+): Array<{ file: string; line: number; content: string }> | undefined {
+  const lines = observed.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  if (lines.length === 0) return undefined;
+  const matches: Array<{ file: string; line: number; content: string }> = [];
+  for (const text of lines) {
+    const parsed = MULTI_SEARCH_STDOUT_LINE.exec(text);
+    if (!parsed) return undefined;
+    const line = Number(parsed[2]);
+    if (!Number.isSafeInteger(line) || line < 1) return undefined;
+    matches.push({ file: parsed[1] ?? "", line, content: parsed[3] ?? "" });
+  }
+  return matches;
+}
+
+/** WHY: (item 10) exactly one text block, the attribution rule every seam applies. */
+function singleTextBlock(event: ToolResultEvent): string | undefined {
+  const block = Array.isArray(event.content) ? event.content : undefined;
+  return block?.length === 1 && block[0]?.type === "text" ? block[0].text : undefined;
+}
+
+/**
+ * WHY: (item 11) the header states the order whenever a consumer reordered the stream — a sorted
+ * WHY: or adjacent-deduped render is not the file's own order, and the model reads the header to
+ * WHY: know which coordinates it holds. The order suffix is empty for every order-preserving fold
+ * WHY: (so the item-9/item-10 headers stay byte-identical), and `count` names itself instead.
+ */
+function viewHeader(filePath: string, ops: readonly ViewOp[], count: number): string {
+  if (ops.some((op) => op.kind === "count")) return `[${filePath} (count: ${count})]`;
+  const markers: string[] = [];
+  if (ops.some((op) => op.kind === "sortUnique")) markers.push("sorted");
+  if (ops.some((op) => op.kind === "uniq")) markers.push("adjacent-dedup");
+  const order = markers.length === 0 ? "" : `, ${markers.join(", ")}`;
+  return `[${filePath} (${count} ${count === 1 ? "line" : "lines"}${order})]`;
+}
+
+/**
+ * WHY: (item 10) the recursive-walk exclusion list, stated rather than inferred: no directory
+ * whose name is hidden (leading `.`, which covers `.git`) and none named `node_modules` is ever
+ * descended into. Exclusions gate DESCENT only — an explicitly named operand is still honored,
+ * because the operator asked for that path.
+ */
+const SEARCH_WALK_EXCLUDED_DIR_NAMES: ReadonlySet<string> = new Set(["node_modules"]);
+
+function isWalkableDirName(name: string): boolean {
+  if (name.startsWith(".")) return false;
+  return !SEARCH_WALK_EXCLUDED_DIR_NAMES.has(name);
+}
+
 /** `grep -n`/`rg --line-number` stdout row: a 1-indexed line number, a colon, the matched text. */
 const SEARCH_STDOUT_LINE = /^(\d+):([\s\S]*)$/;
 /** `cat -n`/`nl -ba` stdout row: blank-padded 1-indexed number, a tab, the line content. */
 const NUMBERED_STDOUT_LINE = /^\s*(\d+)\t([\s\S]*)$/;
+/**
+ * WHY: (item 11) `wc -l` stdout is the count ALONE. GNU pads to a fixed width when it
+ * WHY: names a file (`   12 f`), so both `12\n` and `   12\n` are accepted
+ * WHY: for a piped count; a second field, a non-number or an empty stdout fails the gate.
+ */
+const COUNT_STDOUT_LINE = /^\s*(\d+)\s*$/;
 
 /**
  * Parse the `LINE:content` rows of a line-numbered single-file search. Fails closed (`undefined`)
@@ -497,9 +576,10 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
     ctx: ToolContext,
   ): Promise<{ content: Array<{ type: string; text: string }>; details?: unknown } | undefined> {
     if (event.toolName !== "bash") return undefined;
-    // WHY: the off switch bypasses BOTH branches below — view and search — so raw output
-    // WHY: passes through byte-identical. The default is on, so an unconfigured session
-    // WHY: never reaches this return.
+    // WHY: the off switch bypasses EVERY seam below — view, search, content filter,
+    // WHY: multi-file, recursive walk and `rg --files` — so raw output passes through
+    // WHY: byte-identical. The default is on, so an unconfigured session never reaches this
+    // WHY: return.
     if (resolveBashViewMode(ctx.cwd) === "off") return undefined;
     if (event.isError) return undefined;
     const rawInput = event.input as Record<string, unknown> | undefined;
@@ -520,10 +600,22 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
       return undefined;
     }
     try {
-      const { classifyBashCommand, applySliceOps } = await import("../bash-classifier.js");
+      const { classifyBashCommand, applySliceOps, isContentOp, isSliceOp } =
+        await import("../bash-classifier.js");
       const classification = classifyBashCommand(command);
       if (classification.kind === "pureSearch") {
         return await handleBashSearch(event, ctx, classification.search);
+      }
+      // WHY: (item 10) the three new geometries each get their own seam; every one of them
+      // WHY: returns `undefined` (raw output, zero leases) the moment a gate fails.
+      if (classification.kind === "pureMultiSearch") {
+        return await handleBashMultiSearch(event, ctx, classification.search);
+      }
+      if (classification.kind === "pureRecursiveSearch") {
+        return await handleBashRecursiveSearch(event, ctx, classification.search);
+      }
+      if (classification.kind === "pureFilesList") {
+        return await handleBashFilesList(event, ctx, classification.search);
       }
       if (classification.kind !== "pureView") {
         // WHY: (ADR-0033 observability) a systematic regression (parser drift, a
@@ -563,7 +655,24 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
       // WHY: intervals fold over the re-read line count, so an empty selection
       // WHY: (e.g. `head -n 0`, out-of-range `sed` addresses) serves nothing and
       // WHY: passes through — zero leases, zero output change (ADR-0033 D3).
-      const intervals = applySliceOps(ops, deps.visLines(normalized).length);
+      const allLines = deps.visLines(normalized);
+      // WHY: (item 9) a content stage needs the line bytes, so it takes its own seam (row
+      // WHY: leases over the survivors, bounded like a search). The predicate is the type
+      // WHY: refinement that keeps the selector-only path structurally `SliceOp[]`, so the
+      // WHY: interval algebra keeps its exact contract.
+      // WHY: (item 11) the line-set consumers take this same seam: the predicate is the single
+      // WHY: split over `ViewOp`, so a new content op routes here by construction.
+      if (ops.some(isContentOp)) {
+        return await serveContentView(event, ctx, {
+          filePath,
+          absolutePath,
+          normalized,
+          fileHashes,
+          allLines,
+          ops,
+        });
+      }
+      const intervals = applySliceOps(ops.filter(isSliceOp), allLines.length);
       if (intervals.length === 0 || intervals.length > MAX_READ_WINDOWS) return undefined;
       // WHY: [ADR-0033 D9] the observed stdout must byte-match the re-read slice —
       // WHY: this is what makes transparent wrappers (e.g. `rtk`) safe by
@@ -584,7 +693,6 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
           ? stdoutBlock[0].text
           : undefined;
       if (typeof stdoutText !== "string") return undefined;
-      const allLines = deps.visLines(normalized);
       const sliceLines: string[] = [];
       for (const iv of intervals) sliceLines.push(...allLines.slice(iv.lo - 1, iv.hi));
       const joinedSlice = sliceLines.join("\n");
@@ -658,6 +766,335 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
   }
 
   /**
+   * WHY: (item 10) resolve + read one candidate file for a triple serve. The classifier is pure
+   * WHY: and zero-fs, so the file kind is re-checked here: anything that is not decodable text
+   * WHY: fails the WHOLE serve closed rather than being silently skipped.
+   */
+  async function loadTextTarget(
+    displayPath: string,
+    effCwd: string,
+  ): Promise<
+    | { absolutePath: string; normalized: string; fileHashes: string[]; allLines: string[] }
+    | undefined
+  > {
+    const resolvedPath = await deps.resolveTarget(deps.toCwd(displayPath, effCwd));
+    await deps.valAccess(resolvedPath, displayPath);
+    const file = await deps.loadFileKindAndText(resolvedPath, {
+      maxLines: SERVED_MAX_LINES,
+      displayPath,
+    });
+    if (file.kind !== "text") return undefined;
+    const { normalized, fileHashes, absolutePath } = await deps.readNormFile(displayPath, effCwd, {
+      maxLines: SERVED_MAX_LINES,
+      preloadedFile: file,
+    });
+    return { absolutePath, normalized, fileHashes, allLines: deps.visLines(normalized) };
+  }
+
+  /**
+   * WHY: (item 10) the shared multi-file / recursive serve seam. Every named file must resolve
+   * INTO the admitted set (explicit operands or the walked set), every row's bytes must equal
+   * the disk line at that number, and the total row count must fit `SEARCH_MAX_MATCHES` — all
+   * verified BEFORE the first lease, so a refusal grants nothing (invariant 2) and an over-cap
+   * search passes through raw instead of truncating (invariant 3). Sections render in operand /
+   * first-seen order with the triple's own spelling, so coordinates are stable.
+   */
+  async function serveMatchTriples(
+    event: ToolResultEvent,
+    ctx: ToolContext,
+    input: { effCwd: string; admitted: ReadonlyMap<string, string> },
+  ): Promise<{ content: Array<{ type: string; text: string }> } | undefined> {
+    const stdoutText = singleTextBlock(event);
+    if (stdoutText === undefined) return undefined;
+    const parsed = parseTripleStdout(toLF(stripBOM(stdoutText).text));
+    if (parsed === undefined || parsed.length === 0) return undefined;
+    if (parsed.length > SEARCH_MAX_MATCHES) return undefined;
+    const grouped = new Map<string, Array<{ line: number; content: string }>>();
+    for (const row of parsed) {
+      const resolved = await deps.resolveTarget(deps.toCwd(row.file, input.effCwd));
+      // WHY: a triple may only name a file this command could have read — `../` escapes, alias
+      // WHY: spellings that resolve outside the set, and unwalked subtrees all fail closed.
+      if (!input.admitted.has(resolved)) return undefined;
+      const rows = grouped.get(resolved) ?? [];
+      // WHY: (review F3) a repeated `(file, line)` coordinate renders and leases ONCE: the
+      // WHY: coordinate set is a set, and `grep -n pat a.txt a.txt` prints the same line twice
+      // WHY: only because the operand was repeated. Nothing new is witnessed by a second copy.
+      if (!rows.some((existing) => existing.line === row.line)) {
+        rows.push({ line: row.line, content: row.content });
+      }
+      grouped.set(resolved, rows);
+    }
+    if (grouped.size === 0 || grouped.size > BASH_SEARCH_MAX_FILES) return undefined;
+    const verified: Array<{
+      display: string;
+      absolutePath: string;
+      normalized: string;
+      allLines: string[];
+      servedRows: ServedRow[];
+    }> = [];
+    for (const [resolved, rows] of grouped) {
+      const display = input.admitted.get(resolved) ?? resolved;
+      const target = await loadTextTarget(display, input.effCwd);
+      if (target === undefined) return undefined;
+      const servedRows: ServedRow[] = [];
+      for (const row of rows) {
+        // WHY: [ADR-0033 D9] byte equality per matched line against the re-read snapshot — the
+        // WHY: witness that the anchored row is the line bash printed. A stale or forged row
+        // WHY: fails the WHOLE serve, so no partial grant can ever be recorded.
+        if (target.allLines[row.line - 1] !== row.content) return undefined;
+        const hash = target.fileHashes[row.line - 1];
+        if (hash === undefined) return undefined;
+        servedRows.push({ position: row.line - 1, hash });
+      }
+      verified.push({ display, ...target, servedRows });
+    }
+    const sessionKey = deps.sessionKeyFor(ctx);
+    const blocks: string[] = [];
+    for (const group of verified) {
+      // WHY: the lease key is the existing `(session, file_path, anchor)` triple, so per-file
+      // WHY: leases ride the path Tier 1 already uses — no new identity, no #24 revival.
+      await recordServesBestEffort({
+        sessionKey,
+        path: group.absolutePath,
+        servedRows: group.servedRows,
+        contentHash: snapshotHashFor(group.normalized),
+      });
+      notifyServedSpans({
+        filePath: group.absolutePath,
+        spans: servedRowsToSpans(group.servedRows),
+        source: "auto-read",
+        content: group.normalized,
+      });
+      const count = group.servedRows.length;
+      blocks.push(
+        `[${group.display} (${count} ${count === 1 ? "match" : "matches"})]\n${fmtServedRows(group.servedRows, group.allLines)}`,
+      );
+    }
+    notifyBashViewOnce(ctx, sessionKey);
+    return {
+      content: [
+        { type: "text", text: `--- Bash search (hashline anchors) ---\n${blocks.join("\n")}` },
+      ],
+    };
+  }
+
+  /**
+   * WHY: (item 10) the walk behind a recursive search and `rg --files`: breadth-first, hidden and
+   * `node_modules` directories never descended into, symlinks never followed (a `Dirent`'s
+   * `isFile()` does not follow one), and the visit count bounded — past
+   * `BASH_SEARCH_WALK_MAX_FILES` the WHOLE command passes through raw.
+   */
+  async function walkSearchFiles(
+    rootAbsolute: string,
+    rootDisplay: string,
+  ): Promise<Map<string, string> | undefined> {
+    const found = new Map<string, string>();
+    let root;
+    try {
+      root = await lstat(rootAbsolute);
+    } catch {
+      return undefined;
+    }
+    if (root.isSymbolicLink()) return undefined;
+    if (root.isFile()) {
+      found.set(rootAbsolute, rootDisplay);
+      return found;
+    }
+    if (!root.isDirectory()) return undefined;
+    const queue: Array<{ abs: string; display: string }> = [
+      { abs: rootAbsolute, display: rootDisplay },
+    ];
+    let visited = 0;
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (current === undefined) break;
+      let entries;
+      try {
+        entries = await readdir(current.abs, { withFileTypes: true });
+      } catch {
+        return undefined;
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (isWalkableDirName(entry.name)) {
+            queue.push({
+              abs: join(current.abs, entry.name),
+              display: join(current.display, entry.name),
+            });
+            // WHY: (review F4) the visit bound must cover DIRECTORIES too: a forest of empty
+            // WHY: directories has no files to count, so an unbounded queue would walk it whole.
+            if (queue.length > BASH_SEARCH_WALK_MAX_FILES) return undefined;
+          }
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        visited += 1;
+        if (visited > BASH_SEARCH_WALK_MAX_FILES) return undefined;
+        found.set(join(current.abs, entry.name), join(current.display, entry.name));
+      }
+    }
+    return found;
+  }
+
+  /**
+   * WHY: (item 10) the multi-file seam. Triples require a numbered spelling, and the `tool_call`
+   * rewrite supplies it; a command that somehow reaches here without it fails closed instead of
+   * serving an unverifiable geometry.
+   */
+  async function handleBashMultiSearch(
+    event: ToolResultEvent,
+    ctx: ToolContext,
+    search: BashMultiSearch,
+  ): Promise<{ content: Array<{ type: string; text: string }> } | undefined> {
+    if (!search.lineNumbered) return undefined;
+    const effCwd = search.baseDir === undefined ? ctx.cwd : deps.toCwd(search.baseDir, ctx.cwd);
+    const admitted = new Map<string, string>();
+    for (const filePath of search.filePaths) {
+      admitted.set(await deps.resolveTarget(deps.toCwd(filePath, effCwd)), filePath);
+    }
+    return await serveMatchTriples(event, ctx, { effCwd, admitted });
+  }
+
+  /**
+   * WHY: (item 10) the recursive seam over one explicit root (`grep -r PATTERN DIR`, and an `rg`
+   * directory operand). Only files the walk actually visited can be leased, so the exclusion list
+   * is what keeps `node_modules`/`.git`/hidden subtrees out of the anchor budget.
+   */
+  async function handleBashRecursiveSearch(
+    event: ToolResultEvent,
+    ctx: ToolContext,
+    search: BashRecursiveSearch,
+  ): Promise<{ content: Array<{ type: string; text: string }> } | undefined> {
+    if (!search.lineNumbered) return undefined;
+    const effCwd = search.baseDir === undefined ? ctx.cwd : deps.toCwd(search.baseDir, ctx.cwd);
+    const rootResolved = await deps.resolveTarget(deps.toCwd(search.dirPath, effCwd));
+    const walked = await walkSearchFiles(rootResolved, search.dirPath);
+    if (walked === undefined) return undefined;
+    return await serveMatchTriples(event, ctx, { effCwd, admitted: walked });
+  }
+
+  /**
+   * WHY: (item 10) `rg --files`: every entry is existence-checked against the walk (invariant 2)
+   * inside the same count cap, and NOTHING is leased — a path list has no lines to anchor, so
+   * listing grants no edit rights.
+   */
+  async function handleBashFilesList(
+    event: ToolResultEvent,
+    ctx: ToolContext,
+    search: BashFilesList,
+  ): Promise<{ content: Array<{ type: string; text: string }> } | undefined> {
+    const effCwd = search.baseDir === undefined ? ctx.cwd : deps.toCwd(search.baseDir, ctx.cwd);
+    const rootDisplay = search.dirPath ?? ".";
+    const rootResolved = await deps.resolveTarget(deps.toCwd(rootDisplay, effCwd));
+    const walked = await walkSearchFiles(rootResolved, rootDisplay);
+    if (walked === undefined) return undefined;
+    // WHY: (review F5) no `valAccess`/`loadFileKindAndText` here on purpose: a path list has
+    // WHY: no bytes to witness and grants no anchors, so the walk's membership is the whole
+    // WHY: witness chain. And because nothing is leased, the anchor-budget rationale behind
+    // WHY: `BASH_SEARCH_MAX_FILES` does not apply to this shape — a repository-wide listing
+    // WHY: therefore passes through raw, which ADR-0033 D10 records.
+    const stdoutText = singleTextBlock(event);
+    if (stdoutText === undefined) return undefined;
+    const lines = toLF(stripBOM(stdoutText).text).split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    if (lines.length === 0 || lines.length > BASH_SEARCH_MAX_FILES) return undefined;
+    for (const entry of lines) {
+      if (entry === "" || !walked.has(await deps.resolveTarget(deps.toCwd(entry, effCwd)))) {
+        return undefined;
+      }
+    }
+    return {
+      content: [{ type: "text", text: `--- Bash file list (no anchors) ---\n${lines.join("\n")}` }],
+    };
+  }
+
+  /**
+   * WHY: (item 9) the content stage's serve seam. A filter's survivors are sparse, so they are
+   * WHY: leased row by row exactly like a search's matches — the same `fmtServedRows` renderer
+   * WHY: and `SEARCH_MAX_MATCHES` bound — rather than borrowing the read tool's window budget,
+   * WHY: which would pass a realistic sparse filter through raw. The whole-stdout byte gate is
+   * WHY: the witness: a literal fold that diverges from what bash printed (a regex pattern, an
+   * WHY: `-i` spelling) fails closed here instead of being served as if it were the command's
+   * WHY: output. Empty survivors pass through, so a filter that matched nothing leases nothing.
+   *
+   * WHY: (item 11) the same seam serves the line-SET consumers. `sort -u`/`uniq` reorder the
+   * WHY: rows, so the header names the order while every lease keeps the true file coordinate;
+   * WHY: `wc -l` is terminal and takes the count gate instead of the byte gate, leasing EVERY
+   * WHY: counted row in file order so the number it printed is checkable by editing a row.
+   */
+  async function serveContentView(
+    event: ToolResultEvent,
+    ctx: ToolContext,
+    input: {
+      filePath: string;
+      absolutePath: string;
+      normalized: string;
+      fileHashes: string[];
+      allLines: string[];
+      ops: ViewOp[];
+    },
+  ): Promise<{ content: Array<{ type: string; text: string }> } | undefined> {
+    const { applyViewOps } = await import("../bash-classifier.js");
+    const stdoutText = singleTextBlock(event);
+    if (stdoutText === undefined) return undefined;
+    const observedText = toLF(stripBOM(stdoutText).text);
+    const survivors = applyViewOps(
+      input.ops,
+      input.allLines.map((text, index) => ({ line: index + 1, text })),
+    );
+    // WHY: empty survivors and over-cap output both pass the WHOLE stdout through with zero
+    // WHY: leases: `SEARCH_MAX_MATCHES` bounds a content stage exactly as it bounds a search, and
+    // WHY: an empty fold has no row to lease — never a truncated or invented render.
+    if (survivors.length === 0 || survivors.length > SEARCH_MAX_MATCHES) return undefined;
+    let rows: ContentLine[];
+    if (input.ops.some((op) => op.kind === "count")) {
+      // WHY: (item 11) `wc -l` is terminal and its observed stdout is the NUMBER, not the
+      // WHY: content, so the count REPLACES the whole-stdout byte gate. A count the fold does
+      // WHY: not produce refuses the whole serve with zero leases.
+      const observed = COUNT_STDOUT_LINE.exec(observedText);
+      if (observed === null || Number(observed[1]) !== survivors.length) return undefined;
+      // WHY: the counted rows render in FILE order — the number is checkable only against stable
+      // WHY: coordinates, not against the stream order a preceding consumer established.
+      rows = [...survivors].sort((left, right) => left.line - right.line);
+    } else {
+      // WHY: [ADR-0033 D9] the whole-stdout byte gate against the disk-derived fold; a fold
+      // WHY: that diverges from what bash printed fails closed here.
+      const joined = survivors.map((entry) => entry.text).join("\n");
+      if (observedText !== joined && observedText !== `${joined}\n`) return undefined;
+      rows = survivors;
+    }
+    const servedRows: ServedRow[] = [];
+    for (const entry of rows) {
+      const hash = input.fileHashes[entry.line - 1];
+      if (hash === undefined) return undefined;
+      servedRows.push({ position: entry.line - 1, hash });
+    }
+    const sessionKey = deps.sessionKeyFor(ctx);
+    await recordServesBestEffort({
+      sessionKey,
+      path: input.absolutePath,
+      servedRows,
+      contentHash: snapshotHashFor(input.normalized),
+    });
+    notifyServedSpans({
+      filePath: input.absolutePath,
+      spans: servedRowsToSpans(servedRows),
+      source: "auto-read",
+      content: input.normalized,
+    });
+    notifyBashViewOnce(ctx, sessionKey);
+    const count = servedRows.length;
+    return {
+      content: [
+        {
+          type: "text",
+          text: `--- Bash view (hashline anchors) ---\n${viewHeader(input.filePath, input.ops, count)}\n${fmtServedRows(servedRows, input.allLines)}`,
+        },
+      ],
+    };
+  }
+
+  /**
    * [spec §3.4] The `tool_result` half of search interception: parse the `LINE:content` stdout of an
    * already-rewritten search, verify every match against the disk bytes (D9), then swap the raw
    * match list for anchored rows and synchronously enroll their leases.
@@ -677,29 +1114,39 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
     ctx: ToolContext,
     search: BashSearch,
   ): Promise<{ content: Array<{ type: string; text: string }> } | undefined> {
-    // WHY: exactly one text block, the same attribution rule the view path applies — a search whose
-    // WHY: stdout is split or non-text cannot be proven to be this command's output.
-    const stdoutBlock = Array.isArray(event.content) ? event.content : undefined;
-    const stdoutText =
-      stdoutBlock?.length === 1 && stdoutBlock[0]?.type === "text"
-        ? stdoutBlock[0].text
-        : undefined;
-    if (typeof stdoutText !== "string") return undefined;
-    const matches = parseSearchStdout(toLF(stripBOM(stdoutText).text));
-    if (matches === undefined || matches.length === 0) return undefined;
-    if (matches.length > SEARCH_MAX_MATCHES) return undefined;
     // WHY: the single pre-search literal `cd` re-bases relative resolution under the same rule as a
     // WHY: view (ADR-0033 D1); multi-`cd` and post-search-`cd` chains never reach here.
     const effCwd = search.baseDir === undefined ? ctx.cwd : deps.toCwd(search.baseDir, ctx.cwd);
     const resolvedPath = await deps.resolveTarget(deps.toCwd(search.filePath, effCwd));
     await deps.valAccess(resolvedPath, search.filePath);
     // WHY: the pure classifier cannot see the filesystem, so the single-operand target is re-checked
-    // WHY: here: a directory (or anything not decodable text) fails closed instead of being anchored.
+    // WHY: FIRST — before any stdout geometry is parsed, because a directory operand's stdout is
+    // WHY: `FILE:LINE:content` triples, not the `LINE:content` rows below.
     const file = await deps.loadFileKindAndText(resolvedPath, {
       maxLines: SERVED_MAX_LINES,
       displayPath: search.filePath,
     });
+    if (file.kind === "directory") {
+      // WHY: (item 10) rg recurses by default, so a directory operand is a recursive search and
+      // WHY: delegates to the walk seam. grep needs its explicit `-r`, so the same operand for
+      // WHY: grep stays raw — native grep errors on a directory without the marker.
+      if (search.program !== "rg") return undefined;
+      return await handleBashRecursiveSearch(event, ctx, {
+        program: "rg",
+        pattern: search.pattern,
+        dirPath: search.filePath,
+        lineNumbered: search.lineNumbered,
+        ...(search.baseDir !== undefined ? { baseDir: search.baseDir } : {}),
+      });
+    }
     if (file.kind !== "text") return undefined;
+    // WHY: exactly one text block, the same attribution rule the view path applies — a search whose
+    // WHY: stdout is split or non-text cannot be proven to be this command's output.
+    const stdoutText = singleTextBlock(event);
+    if (stdoutText === undefined) return undefined;
+    const matches = parseSearchStdout(toLF(stripBOM(stdoutText).text));
+    if (matches === undefined || matches.length === 0) return undefined;
+    if (matches.length > SEARCH_MAX_MATCHES) return undefined;
     const { normalized, fileHashes, absolutePath } = await deps.readNormFile(
       search.filePath,
       effCwd,
