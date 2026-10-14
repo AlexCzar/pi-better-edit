@@ -48,6 +48,8 @@ export interface BashView {
   baseDir?: string;
   /** Slice ops in stream order, folded by `applySliceOps` over the line count. */
   ops: SliceOp[];
+  /** Present-and-true only for `cat -n FILE` / `nl -ba FILE`; absent means unnumbered. Optional so Tier-1 `toEqual` literals keep passing. */
+  lineNumbered?: boolean;
 }
 
 /**
@@ -282,6 +284,7 @@ function defaultCount(name: "head" | "tail"): SliceOp {
 interface SourceStage {
   filePath: string;
   ops: SliceOp[];
+  lineNumbered?: boolean;
 }
 
 /** Stages that consume the source file: `cat FILE`, or a file-direct filter. */
@@ -291,10 +294,25 @@ function parseSourceStage(shape: StageShape): SourceStage | undefined {
   // WHY: while filter stages (`parseFilterStage`) and silent commands never do.
   const stage = unwrapViewWrapper(shape);
   if (!stage) return undefined;
-  if (stage.name === "cat") {
-    if (stage.args.length !== 1 || stage.args[0].startsWith("-")) return undefined;
-    return { filePath: stage.args[0], ops: [] };
-  }
+    if (stage.name === "cat") {
+      // WHY (item 8): the numbered spelling is exactly `cat -n FILE`. A second flag,
+      // WHY: a long `--number`, an attached `-nFILE`, or a `-`-leading file all fail closed.
+      if (stage.args.length === 2 && stage.args[0] === "-n" && !stage.args[1].startsWith("-")) {
+        return { filePath: stage.args[1], ops: [], lineNumbered: true };
+      }
+      if (stage.args.length !== 1 || stage.args[0].startsWith("-")) return undefined;
+      return { filePath: stage.args[0], ops: [] };
+    }
+    // WHY (item 8): the only admitted `nl` spelling is exactly `nl -ba FILE` (number all
+    // WHY: lines, the `cat -n` geometry). `-ba` attached differently (`-b a`,
+    // WHY: `--body-numbering=a`, `-bn`, `-bp`, `-bt`, `-v`, `-i`, `-s`, `-w`, `-n*`) and any
+    // WHY: extra operand all fail closed.
+    if (stage.name === "nl") {
+      if (stage.args.length !== 2 || stage.args[0] !== "-ba" || stage.args[1].startsWith("-")) {
+        return undefined;
+      }
+      return { filePath: stage.args[1], ops: [], lineNumbered: true };
+    }
   if (stage.name === "head" || stage.name === "tail") {
     const selection = parseCountSelector(stage.name, stage.args);
     if (!selection || selection.file === undefined) return undefined;
@@ -518,6 +536,7 @@ interface ViewSeg {
   kind: "view";
   filePath: string;
   ops: SliceOp[];
+  lineNumbered?: boolean;
 }
 
 interface SearchSeg {
@@ -577,7 +596,12 @@ function parseViewSegment(node: Command | Pipeline): ViewSeg | undefined {
     if (!stage) return undefined;
     const source = parseSourceStage(stage);
     if (!source) return undefined;
-    return { kind: "view", filePath: source.filePath, ops: source.ops };
+    return {
+      kind: "view",
+      filePath: source.filePath,
+      ops: source.ops,
+      ...(source.lineNumbered === true ? { lineNumbered: true } : {}),
+    };
   }
   if (node.operators.some((op) => op !== "|")) return undefined;
   if (node.commands.length < 2 || node.commands.length > BASH_VIEW_MAX_PIPELINE_STAGES) {
@@ -596,6 +620,9 @@ function parseViewSegment(node: Command | Pipeline): ViewSeg | undefined {
     if (index === 0) {
       const source = parseSourceStage(stage);
       if (!source) return undefined;
+      // WHY (item 8): the numbered geometry is full-file display only; any downstream
+      // WHY: filter would silently drop numbered rows while claiming full-file leases.
+      if (source.lineNumbered === true) return undefined;
       filePath = source.filePath;
       ops.push(...source.ops);
       continue;
@@ -615,7 +642,13 @@ function classifySegment(node: Command | Pipeline, prefixPosition = false): Segm
     const silent = parseSilent(stage, prefixPosition);
     if (silent) return silent;
     const source = parseSourceStage(stage);
-    if (source) return { kind: "view", filePath: source.filePath, ops: source.ops };
+    if (source)
+      return {
+        kind: "view",
+        filePath: source.filePath,
+        ops: source.ops,
+        ...(source.lineNumbered === true ? { lineNumbered: true } : {}),
+      };
     const search = parseSearchStage(stage);
     if (search) return { kind: "search", search };
     return { kind: "unsafe", reason: `unsupported-command:${stage.name}` };
@@ -775,8 +808,17 @@ function classifyBash(command: string, located: { searchNameEnd?: number }): Bas
     kind: "pureView",
     view:
       baseDir === undefined
-        ? { filePath: view.filePath, ops: view.ops }
-        : { filePath: view.filePath, baseDir, ops: view.ops },
+        ? {
+            filePath: view.filePath,
+            ops: view.ops,
+            ...(view.lineNumbered === true ? { lineNumbered: true } : {}),
+          }
+        : {
+            filePath: view.filePath,
+            baseDir,
+            ops: view.ops,
+            ...(view.lineNumbered === true ? { lineNumbered: true } : {}),
+          },
   };
 }
 

@@ -198,7 +198,6 @@ describe("bash-classifier fail-closed matrix", () => {
 
   it("passes through flag hazards (R4)", () => {
     expect(reasonOf("cat -A f")).toBe("unsupported-command:cat");
-    expect(reasonOf("cat -n f")).toBe("unsupported-command:cat");
     expect(reasonOf("cat -v f")).toBe("unsupported-command:cat");
     expect(reasonOf("cat")).toBe("unsupported-command:cat");
     expect(reasonOf("head -c 20 f")).toBe("unsupported-command:head");
@@ -878,5 +877,76 @@ describe("bash-classifier sed multi-range -e matrix (Tier-2 item 7)", () => {
     // WHY: pipeline position denies with the pipeline reason, not the command one.
     expect(reasonOf("cat f | sed -n -e '1p' -e 'oops'")).toBe("unsupported-pipeline");
     expect(reasonOf("cat f | sed -n -e '9,2p'")).toBe("unsupported-pipeline");
+  });
+});
+
+describe("bash-classifier numbered viewers (Tier-2 item 8)", () => {
+  it("admits exactly `cat -n FILE` with the numbered marker", () => {
+    expect(viewOf("cat -n f.txt")).toMatchObject({
+      filePath: "f.txt",
+      ops: [],
+      lineNumbered: true,
+    });
+    expect(viewOf("cat -n ./sub/f.txt")).toMatchObject({
+      filePath: "./sub/f.txt",
+      lineNumbered: true,
+    });
+    expect(viewOf('cat -n "my file.txt"')).toMatchObject({
+      filePath: "my file.txt",
+      lineNumbered: true,
+    });
+    expect(viewOf("cd sub && cat -n f.txt")).toMatchObject({
+      filePath: "f.txt",
+      baseDir: "sub",
+      lineNumbered: true,
+    });
+    // Unnumbered shape is unchanged (no marker key — Tier-1 toEqual literals keep passing).
+    expect(viewOf("cat f.txt")).toEqual({ filePath: "f.txt", ops: [] });
+  });
+
+  it("admits exactly `nl -ba FILE` with the same marker", () => {
+    expect(viewOf("nl -ba f.txt")).toMatchObject({
+      filePath: "f.txt",
+      ops: [],
+      lineNumbered: true,
+    });
+    expect(viewOf("nl -ba ./sub/f.txt")).toMatchObject({
+      filePath: "./sub/f.txt",
+      lineNumbered: true,
+    });
+    expect(viewOf("cd sub && nl -ba f.txt")).toMatchObject({
+      filePath: "f.txt",
+      baseDir: "sub",
+      lineNumbered: true,
+    });
+  });
+
+  it("fails closed on every other cat/nl spelling", () => {
+    // cat: every other flag, doubled flags, longs, attached values, missing/extra operands.
+    expect(reasonOf("cat -A f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -b f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -E f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -n -n f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -n")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat --number f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -n f g")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -n -f")).toBe("unsupported-command:cat");
+    // nl: every other style, split/shuffled flags, longs, counts, extra operands.
+    expect(reasonOf("nl f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -ba")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -bn f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -bp f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -bt f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -b a f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -ba -ba f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl --body-numbering=a f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -ba f g")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -ba -f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -v 2 -ba f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -i 2 -ba f")).toBe("unsupported-command:nl");
+    // numbered source with a downstream filter is never a numbered view.
+    expect(reasonOf("cat -n f | head -5")).toBe("unsupported-pipeline");
+    expect(reasonOf("nl -ba f | head -5")).toBe("unsupported-pipeline");
+    expect(reasonOf("cat -n f | cat")).toBe("unsupported-pipeline");
   });
 });

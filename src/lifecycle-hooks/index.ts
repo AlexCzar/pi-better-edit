@@ -77,6 +77,8 @@ function defaultDeps(): LifecycleDeps {
 
 /** `grep -n`/`rg --line-number` stdout row: a 1-indexed line number, a colon, the matched text. */
 const SEARCH_STDOUT_LINE = /^(\d+):([\s\S]*)$/;
+/** `cat -n`/`nl -ba` stdout row: blank-padded 1-indexed number, a tab, the line content. */
+const NUMBERED_STDOUT_LINE = /^\s*(\d+)\t([\s\S]*)$/;
 
 /**
  * Parse the `LINE:content` rows of a line-numbered single-file search. Fails closed (`undefined`)
@@ -97,6 +99,28 @@ function parseSearchStdout(observed: string): Array<{ line: number; content: str
     matches.push({ line, content: parsed[2] });
   }
   return matches;
+}
+
+/**
+ * Parse one `cat -n` / `nl -ba` full-file stdout into content lines. Fails closed
+ * (`undefined`) unless EVERY non-trailing-newline row matches the shared numbered
+ * geometry — ONE parser for both spellings (they are the same view). The numeric
+ * field is display geometry: it is validated only for strict `1..L` sequencing and
+ * never used as a lease coordinate (leases come from re-read positions).
+ */
+function parseNumberedStdout(observed: string): string[] | undefined {
+  const lines = observed.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  if (lines.length === 0) return undefined;
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const parsed = NUMBERED_STDOUT_LINE.exec(lines[i]);
+    if (!parsed) return undefined;
+    // Strict 1-based sequencing: `cat -n`/`nl -ba` number every line from 1.
+    if (Number(parsed[1]) !== i + 1) return undefined;
+    out.push(parsed[2]);
+  }
+  return out;
 }
 
 /**
@@ -512,7 +536,14 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
         }
         return undefined;
       }
-      const { filePath, baseDir, ops } = classification.view;
+      const { filePath, baseDir, ops, lineNumbered } = classification.view;
+      // WHY (item 8): numbered and unnumbered are the same view — full-file, leased.
+      // WHY: `lineNumbered` only selects the stdout-verification parser; leases and render
+      // WHY: always come from re-read positions, never from parsed stdout numbers.
+      const isNumbered = lineNumbered === true;
+      // WHY (item 8): numbered views admit no slice ops — the classifier only emits
+      // WHY: `ops: []` with the marker, but defense-in-depth fails closed on any drift.
+      if (isNumbered && ops.length !== 0) return undefined;
       // WHY: the single pre-view literal `cd` re-bases relative resolution; an absolute
       // WHY: view target ignores it (`toCwd` returns absolutes unchanged). Multi-`cd`
       // WHY: and post-view-`cd` chains never reach here — the classifier fails them
@@ -561,7 +592,19 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
       // WHY: implements D9's symmetric CRLF/BOM normalization here; D1's
       // WHY: `;`-chain gate lives in the classifier.
       const observedText = toLF(stripBOM(stdoutText).text);
-      if (observedText !== joinedSlice && observedText !== `${joinedSlice}\n`) return undefined;
+      if (isNumbered) {
+        // WHY (item 8): strip display numbers, then the SAME byte-equality gate as below.
+        // WHY: the numbers are never trusted as coordinates — positions come from `intervals`
+        // WHY: (full-file here), and a row-count or content mismatch fails closed with no lease.
+        const deNumbered = parseNumberedStdout(observedText);
+        if (deNumbered === undefined) return undefined;
+        if (deNumbered.length !== allLines.length) return undefined;
+        for (let i = 0; i < allLines.length; i++) {
+          if (deNumbered[i] !== allLines[i]) return undefined;
+        }
+      } else if (observedText !== joinedSlice && observedText !== `${joinedSlice}\n`) {
+        return undefined;
+      }
       const preview = await deps.fmtReadPreview(
         normalized,
         { windows: intervals.map((iv) => ({ offset: iv.lo, limit: iv.hi - iv.lo + 1 })) },

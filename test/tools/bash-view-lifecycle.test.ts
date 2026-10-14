@@ -1211,3 +1211,135 @@ describe("bash multi-range sed lifecycle (Tier-2 item 7)", () => {
     });
   });
 });
+
+describe("bash numbered view lifecycle (Tier-2 item 8)", () => {
+  function catNumbered(text: string): string {
+    // Mirrors GNU `cat -n` geometry: right-aligned width-6 number + tab.
+    return (
+      text
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l, i) => `${String(i + 1).padStart(6)}\t${l}`)
+        .join("\n") + "\n"
+    );
+  }
+
+  it("replaces `cat -n` output with the full-file anchored view and leases the whole file", async () => {
+    await withTempDir("bash-view-num-", async (dir) => {
+      const body = numberedLines(10);
+      await writeFile(join(dir, "f.txt"), body, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const editTool = getTool("edit");
+      expect(handler).toBeDefined();
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-num-a" } };
+
+      const result = await bashResult(handler!, "cat -n f.txt", ctx, catNumbered(body));
+      expect(result).toBeDefined();
+      expect(result!.content).toHaveLength(1);
+      const text = result!.content[0]!.text;
+      expect(text.startsWith("--- Bash view (hashline anchors) ---\n")).toBe(true);
+      const rows = rowsOf(text);
+      expect(rows).toHaveLength(10);
+      for (const n of [1, 5, 10]) expect(rows.some((l) => l.endsWith(`│line${n}`))).toBe(true);
+
+      // Lease shape: full-file — first AND last line anchors both edit cleanly.
+      for (const target of ["line1", "line10"] as const) {
+        const ok = await editTool.execute(
+          "e-" + target,
+          {
+            file: "f.txt",
+            edits: [
+              {
+                anchor_from: anchorFor(rows, target),
+                anchor_to: anchorFor(rows, target),
+                text: "X",
+              },
+            ],
+          },
+          undefined,
+          undefined,
+          ctx,
+        );
+        expect(ok.isError).toBeFalsy();
+      }
+    });
+  });
+
+  it("renders `nl -ba` through the same full-file renderer with the same lease", async () => {
+    await withTempDir("bash-view-num-", async (dir) => {
+      const body = numberedLines(6);
+      await writeFile(join(dir, "f.txt"), body, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-num-b" } };
+
+      const catRes = await bashResult(handler!, "cat -n f.txt", ctx, catNumbered(body));
+      const nlRes = await bashResult(handler!, "nl -ba f.txt", ctx, catNumbered(body));
+      expect(catRes).toBeDefined();
+      expect(nlRes).toBeDefined();
+      // ONE renderer: same header; same row count; row bodies identical up to per-run hashes.
+      expect(nlRes!.content[0]!.text.startsWith("--- Bash view (hashline anchors) ---\n")).toBe(true);
+      expect(rowsOf(nlRes!.content[0]!.text)).toHaveLength(6);
+      const bodies = (t: string) =>
+        rowsOf(t)
+          .map((r) => r.split("│")[1])
+          .join("\n");
+      expect(bodies(nlRes!.content[0]!.text)).toBe(bodies(catRes!.content[0]!.text));
+
+      const nlRows = rowsOf(nlRes!.content[0]!.text);
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(nlRows, "line6"),
+              anchor_to: anchorFor(nlRows, "line6"),
+              text: "X",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("fails closed to raw stdout on any numbered-output skew (no lease, no replace)", async () => {
+    await withTempDir("bash-view-num-", async (dir) => {
+      const body = numberedLines(4);
+      await writeFile(join(dir, "f.txt"), body, "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-num-c" } };
+
+      // Dropped row.
+      const dropped = catNumbered(body)
+        .split("\n")
+        .filter((_, i) => i !== 1)
+        .join("\n");
+      expect(await bashResult(handler!, "cat -n f.txt", ctx, dropped)).toBeUndefined();
+      // Renumbered (starts at 0).
+      const renum =
+        body
+          .split("\n")
+          .filter((l) => l !== "")
+          .map((l, i) => `${String(i).padStart(6)}\t${l}`)
+          .join("\n") + "\n";
+      expect(await bashResult(handler!, "cat -n f.txt", ctx, renum)).toBeUndefined();
+      // Forged content on a numbered row.
+      const forged = catNumbered(body).replace("line2", "EVIL");
+      expect(await bashResult(handler!, "nl -ba f.txt", ctx, forged)).toBeUndefined();
+      // Unnumbered stdout for a numbered command (and vice versa).
+      expect(await bashResult(handler!, "cat -n f.txt", ctx, body)).toBeUndefined();
+      expect(await bashResult(handler!, "cat f.txt", ctx, catNumbered(body))).toBeUndefined();
+    });
+  });
+});
