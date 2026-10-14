@@ -1186,24 +1186,38 @@ export async function healUnhealthyStore(budget?: BusyBudget): Promise<boolean> 
  * teardown (`shutdownDb`'s checkpoint, `close`) keeps working through the guard.
  */
 function guardDatabaseHandle(raw: DatabaseSync, storePath: string): DatabaseSync {
+  // WHY the originals are captured here: doubles installed on the handle afterwards (notably
+  // WHY: `vi.spyOn`, whose defineProperty forwards onto the raw connection) land as OWN
+  // WHY: properties. If the wrappers below called `target.exec`/`target.prepare`, they would hit
+  // WHY: the double, and a call-through double recurses wrapper → double → wrapper. On a fresh
+  // WHY: connection these members live on the prototype, so this capture is the real method.
+  const rawExec = raw.exec.bind(raw);
+  const rawPrepare = raw.prepare.bind(raw);
   const guarded: DatabaseSync = new Proxy(raw, {
     get(target, property) {
-      if (property === "prepare") {
+      if (property === "prepare" || property === "exec") {
+        // WHY own properties win: a double must observe every call — including the guard's own —
+        // WHY: or call-through doubles recurse. The guard stays armed underneath: the double
+        // WHY: reaches the real method through the capture above, never through this trap.
+        if (Object.prototype.hasOwnProperty.call(target, property)) {
+          const override: unknown = Reflect.get(target, property, target);
+          return typeof override === "function" ? override.bind(target) : override;
+        }
+        if (property === "prepare") {
+          return (sql: string) => {
+            let statement: StatementSync;
+            try {
+              statement = rawPrepare(sql);
+            } catch (error) {
+              triggerUseTimeHeal(guarded, storePath, error);
+              throw error;
+            }
+            return guardStatement(statement, guarded, storePath);
+          };
+        }
         return (sql: string) => {
-          let statement: StatementSync;
           try {
-            statement = target.prepare(sql);
-          } catch (error) {
-            triggerUseTimeHeal(guarded, storePath, error);
-            throw error;
-          }
-          return guardStatement(statement, guarded, storePath);
-        };
-      }
-      if (property === "exec") {
-        return (sql: string) => {
-          try {
-            target.exec(sql);
+            rawExec(sql);
           } catch (error) {
             triggerUseTimeHeal(guarded, storePath, error);
             throw error;
@@ -1225,23 +1239,48 @@ function guardStatement(
   generation: DatabaseSync,
   storePath: string,
 ): StatementSync {
+  // WHY the capture mirrors the handle's: a double installed on a statement afterwards must see
+  // WHY: through to the real method, or a call-through double recurses wrapper → double → wrapper.
+  const rawMethods = new Map<string, (...args: unknown[]) => unknown>();
+  for (const method of GUARDED_STATEMENT_METHODS) {
+    const value: unknown = Reflect.get(statement, method, statement);
+    if (typeof value === "function") {
+      rawMethods.set(method, (value as (...args: unknown[]) => unknown).bind(statement));
+    }
+  }
   return new Proxy(statement, {
     get(target, property) {
+      if (typeof property === "string" && GUARDED_STATEMENT_METHODS.has(property)) {
+        if (Object.prototype.hasOwnProperty.call(target, property)) {
+          const override: unknown = Reflect.get(target, property, target);
+          return typeof override === "function" ? override.bind(target) : override;
+        }
+        // WHY the `!`: the map above is filled from this same method set on a real statement, so
+        // WHY: the entry always exists; the assertion keeps the absence unrepresentable instead of
+        // WHY: silently returning undefined for a missing method.
+        const raw = rawMethods.get(property)!;
+        if (property === "iterate") {
+          return (...args: unknown[]) => {
+            try {
+              return guardIterator(raw(...args) as IterableIterator<unknown>, generation, storePath);
+            } catch (error) {
+              triggerUseTimeHeal(generation, storePath, error);
+              throw error;
+            }
+          };
+        }
+        return (...args: unknown[]) => {
+          try {
+            return raw(...args);
+          } catch (error) {
+            triggerUseTimeHeal(generation, storePath, error);
+            throw error;
+          }
+        };
+      }
       const value: unknown = Reflect.get(target, property, target);
       if (typeof value !== "function") return value;
-      const bound = (value as (...args: unknown[]) => unknown).bind(target);
-      if (typeof property !== "string" || !GUARDED_STATEMENT_METHODS.has(property)) return bound;
-      return (...args: unknown[]) => {
-        try {
-          const result = bound(...args);
-          return property === "iterate"
-            ? guardIterator(result as IterableIterator<unknown>, generation, storePath)
-            : result;
-        } catch (error) {
-          triggerUseTimeHeal(generation, storePath, error);
-          throw error;
-        }
-      };
+      return (value as (...args: unknown[]) => unknown).bind(target);
     },
   });
 }
@@ -1255,15 +1294,20 @@ function guardIterator(
   generation: DatabaseSync,
   storePath: string,
 ): IterableIterator<unknown> {
+  // WHY the capture mirrors the handle's: the same double-recursion hazard applies to `next`.
+  const rawNext = iterator.next.bind(iterator) as (...args: unknown[]) => unknown;
   return new Proxy(iterator, {
     get(target, property) {
+      if (property === "next" && Object.prototype.hasOwnProperty.call(target, property)) {
+        const override: unknown = Reflect.get(target, property, target);
+        return typeof override === "function" ? override.bind(target) : override;
+      }
       const value: unknown = Reflect.get(target, property, target);
       if (typeof value !== "function") return value;
-      const bound = (value as (...args: unknown[]) => unknown).bind(target);
-      if (property !== "next") return bound;
+      if (property !== "next") return (value as (...args: unknown[]) => unknown).bind(target);
       return (...args: unknown[]) => {
         try {
-          return bound(...args);
+          return rawNext(...args);
         } catch (error) {
           triggerUseTimeHeal(generation, storePath, error);
           throw error;
