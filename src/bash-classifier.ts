@@ -294,25 +294,25 @@ function parseSourceStage(shape: StageShape): SourceStage | undefined {
   // WHY: while filter stages (`parseFilterStage`) and silent commands never do.
   const stage = unwrapViewWrapper(shape);
   if (!stage) return undefined;
-    if (stage.name === "cat") {
-      // WHY: (item 8) the numbered spelling is exactly `cat -n FILE`. A second flag,
-      // WHY: a long `--number`, an attached `-nFILE`, or a `-`-leading file all fail closed.
-      if (stage.args.length === 2 && stage.args[0] === "-n" && !stage.args[1].startsWith("-")) {
-        return { filePath: stage.args[1], ops: [], lineNumbered: true };
-      }
-      if (stage.args.length !== 1 || stage.args[0].startsWith("-")) return undefined;
-      return { filePath: stage.args[0], ops: [] };
-    }
-    // WHY: (item 8) the only admitted `nl` spelling is exactly `nl -ba FILE` (number all
-    // WHY: lines, the `cat -n` geometry). `-ba` attached differently (`-b a`,
-    // WHY: `--body-numbering=a`, `-bn`, `-bp`, `-bt`, `-v`, `-i`, `-s`, `-w`, `-n*`) and any
-    // WHY: extra operand all fail closed.
-    if (stage.name === "nl") {
-      if (stage.args.length !== 2 || stage.args[0] !== "-ba" || stage.args[1].startsWith("-")) {
-        return undefined;
-      }
+  if (stage.name === "cat") {
+    // WHY: (item 8) the numbered spelling is exactly `cat -n FILE`. A second flag,
+    // WHY: a long `--number`, an attached `-nFILE`, or a `-`-leading file all fail closed.
+    if (stage.args.length === 2 && stage.args[0] === "-n" && !stage.args[1].startsWith("-")) {
       return { filePath: stage.args[1], ops: [], lineNumbered: true };
     }
+    if (stage.args.length !== 1 || stage.args[0].startsWith("-")) return undefined;
+    return { filePath: stage.args[0], ops: [] };
+  }
+  // WHY: (item 8) the only admitted `nl` spelling is exactly `nl -ba FILE` (number all
+  // WHY: lines, the `cat -n` geometry). `-ba` attached differently (`-b a`,
+  // WHY: `--body-numbering=a`, `-bn`, `-bp`, `-bt`, `-v`, `-i`, `-s`, `-w`, `-n*`) and any
+  // WHY: extra operand all fail closed.
+  if (stage.name === "nl") {
+    if (stage.args.length !== 2 || stage.args[0] !== "-ba" || stage.args[1].startsWith("-")) {
+      return undefined;
+    }
+    return { filePath: stage.args[1], ops: [], lineNumbered: true };
+  }
   if (stage.name === "head" || stage.name === "tail") {
     const selection = parseCountSelector(stage.name, stage.args);
     if (!selection || selection.file === undefined) return undefined;

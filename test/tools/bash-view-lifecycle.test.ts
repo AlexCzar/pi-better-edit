@@ -1282,7 +1282,9 @@ describe("bash numbered view lifecycle (Tier-2 item 8)", () => {
       expect(catRes).toBeDefined();
       expect(nlRes).toBeDefined();
       // ONE renderer: same header; same row count; row bodies identical up to per-run hashes.
-      expect(nlRes!.content[0]!.text.startsWith("--- Bash view (hashline anchors) ---\n")).toBe(true);
+      expect(nlRes!.content[0]!.text.startsWith("--- Bash view (hashline anchors) ---\n")).toBe(
+        true,
+      );
       expect(rowsOf(nlRes!.content[0]!.text)).toHaveLength(6);
       const bodies = (t: string) =>
         rowsOf(t)
