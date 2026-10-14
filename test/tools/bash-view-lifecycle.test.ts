@@ -944,7 +944,6 @@ describe("bash search interception (I1a #73)", () => {
         "grep -r pat .",
         "grep -R pat .",
         "grep -P pat f.txt",
-        "grep -e pat f.txt",
         "grep -f pats f.txt",
         "grep -n5 pat f.txt",
         "grep --line-number=x pat f.txt",
@@ -1087,6 +1086,262 @@ describe("bash search interception (I1a #73)", () => {
       expect(bom).toBeDefined();
       expect(bom!.content[0]!.text).toContain("[bom.txt (1 match)]");
       expect(rowsOf(bom!.content[0]!.text)[0]!.endsWith("│line1")).toBe(true);
+    });
+  });
+});
+
+describe("bash multi-range sed lifecycle (Tier-2 item 7)", () => {
+  it("intercepts merged multi-range sed and leases exactly the union", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      await writeFile(join(dir, "f.txt"), numberedLines(30), "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-sed-multi" } };
+
+      // WHY: '16,18p'+'17,20p' merge at parse to [16,20]; stdout must equal
+      // WHY: exactly that slice or the D9 byte gate fails closed.
+      const sliceStdout = `${Array.from({ length: 5 }, (_, i) => `line${i + 16}`).join("\n")}\n`;
+      const result = await bashResult(
+        handler!,
+        "sed -n -e '16,18p' -e '17,20p' f.txt",
+        ctx,
+        sliceStdout,
+      );
+      expect(result).toBeDefined();
+      const rows = rowsOf(result!.content[0]!.text);
+      expect(rows).toHaveLength(5);
+      for (const n of [16, 17, 18, 19, 20]) {
+        expect(rows.some((line) => line.endsWith(`│line${n}`))).toBe(true);
+      }
+      expect(rows.some((line) => line.endsWith("│line15"))).toBe(false);
+      expect(rows.some((line) => line.endsWith("│line21"))).toBe(false);
+      // WHY: least privilege before the first edit: line5 was never served, so its
+      // WHY: anchor — though valid content — carries no lease and fails closed.
+      // WHY: (After any successful edit the commit re-serves the whole file, so
+      // WHY: this scoping holds until the session's first successful mutation.)
+      const allHashes = await lineHashes(numberedLines(30), join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[4]!, anchor_to: allHashes[4]!, text: "LINE5" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(rows, "line18"),
+              anchor_to: anchorFor(rows, "line18"),
+              text: "LINE18",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("passes through disjoint multi-range sed (fold-inert) with no leases", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      await writeFile(join(dir, "f.txt"), numberedLines(30), "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-sed-disjoint" } };
+
+      // WHY: disjoint [1,1],[30,30] cannot survive the sequential stream-relative
+      // WHY: fold — the second range selects inside the first selection, yielding
+      // WHY: empty — so D3 passes through and grants nothing. True sed would print
+      // WHY: line1+line30; serving raw is the safe answer until a union-aware op
+      // WHY: exists. Pass-through either way.
+      expect(
+        await bashResult(handler!, "sed -n -e '1p' -e '30p' f.txt", ctx, "line1\nline30\n"),
+      ).toBeUndefined();
+      const allHashes = await lineHashes(numberedLines(30), join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e1",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[0]!, anchor_to: allHashes[0]!, text: "LINE1" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+
+  it("passes through mixed valid+garbage, reversed, and ;-joined sed spells", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      await writeFile(join(dir, "f.txt"), numberedLines(5), "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-sed-deny" } };
+
+      for (const command of [
+        "sed -n -e '2p' -e 's/a/b/p' f.txt",
+        "sed -n -e '2p' -e '/re/p' f.txt",
+        "sed -n -e '4,2p' f.txt",
+        "sed -n '4,2p' f.txt",
+        "sed -n -e '1p;2p' f.txt",
+        "sed -n '1p;2p' f.txt",
+        "sed -n '2p' -e '3p' f.txt",
+        "sed -n -e '2p' f.txt extra.txt",
+      ]) {
+        expect(await bashResult(handler!, command, ctx, "<<raw stdout>>")).toBeUndefined();
+      }
+    });
+  });
+});
+
+describe("bash numbered view lifecycle (Tier-2 item 8)", () => {
+  function catNumbered(text: string): string {
+    // Mirrors GNU `cat -n` geometry: right-aligned width-6 number + tab.
+    return (
+      text
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l, i) => `${String(i + 1).padStart(6)}\t${l}`)
+        .join("\n") + "\n"
+    );
+  }
+
+  it("replaces `cat -n` output with the full-file anchored view and leases the whole file", async () => {
+    await withTempDir("bash-view-num-", async (dir) => {
+      const body = numberedLines(10);
+      await writeFile(join(dir, "f.txt"), body, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const editTool = getTool("edit");
+      expect(handler).toBeDefined();
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-num-a" } };
+
+      const result = await bashResult(handler!, "cat -n f.txt", ctx, catNumbered(body));
+      expect(result).toBeDefined();
+      expect(result!.content).toHaveLength(1);
+      const text = result!.content[0]!.text;
+      expect(text.startsWith("--- Bash view (hashline anchors) ---\n")).toBe(true);
+      const rows = rowsOf(text);
+      expect(rows).toHaveLength(10);
+      for (const n of [1, 5, 10]) expect(rows.some((l) => l.endsWith(`│line${n}`))).toBe(true);
+
+      // Lease shape: full-file — first AND last line anchors both edit cleanly.
+      for (const target of ["line1", "line10"] as const) {
+        const ok = await editTool.execute(
+          "e-" + target,
+          {
+            file: "f.txt",
+            edits: [
+              {
+                anchor_from: anchorFor(rows, target),
+                anchor_to: anchorFor(rows, target),
+                text: "X",
+              },
+            ],
+          },
+          undefined,
+          undefined,
+          ctx,
+        );
+        expect(ok.isError).toBeFalsy();
+      }
+    });
+  });
+
+  it("renders `nl -ba` through the same full-file renderer with the same lease", async () => {
+    await withTempDir("bash-view-num-", async (dir) => {
+      const body = numberedLines(6);
+      await writeFile(join(dir, "f.txt"), body, "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-num-b" } };
+
+      const catRes = await bashResult(handler!, "cat -n f.txt", ctx, catNumbered(body));
+      const nlRes = await bashResult(handler!, "nl -ba f.txt", ctx, catNumbered(body));
+      expect(catRes).toBeDefined();
+      expect(nlRes).toBeDefined();
+      // ONE renderer: same header; same row count; row bodies identical up to per-run hashes.
+      expect(nlRes!.content[0]!.text.startsWith("--- Bash view (hashline anchors) ---\n")).toBe(
+        true,
+      );
+      expect(rowsOf(nlRes!.content[0]!.text)).toHaveLength(6);
+      const bodies = (t: string) =>
+        rowsOf(t)
+          .map((r) => r.split("│")[1])
+          .join("\n");
+      expect(bodies(nlRes!.content[0]!.text)).toBe(bodies(catRes!.content[0]!.text));
+
+      const nlRows = rowsOf(nlRes!.content[0]!.text);
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(nlRows, "line6"),
+              anchor_to: anchorFor(nlRows, "line6"),
+              text: "X",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("fails closed to raw stdout on any numbered-output skew (no lease, no replace)", async () => {
+    await withTempDir("bash-view-num-", async (dir) => {
+      const body = numberedLines(4);
+      await writeFile(join(dir, "f.txt"), body, "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-num-c" } };
+
+      // Dropped row.
+      const dropped = catNumbered(body)
+        .split("\n")
+        .filter((_, i) => i !== 1)
+        .join("\n");
+      expect(await bashResult(handler!, "cat -n f.txt", ctx, dropped)).toBeUndefined();
+      // Renumbered (starts at 0).
+      const renum =
+        body
+          .split("\n")
+          .filter((l) => l !== "")
+          .map((l, i) => `${String(i).padStart(6)}\t${l}`)
+          .join("\n") + "\n";
+      expect(await bashResult(handler!, "cat -n f.txt", ctx, renum)).toBeUndefined();
+      // Forged content on a numbered row.
+      const forged = catNumbered(body).replace("line2", "EVIL");
+      expect(await bashResult(handler!, "nl -ba f.txt", ctx, forged)).toBeUndefined();
+      // Unnumbered stdout for a numbered command (and vice versa).
+      expect(await bashResult(handler!, "cat -n f.txt", ctx, body)).toBeUndefined();
+      expect(await bashResult(handler!, "cat f.txt", ctx, catNumbered(body))).toBeUndefined();
     });
   });
 });

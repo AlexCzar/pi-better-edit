@@ -198,7 +198,6 @@ describe("bash-classifier fail-closed matrix", () => {
 
   it("passes through flag hazards (R4)", () => {
     expect(reasonOf("cat -A f")).toBe("unsupported-command:cat");
-    expect(reasonOf("cat -n f")).toBe("unsupported-command:cat");
     expect(reasonOf("cat -v f")).toBe("unsupported-command:cat");
     expect(reasonOf("cat")).toBe("unsupported-command:cat");
     expect(reasonOf("head -c 20 f")).toBe("unsupported-command:head");
@@ -418,7 +417,6 @@ describe("bash-classifier search matrix (I1a)", () => {
       "grep -r pat f",
       "grep -R pat f",
       "grep -P pat f",
-      "grep -e pat f",
       "grep -f pats f",
       "grep -n5 pat f",
       "grep --line-number=x pat f",
@@ -609,5 +607,346 @@ describe("applySliceOps interval algebra", () => {
       { kind: "first", n: 4 },
     ] as const;
     expect(applySliceOps([...ops], 100)).toEqual([{ lo: 10, hi: 13 }]);
+  });
+});
+
+describe("bash-classifier search -e matrix (Tier-2 item 6)", () => {
+  it("admits separate `-e PAT` in every flag position", () => {
+    expect(searchOf("grep -e pat f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    expect(searchOf("rg -e pat f")).toEqual({
+      program: "rg",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    // WHY: flags are admitted at any position before `--` (Tier-1 shape (d)), and `-e` is
+    // WHY: a flag — between pattern-slot and file, and after the file, alike.
+    expect(searchOf("grep -i -e pat f").pattern).toBe("pat");
+    expect(searchOf("grep -e pat -i f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    expect(searchOf("grep -i f -e pat")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    // WHY: the point of `-e`: a `-`-leading value is the pattern, no `--` required.
+    expect(searchOf("grep -e -pat f")).toEqual({
+      program: "grep",
+      pattern: "-pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    // WHY: a consumed `-e` value is never re-parsed as a flag — `-n` here is the pattern.
+    expect(searchOf("grep -e -n f")).toEqual({
+      program: "grep",
+      pattern: "-n",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    // WHY: `--` still ends flag parsing, so the file may itself be `-n`.
+    expect(searchOf("grep -e pat -- -n")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "-n",
+      lineNumbered: false,
+    });
+  });
+
+  it("admits attached `-ePAT` without decomposing the pattern letters", () => {
+    expect(searchOf("grep -epat f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    expect(searchOf("rg -epat f").program).toBe("rg");
+    expect(searchOf("grep -e-pat f").pattern).toBe("-pat");
+    expect(searchOf("grep -i -epat f").pattern).toBe("pat");
+    expect(searchOf("grep -epat -i f").filePath).toBe("f");
+  });
+
+  it("admits cluster-close `-e` mirroring `-m` (must close, consumes next)", () => {
+    expect(searchOf("grep -ine pat f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: true,
+    });
+    expect(searchOf("grep -ne pat f").lineNumbered).toBe(true);
+    expect(searchOf("grep -ie pat f").pattern).toBe("pat");
+    expect(searchOf("rg -ine pat f").program).toBe("rg");
+  });
+
+  it("admits the `-e` + `-m` interplay (each value-taker consumes exactly one argument)", () => {
+    expect(searchOf("grep -e pat -m 3 f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: false,
+    });
+    expect(searchOf("grep -m 3 -e pat f").pattern).toBe("pat");
+    expect(searchOf("grep -nm 3 -e pat f")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: true,
+    });
+    expect(searchOf("grep -ine pat -m 3 f").pattern).toBe("pat");
+    expect(searchOf("rg -m 1 -e pat f").program).toBe("rg");
+  });
+
+  it("fails closed on missing `-e` values in every spelling", () => {
+    for (const command of [
+      "grep -e",
+      "grep -e pat",
+      "grep pat f -e",
+      "grep -m 3 -e",
+      "grep -ine",
+      "grep -ine pat",
+      "rg -e",
+    ]) {
+      expect(reasonOf(command)).toBe(
+        command.startsWith("rg") ? "unsupported-command:rg" : "unsupported-command:grep",
+      );
+    }
+  });
+
+  it("fails closed on doubled `-e` and on pattern-both-ways", () => {
+    for (const command of [
+      "grep -e a -e b f",
+      "grep -ea -eb f",
+      "grep -e a -eb f",
+      "grep -ea -e b f",
+      "grep -e pat -e pat f",
+      "grep -ine a -e b f",
+      "grep -ine a -ine b f",
+      // WHY: operands must then be exactly `[FILE]` — a positional pattern plus `-e` is both ways.
+      "grep -e a b f",
+      "grep b -e a f",
+      "grep -ea b f",
+      "grep b -ea f",
+      "grep -e a -- b f",
+    ]) {
+      expect(reasonOf(command)).toBe("unsupported-command:grep");
+    }
+  });
+
+  it("fails closed on `-e`-as-cluster misreadings and `-e`+`-m` collisions", () => {
+    for (const command of [
+      // WHY: any token starting `-e` is the attached form, so `-ei` is pattern `i` plus two
+      // WHY: operands (`pat`, `f`) — both-ways, not a cluster.
+      "grep -ei pat f",
+      "grep -en pat f",
+      // WHY: `m` anywhere but last fails closed, even beside `e`.
+      "grep -me pat f",
+      "grep -iem pat f",
+      "grep -emi pat f",
+      // WHY: `-e` swallows `-m` as its pattern value, leaving two operands (`3`, `f`).
+      "grep -e -m 3 f",
+      // WHY: bad `-m` values still fail with `-e` present.
+      "grep -e pat -m 0 f",
+      "grep -e pat -m3 f",
+      "grep -e pat -nm3 f",
+    ]) {
+      expect(reasonOf(command)).toBe("unsupported-command:grep");
+    }
+  });
+
+  it("keeps `-f` denied in every spelling", () => {
+    for (const command of ["grep -f pats f", "grep -ffoo f", "grep --file=x f", "rg -f pats f"]) {
+      expect(reasonOf(command)).toBe(
+        command.startsWith("rg") ? "unsupported-command:rg" : "unsupported-command:grep",
+      );
+    }
+  });
+
+  it("rewrites `-e` searches with the line-number splice after the program name", () => {
+    expect(withSearchLineNumbers("grep -e pat f")).toBe("grep -n -e pat f");
+    expect(withSearchLineNumbers("grep -epat f")).toBe("grep -n -epat f");
+    expect(withSearchLineNumbers("grep -e pat -m 3 f")).toBe("grep -n -e pat -m 3 f");
+    // WHY: `-ne`/`-ine` already carry `n`, so the injection skips byte-identically.
+    expect(withSearchLineNumbers("grep -ne pat f")).toBe("grep -ne pat f");
+    expect(withSearchLineNumbers("grep -ine pat f")).toBe("grep -ine pat f");
+    // WHY: `-e -n` is NOT numbered (`-n` is the pattern), so the splice still applies.
+    expect(withSearchLineNumbers("grep -e -n f")).toBe("grep -n -e -n f");
+    // WHY: denied `-e` shapes pass through the rewriter byte-identical.
+    expect(withSearchLineNumbers("grep -e a -e b f")).toBe("grep -e a -e b f");
+    expect(withSearchLineNumbers("grep -e a b f")).toBe("grep -e a b f");
+  });
+});
+
+describe("bash-classifier sed multi-range -e matrix (Tier-2 item 7)", () => {
+  it("admits -n -e RANGEp [-e RANGEp …] and merges at parse", () => {
+    // WHY: disjoint ranges survive parse sorted and separate; the D3/D9
+    // WHY: serve-time gates (not the classifier) decide their fate.
+    expect(viewOf("sed -n -e '1p' -e '10p' f")).toEqual({
+      filePath: "f",
+      ops: [
+        { kind: "range", from: 1, to: 1 },
+        { kind: "range", from: 10, to: 10 },
+      ],
+    });
+    // WHY: overlap merges to the union — no gap, nothing unprinted is added.
+    expect(viewOf("sed -n -e '1,5p' -e '3,7p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 1, to: 7 }],
+    });
+    // WHY: adjacency merges ([1,3]+[4,5] prints exactly 1..5, contiguous).
+    expect(viewOf("sed -n -e '1,3p' -e '4,5p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 1, to: 5 }],
+    });
+    // WHY: unsorted input is sorted at parse; containment collapses inward.
+    expect(viewOf("sed -n -e '10,12p' -e '1,2p' f")).toEqual({
+      filePath: "f",
+      ops: [
+        { kind: "range", from: 1, to: 2 },
+        { kind: "range", from: 10, to: 12 },
+      ],
+    });
+    expect(viewOf("sed -n -e '2p' -e '2p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 2, to: 2 }],
+    });
+    expect(viewOf("sed -n -e '1,10p' -e '3,4p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 1, to: 10 }],
+    });
+    // WHY: a three-spec chain bridges through the middle spec.
+    expect(viewOf("sed -n -e '1,2p' -e '5,6p' -e '3,4p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 1, to: 6 }],
+    });
+    // WHY: a single -e pair is the degenerate multi-range shape.
+    expect(viewOf("sed -n -e '5p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 5, to: 5 }],
+    });
+    // WHY: the legacy spelling keeps working byte-identically (contract).
+    expect(viewOf("sed -n '20,128p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 20, to: 128 }],
+    });
+    expect(viewOf("sed -n 5p f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 5, to: 5 }],
+    });
+    // WHY: no-file multi-range is the pipeline filter position (parseFilterStage).
+    expect(viewOf("cat f | sed -n -e '3,7p' -e '5,9p'")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 3, to: 9 }],
+    });
+  });
+
+  it("fails the whole stage closed on any unparseable spec (never partial)", () => {
+    // WHY: mixed valid+garbage denies the stage even though '1p' alone is fine.
+    expect(reasonOf("sed -n -e '1p' -e 's/a/b/p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -e '/re/p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -e '1,5w out' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -e '1,5d' f")).toBe("unsupported-command:sed");
+    // WHY: reversed ranges fail closed in BOTH spellings (strict-print spirit;
+    // WHY: legacy `10,1p` was previously admitted by the parser and died at
+    // WHY: serve time — now it is denied at parse; recorded choice).
+    expect(reasonOf("sed -n -e '10,1p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n '10,1p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '5p' -e '10,1p' f")).toBe("unsupported-command:sed");
+    // WHY: `;`-joined multi-range stays raw — `;` is not in the strict regex,
+    // WHY: so the single PROG is unparseable and the stage is denied whole.
+    expect(reasonOf("sed -n -e '1p;2p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n '1p;2p' f")).toBe("unsupported-command:sed");
+    // WHY: shape hazards — dangling -e, mixed legacy+-e, file-not-last,
+    // WHY: two files, -e without -n, -n without pairs.
+    expect(reasonOf("sed -n -e '1p' -e f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n '5p' -e '6p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' f -e '2p'")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -e '2p' f g")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -e '1p' -e '2p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -- f")).toBe("unsupported-command:sed");
+    // WHY: pipeline position denies with the pipeline reason, not the command one.
+    expect(reasonOf("cat f | sed -n -e '1p' -e 'oops'")).toBe("unsupported-pipeline");
+    expect(reasonOf("cat f | sed -n -e '9,2p'")).toBe("unsupported-pipeline");
+  });
+});
+
+describe("bash-classifier numbered viewers (Tier-2 item 8)", () => {
+  it("admits exactly `cat -n FILE` with the numbered marker", () => {
+    expect(viewOf("cat -n f.txt")).toMatchObject({
+      filePath: "f.txt",
+      ops: [],
+      lineNumbered: true,
+    });
+    expect(viewOf("cat -n ./sub/f.txt")).toMatchObject({
+      filePath: "./sub/f.txt",
+      lineNumbered: true,
+    });
+    expect(viewOf('cat -n "my file.txt"')).toMatchObject({
+      filePath: "my file.txt",
+      lineNumbered: true,
+    });
+    expect(viewOf("cd sub && cat -n f.txt")).toMatchObject({
+      filePath: "f.txt",
+      baseDir: "sub",
+      lineNumbered: true,
+    });
+    // Unnumbered shape is unchanged (no marker key — Tier-1 toEqual literals keep passing).
+    expect(viewOf("cat f.txt")).toEqual({ filePath: "f.txt", ops: [] });
+  });
+
+  it("admits exactly `nl -ba FILE` with the same marker", () => {
+    expect(viewOf("nl -ba f.txt")).toMatchObject({
+      filePath: "f.txt",
+      ops: [],
+      lineNumbered: true,
+    });
+    expect(viewOf("nl -ba ./sub/f.txt")).toMatchObject({
+      filePath: "./sub/f.txt",
+      lineNumbered: true,
+    });
+    expect(viewOf("cd sub && nl -ba f.txt")).toMatchObject({
+      filePath: "f.txt",
+      baseDir: "sub",
+      lineNumbered: true,
+    });
+  });
+
+  it("fails closed on every other cat/nl spelling", () => {
+    // cat: every other flag, doubled flags, longs, attached values, missing/extra operands.
+    expect(reasonOf("cat -A f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -b f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -E f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -n -n f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -n")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat --number f")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -n f g")).toBe("unsupported-command:cat");
+    expect(reasonOf("cat -n -f")).toBe("unsupported-command:cat");
+    // nl: every other style, split/shuffled flags, longs, counts, extra operands.
+    expect(reasonOf("nl f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -ba")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -bn f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -bp f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -bt f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -b a f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -ba -ba f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl --body-numbering=a f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -ba f g")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -ba -f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -v 2 -ba f")).toBe("unsupported-command:nl");
+    expect(reasonOf("nl -i 2 -ba f")).toBe("unsupported-command:nl");
+    // numbered source with a downstream filter is never a numbered view.
+    expect(reasonOf("cat -n f | head -5")).toBe("unsupported-pipeline");
+    expect(reasonOf("nl -ba f | head -5")).toBe("unsupported-pipeline");
+    expect(reasonOf("cat -n f | cat")).toBe("unsupported-pipeline");
   });
 });

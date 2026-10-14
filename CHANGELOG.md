@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Features
+* **bash-view:** admit Tier-2 view spellings to interception: explicit `-e` search patterns (separate, attached, cluster-close; exactly once), multi-range `sed -n -e RANGEp` merged at parse, and numbered `cat -n` / `nl -ba` sharing one full-file renderer. Malformed shapes fail closed to raw bash. (#82) (#120)
+
 ### Bug Fixes
 * **store:** quarantine and rebuild the hash store on the first statement that fails with a corruption error, instead of leaving the damage for the next open or janitor run. The guarded handle rethrows the original error, so callers still fail loud. (#100) (#119)
 

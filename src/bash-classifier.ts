@@ -48,6 +48,8 @@ export interface BashView {
   baseDir?: string;
   /** Slice ops in stream order, folded by `applySliceOps` over the line count. */
   ops: SliceOp[];
+  /** Present-and-true only for `cat -n FILE` / `nl -ba FILE`; absent means unnumbered. Optional so Tier-1 `toEqual` literals keep passing. */
+  lineNumbered?: boolean;
 }
 
 /**
@@ -113,9 +115,11 @@ const SEARCH_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
 
 /** The letters a bundled single-dash cluster may contain (spec §3.2). Any digit or unknown
  * letter anywhere in the cluster fails closed, so `-n5`, `-inQ` and `-x5` stay raw bash.
- * `m` is special-cased: it may only close the cluster and consumes the next argument
- * (`-nm 3`), while the attached forms (`-m3`, `-nm3`) fail closed. */
-const SEARCH_SHORT_LETTERS: ReadonlySet<string> = new Set(["n", "i", "F", "E", "w", "x", "m"]);
+ * `m` and `e` are special-cased: each may only close the cluster and consumes the next
+ * argument (`-nm 3`, `-ine pat`), while the attached `-m` forms (`-m3`, `-nm3`) fail closed.
+ * (`-ePAT` never reaches the cluster loop: any token starting `-e` is the attached
+ * explicit-pattern form and is handled before decomposition.) */
+const SEARCH_SHORT_LETTERS: ReadonlySet<string> = new Set(["n", "i", "F", "E", "w", "x", "m", "e"]);
 
 /** The attached long match-limit form only: `--max-count=N`. A bare `--max-count` (value as
  * a separate argument) fails closed — spec §3.2 admits the separate-argument spelling for
@@ -280,6 +284,7 @@ function defaultCount(name: "head" | "tail"): SliceOp {
 interface SourceStage {
   filePath: string;
   ops: SliceOp[];
+  lineNumbered?: boolean;
 }
 
 /** Stages that consume the source file: `cat FILE`, or a file-direct filter. */
@@ -290,8 +295,23 @@ function parseSourceStage(shape: StageShape): SourceStage | undefined {
   const stage = unwrapViewWrapper(shape);
   if (!stage) return undefined;
   if (stage.name === "cat") {
+    // WHY: (item 8) the numbered spelling is exactly `cat -n FILE`. A second flag,
+    // WHY: a long `--number`, an attached `-nFILE`, or a `-`-leading file all fail closed.
+    if (stage.args.length === 2 && stage.args[0] === "-n" && !stage.args[1].startsWith("-")) {
+      return { filePath: stage.args[1], ops: [], lineNumbered: true };
+    }
     if (stage.args.length !== 1 || stage.args[0].startsWith("-")) return undefined;
     return { filePath: stage.args[0], ops: [] };
+  }
+  // WHY: (item 8) the only admitted `nl` spelling is exactly `nl -ba FILE` (number all
+  // WHY: lines, the `cat -n` geometry). `-ba` attached differently (`-b a`,
+  // WHY: `--body-numbering=a`, `-bn`, `-bp`, `-bt`, `-v`, `-i`, `-s`, `-w`, `-n*`) and any
+  // WHY: extra operand all fail closed.
+  if (stage.name === "nl") {
+    if (stage.args.length !== 2 || stage.args[0] !== "-ba" || stage.args[1].startsWith("-")) {
+      return undefined;
+    }
+    return { filePath: stage.args[1], ops: [], lineNumbered: true };
   }
   if (stage.name === "head" || stage.name === "tail") {
     const selection = parseCountSelector(stage.name, stage.args);
@@ -313,13 +333,20 @@ function parseSourceStage(shape: StageShape): SourceStage | undefined {
  * before the pattern, between pattern and file, and after the file — because GNU grep/rg
  * accept post-operand options and the benchmark issues them (`grep pat -i f`). A bundled
  * single-dash cluster (`-in`, `-wF`) is decomposed and EVERY letter must be admitted; the
- * value-taking `m` may only close it (`-nm 3`). `--` ends flag parsing, so `grep pat -- -n`
- * names the file `-n`. Fail closed: attached short values (`-m3`, `-nm3`), any digit in a
- * cluster (`-n5`), an unknown letter (`-inQ`), every `=`-long form but `--max-count=N`
- * (`--line-number=x`, `--color=always`), a value that is not a strictly positive integer or
- * not exactly `never`, `-e`/`-f`, a `-`-leading pattern with no `--`, zero operands (stdin)
- * and two-or-more operands (filename prefixes break the `^\d+:` geometry). Globs, tildes and
- * expansions never reach here because `stageShape`/`literalValue` reject them first.
+ * value-taking `m` may only close it (`-nm 3`). The explicit-pattern `-e` is admitted in
+ * three spellings — separate (`-e PAT`), attached (`-ePAT`, handled before cluster
+ * decomposition since `PAT` letters are not admitted), and cluster-close (`-ine PAT`,
+ * mirroring `m`: must close, consumes the next argument) — exactly once; its value becomes
+ * THE pattern so the operands must then be exactly `[FILE]`. `--` ends flag parsing, so
+ * `grep pat -- -n` names the file `-n`. Fail closed: attached short values (`-m3`, `-nm3`),
+ * any digit in a cluster (`-n5`), an unknown letter (`-inQ`), every `=`-long form but
+ * `--max-count=N` (`--line-number=x`, `--color=always`), a value that is not a strictly
+ * positive integer or not exactly `never`, `-f` (stays denied: file-input patterns break
+ * the single-`PATTERN FILE` geometry), `-e` with no value, `-e` twice, a pattern both via
+ * `-e` and positionally, a `-`-leading pattern with no `--` (unless given via `-e`), zero
+ * operands (stdin) and two-or-more operands (filename prefixes break the `^\d+:` geometry).
+ * Globs, tildes and expansions never reach here because `stageShape`/`literalValue` reject
+ * them first.
  * Directory operands are deliberately NOT detected here: this module is pure and zero-fs, so
  * the lifecycle layer re-checks the resolved file kind.
  */
@@ -329,6 +356,7 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
   const operands: string[] = [];
   let lineNumbered = false;
   let separatorSeen = false;
+  let explicitPattern: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (!separatorSeen && arg === "--") {
@@ -349,8 +377,28 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
       }
       // WHY: every other `--…` token is an unlisted long option (`--json`, `--color=always`).
       if (arg.startsWith("--")) return undefined;
+      // WHY: explicit `-e` takes its pattern separately (`-e PAT`): exactly once, must have
+      // WHY: a next argument, which becomes THE pattern (so operands must then be `[FILE]`).
+      // WHY: a `-`-leading value is admitted here — that is the point of `-e`.
+      if (arg === "-e") {
+        if (explicitPattern !== undefined) return undefined;
+        const value = args.at(index + 1);
+        if (value === undefined) return undefined;
+        explicitPattern = value;
+        index += 1;
+        continue;
+      }
+      // WHY: attached `-ePAT` is handled BEFORE letter decomposition: `PAT...` letters are
+      // WHY: not admitted flags, so decomposing would misread the pattern as a cluster
+      // WHY: (`-efoo` is pattern `foo`, not flags `e`+`f`+`o`+`o`).
+      if (arg.startsWith("-e")) {
+        if (explicitPattern !== undefined) return undefined;
+        explicitPattern = arg.slice(2);
+        continue;
+      }
       // WHY: a single-dash token is a short cluster: every letter must be admitted, and the
-      // WHY: value-taking `m` may only close it, consuming the following argument (`-nm 3`).
+      // WHY: value-taking `m`/`e` may only close it, each consuming the next argument
+      // WHY: (`-nm 3`, `-ine pat`).
       const letters = arg.slice(1).split("");
       if (letters.length === 0) return undefined;
       for (let position = 0; position < letters.length; position++) {
@@ -362,6 +410,14 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
           if (!isPositiveCount(args.at(index + 1))) return undefined;
           index += 1;
         }
+        if (letter === "e") {
+          if (position !== letters.length - 1) return undefined;
+          if (explicitPattern !== undefined) return undefined;
+          const value = args.at(index + 1);
+          if (value === undefined) return undefined;
+          explicitPattern = value;
+          index += 1;
+        }
       }
       continue;
     }
@@ -369,6 +425,21 @@ function parseSearchStage(stage: StageShape): BashSearch | undefined {
   }
   // WHY: exactly two operands — the pattern and the one file. `grep pat` searches stdin, and
   // WHY: `grep pat a b` prints `file:` prefixes, so both fail closed to raw bash.
+  // WHY: with `-e` the value IS the pattern, so exactly one operand (the file) must remain;
+  // WHY: two operands with `-e` means the pattern came both ways and fails closed.
+  // WHY: (item-9/10 gate preserved: no new operand shape is admitted, only the count shifts
+  // WHY: from 2 to 1 when `-e` supplies the pattern.)
+  if (explicitPattern !== undefined) {
+    if (operands.length !== 1) return undefined;
+    const filePath = operands[0];
+    if (filePath === undefined) return undefined;
+    return {
+      program: stage.name as SearchProgram,
+      pattern: explicitPattern,
+      filePath,
+      lineNumbered,
+    };
+  }
   if (operands.length !== 2) return undefined;
   const [pattern, filePath] = operands;
   return { program: stage.name as SearchProgram, pattern, filePath, lineNumbered };
@@ -398,16 +469,62 @@ function parseFilterStage(shape: StageShape): SliceOp[] | undefined {
   return undefined;
 }
 
-/** Exactly `-n PROG [FILE]` with `PROG` numeric print (R4 strict regex). */
+/**
+ * Sort + merge 1-indexed inclusive print ranges into sorted non-overlapping
+ * `SliceOp[]`. Overlap (`[1,5]+[3,7]`→`[1,7]`) and adjacency (`[1,3]+[4,5]`→`[1,5]`,
+ * no gap between them so nothing unprinted is added) collapse; disjoint ranges
+ * keep their order after sorting. Pure — no I/O, total over its input.
+ */
+function mergeRangeOps(ranges: ReadonlyArray<{ from: number; to: number }>): SliceOp[] {
+  const sorted = [...ranges].sort((a, b) => a.from - b.from || a.to - b.to);
+  const ops: SliceOp[] = [];
+  for (const range of sorted) {
+    const last = ops[ops.length - 1];
+    if (last !== undefined && last.kind === "range" && range.from <= last.to + 1) {
+      if (range.to > last.to) last.to = range.to;
+    } else {
+      ops.push({ kind: "range", from: range.from, to: range.to });
+    }
+  }
+  return ops;
+}
+
+/** `-n PROG [FILE]` or `-n -e PROG [-e PROG …] [FILE]`; every PROG numeric print (R4 strict regex, reused). */
 function parseSedArgs(args: string[]): { ops: SliceOp[]; file?: string } | undefined {
-  if (args.length !== 2 && args.length !== 3) return undefined;
-  if (args[0] !== "-n") return undefined;
-  const printed = SED_NUMERIC_PRINT.exec(args[1]);
-  if (!printed) return undefined;
-  const from = Number(printed[1]);
-  const to = printed[3] === undefined ? from : Number(printed[3]);
-  const ops: SliceOp[] = [{ kind: "range", from, to }];
-  return args.length === 3 ? { ops, file: args[2] } : { ops };
+  if (args.length < 2 || args[0] !== "-n") return undefined;
+  if (args[1] !== "-e") {
+    // WHY: legacy spelling keeps working byte-identically — contract.
+    if (args.length !== 2 && args.length !== 3) return undefined;
+    const printed = SED_NUMERIC_PRINT.exec(args[1]);
+    if (!printed) return undefined;
+    const from = Number(printed[1]);
+    const to = printed[3] === undefined ? from : Number(printed[3]);
+    if (to < from) return undefined; // WHY: reversed `10,1p` fails closed (strict-print spirit)
+    const ops: SliceOp[] = [{ kind: "range", from, to }];
+    return args.length === 3 ? { ops, file: args[2] } : { ops };
+  }
+  // WHY: multi-range shape `-n (-e PROG)+ [FILE]` — the loop consumes `-e PROG`
+  // WHY: pairs; the first non-`-e` token (if any) is the optional trailing FILE,
+  // WHY: which must also be the LAST token.
+  const ranges: Array<{ from: number; to: number }> = [];
+  let index = 1;
+  while (index < args.length) {
+    if (args[index] !== "-e") break;
+    const prog = args[index + 1];
+    if (prog === undefined) return undefined; // WHY: dangling `-e`
+    const printed = SED_NUMERIC_PRINT.exec(prog);
+    if (!printed) return undefined; // WHY: ANY unparseable spec fails the WHOLE stage — never partial
+    const from = Number(printed[1]);
+    const to = printed[3] === undefined ? from : Number(printed[3]);
+    if (to < from) return undefined; // WHY: reversed `10,1p` fails closed (strict-print spirit)
+    ranges.push({ from, to });
+    index += 2;
+  }
+  if (ranges.length === 0) return undefined;
+  const rest = args.length - index;
+  if (rest !== 0 && rest !== 1) return undefined; // WHY: zero or one trailing token: the optional FILE
+  const ops = mergeRangeOps(ranges);
+  return rest === 1 ? { ops, file: args[index] } : { ops };
 }
 
 interface SilentSeg {
@@ -419,6 +536,7 @@ interface ViewSeg {
   kind: "view";
   filePath: string;
   ops: SliceOp[];
+  lineNumbered?: boolean;
 }
 
 interface SearchSeg {
@@ -478,7 +596,12 @@ function parseViewSegment(node: Command | Pipeline): ViewSeg | undefined {
     if (!stage) return undefined;
     const source = parseSourceStage(stage);
     if (!source) return undefined;
-    return { kind: "view", filePath: source.filePath, ops: source.ops };
+    return {
+      kind: "view",
+      filePath: source.filePath,
+      ops: source.ops,
+      ...(source.lineNumbered === true ? { lineNumbered: true } : {}),
+    };
   }
   if (node.operators.some((op) => op !== "|")) return undefined;
   if (node.commands.length < 2 || node.commands.length > BASH_VIEW_MAX_PIPELINE_STAGES) {
@@ -497,6 +620,9 @@ function parseViewSegment(node: Command | Pipeline): ViewSeg | undefined {
     if (index === 0) {
       const source = parseSourceStage(stage);
       if (!source) return undefined;
+      // WHY: (item 8) the numbered geometry is full-file display only; any downstream
+      // WHY: filter would silently drop numbered rows while claiming full-file leases.
+      if (source.lineNumbered === true) return undefined;
       filePath = source.filePath;
       ops.push(...source.ops);
       continue;
@@ -516,7 +642,13 @@ function classifySegment(node: Command | Pipeline, prefixPosition = false): Segm
     const silent = parseSilent(stage, prefixPosition);
     if (silent) return silent;
     const source = parseSourceStage(stage);
-    if (source) return { kind: "view", filePath: source.filePath, ops: source.ops };
+    if (source)
+      return {
+        kind: "view",
+        filePath: source.filePath,
+        ops: source.ops,
+        ...(source.lineNumbered === true ? { lineNumbered: true } : {}),
+      };
     const search = parseSearchStage(stage);
     if (search) return { kind: "search", search };
     return { kind: "unsafe", reason: `unsupported-command:${stage.name}` };
@@ -676,8 +808,17 @@ function classifyBash(command: string, located: { searchNameEnd?: number }): Bas
     kind: "pureView",
     view:
       baseDir === undefined
-        ? { filePath: view.filePath, ops: view.ops }
-        : { filePath: view.filePath, baseDir, ops: view.ops },
+        ? {
+            filePath: view.filePath,
+            ops: view.ops,
+            ...(view.lineNumbered === true ? { lineNumbered: true } : {}),
+          }
+        : {
+            filePath: view.filePath,
+            baseDir,
+            ops: view.ops,
+            ...(view.lineNumbered === true ? { lineNumbered: true } : {}),
+          },
   };
 }
 
