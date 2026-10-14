@@ -1186,7 +1186,7 @@ export async function healUnhealthyStore(budget?: BusyBudget): Promise<boolean> 
  * teardown (`shutdownDb`'s checkpoint, `close`) keeps working through the guard.
  */
 function guardDatabaseHandle(raw: DatabaseSync, storePath: string): DatabaseSync {
-  // WHY the originals are captured here: doubles installed on the handle afterwards (notably
+  // WHY: the originals are captured here — doubles installed on the handle afterwards (notably
   // WHY: `vi.spyOn`, whose defineProperty forwards onto the raw connection) land as OWN
   // WHY: properties. If the wrappers below called `target.exec`/`target.prepare`, they would hit
   // WHY: the double, and a call-through double recurses wrapper → double → wrapper. On a fresh
@@ -1196,7 +1196,7 @@ function guardDatabaseHandle(raw: DatabaseSync, storePath: string): DatabaseSync
   const guarded: DatabaseSync = new Proxy(raw, {
     get(target, property) {
       if (property === "prepare" || property === "exec") {
-        // WHY own properties win: a double must observe every call — including the guard's own —
+        // WHY: own properties win — a double must observe every call, including the guard's own,
         // WHY: or call-through doubles recurse. The guard stays armed underneath: the double
         // WHY: reaches the real method through the capture above, never through this trap.
         if (Object.prototype.hasOwnProperty.call(target, property)) {
@@ -1239,7 +1239,7 @@ function guardStatement(
   generation: DatabaseSync,
   storePath: string,
 ): StatementSync {
-  // WHY the capture mirrors the handle's: a double installed on a statement afterwards must see
+  // WHY: the capture mirrors the handle's — a double installed on a statement afterwards must see
   // WHY: through to the real method, or a call-through double recurses wrapper → double → wrapper.
   const rawMethods = new Map<string, (...args: unknown[]) => unknown>();
   for (const method of GUARDED_STATEMENT_METHODS) {
@@ -1255,7 +1255,7 @@ function guardStatement(
           const override: unknown = Reflect.get(target, property, target);
           return typeof override === "function" ? override.bind(target) : override;
         }
-        // WHY the `!`: the map above is filled from this same method set on a real statement, so
+        // WHY: the `!` — the map above is filled from this same method set on a real statement, so
         // WHY: the entry always exists; the assertion keeps the absence unrepresentable instead of
         // WHY: silently returning undefined for a missing method.
         const raw = rawMethods.get(property)!;
@@ -1294,7 +1294,7 @@ function guardIterator(
   generation: DatabaseSync,
   storePath: string,
 ): IterableIterator<unknown> {
-  // WHY the capture mirrors the handle's: the same double-recursion hazard applies to `next`.
+  // WHY: the capture mirrors the handle's — the same double-recursion hazard applies to `next`.
   const rawNext = iterator.next.bind(iterator) as (...args: unknown[]) => unknown;
   return new Proxy(iterator, {
     get(target, property) {
