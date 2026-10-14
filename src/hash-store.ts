@@ -1185,20 +1185,25 @@ export async function healUnhealthyStore(budget?: BusyBudget): Promise<boolean> 
  * `prepare`/`exec` forward bound to the raw connection, so native-method receivers stay valid and
  * teardown (`shutdownDb`'s checkpoint, `close`) keeps working through the guard.
  */
+/**
+ * WHY watched methods resolve through the LIVE prototype on every call instead of being captured
+ * WHY: when the handle is wrapped: the suite patches `DatabaseSync.prototype` (statement tracers,
+ * WHY: `quick_check` counters) and those patches must observe guarded-handle calls exactly as they
+ * WHY: observe raw ones. Instance own-property doubles (`vi.spyOn`) are handled one layer up —
+ * WHY: the traps return those directly — so this lookup never sees a double.
+ */
+function realMethod(target: object, property: string): (...args: unknown[]) => unknown {
+  const value: unknown = Reflect.get(Object.getPrototypeOf(target), property);
+  return (value as (...args: unknown[]) => unknown).bind(target);
+}
+
 function guardDatabaseHandle(raw: DatabaseSync, storePath: string): DatabaseSync {
-  // WHY: the originals are captured here — doubles installed on the handle afterwards (notably
-  // WHY: `vi.spyOn`, whose defineProperty forwards onto the raw connection) land as OWN
-  // WHY: properties. If the wrappers below called `target.exec`/`target.prepare`, they would hit
-  // WHY: the double, and a call-through double recurses wrapper → double → wrapper. On a fresh
-  // WHY: connection these members live on the prototype, so this capture is the real method.
-  const rawExec = raw.exec.bind(raw);
-  const rawPrepare = raw.prepare.bind(raw);
   const guarded: DatabaseSync = new Proxy(raw, {
     get(target, property) {
       if (property === "prepare" || property === "exec") {
         // WHY: own properties win — a double must observe every call, including the guard's own,
         // WHY: or call-through doubles recurse. The guard stays armed underneath: the double
-        // WHY: reaches the real method through the capture above, never through this trap.
+        // WHY: reaches the real method through the live prototype below, never through this trap.
         if (Object.prototype.hasOwnProperty.call(target, property)) {
           const override: unknown = Reflect.get(target, property, target);
           return typeof override === "function" ? override.bind(target) : override;
@@ -1207,7 +1212,7 @@ function guardDatabaseHandle(raw: DatabaseSync, storePath: string): DatabaseSync
           return (sql: string) => {
             let statement: StatementSync;
             try {
-              statement = rawPrepare(sql);
+              statement = realMethod(target, "prepare")(sql) as StatementSync;
             } catch (error) {
               triggerUseTimeHeal(guarded, storePath, error);
               throw error;
@@ -1217,7 +1222,7 @@ function guardDatabaseHandle(raw: DatabaseSync, storePath: string): DatabaseSync
         }
         return (sql: string) => {
           try {
-            rawExec(sql);
+            realMethod(target, "exec")(sql);
           } catch (error) {
             triggerUseTimeHeal(guarded, storePath, error);
             throw error;
@@ -1239,15 +1244,6 @@ function guardStatement(
   generation: DatabaseSync,
   storePath: string,
 ): StatementSync {
-  // WHY: the capture mirrors the handle's — a double installed on a statement afterwards must see
-  // WHY: through to the real method, or a call-through double recurses wrapper → double → wrapper.
-  const rawMethods = new Map<string, (...args: unknown[]) => unknown>();
-  for (const method of GUARDED_STATEMENT_METHODS) {
-    const value: unknown = Reflect.get(statement, method, statement);
-    if (typeof value === "function") {
-      rawMethods.set(method, (value as (...args: unknown[]) => unknown).bind(statement));
-    }
-  }
   return new Proxy(statement, {
     get(target, property) {
       if (typeof property === "string" && GUARDED_STATEMENT_METHODS.has(property)) {
@@ -1255,10 +1251,10 @@ function guardStatement(
           const override: unknown = Reflect.get(target, property, target);
           return typeof override === "function" ? override.bind(target) : override;
         }
-        // WHY: the `!` — the map above is filled from this same method set on a real statement, so
-        // WHY: the entry always exists; the assertion keeps the absence unrepresentable instead of
-        // WHY: silently returning undefined for a missing method.
-        const raw = rawMethods.get(property)!;
+        // WHY: resolve through the live prototype on every call (see `realMethod`): prototype
+        // WHY: patches must observe these calls exactly as raw ones, and own-property doubles are
+        // WHY: already returned above, so this lookup never sees a double.
+        const raw = realMethod(target, property);
         if (property === "iterate") {
           return (...args: unknown[]) => {
             try {
