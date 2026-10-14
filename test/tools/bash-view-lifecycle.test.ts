@@ -1089,3 +1089,125 @@ describe("bash search interception (I1a #73)", () => {
     });
   });
 });
+
+describe("bash multi-range sed lifecycle (Tier-2 item 7)", () => {
+  it("intercepts merged multi-range sed and leases exactly the union", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      await writeFile(join(dir, "f.txt"), numberedLines(30), "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-sed-multi" } };
+
+      // WHY: '16,18p'+'17,20p' merge at parse to [16,20]; stdout must equal
+      // WHY: exactly that slice or the D9 byte gate fails closed.
+      const sliceStdout = `${Array.from({ length: 5 }, (_, i) => `line${i + 16}`).join("\n")}\n`;
+      const result = await bashResult(
+        handler!,
+        "sed -n -e '16,18p' -e '17,20p' f.txt",
+        ctx,
+        sliceStdout,
+      );
+      expect(result).toBeDefined();
+      const rows = rowsOf(result!.content[0]!.text);
+      expect(rows).toHaveLength(5);
+      for (const n of [16, 17, 18, 19, 20]) {
+        expect(rows.some((line) => line.endsWith(`│line${n}`))).toBe(true);
+      }
+      expect(rows.some((line) => line.endsWith("│line15"))).toBe(false);
+      expect(rows.some((line) => line.endsWith("│line21"))).toBe(false);
+      // WHY: least privilege before the first edit: line5 was never served, so its
+      // WHY: anchor — though valid content — carries no lease and fails closed.
+      // WHY: (After any successful edit the commit re-serves the whole file, so
+      // WHY: this scoping holds until the session's first successful mutation.)
+      const allHashes = await lineHashes(numberedLines(30), join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e0",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[4]!, anchor_to: allHashes[4]!, text: "LINE5" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+
+      const ok = await editTool.execute(
+        "e1",
+        {
+          file: "f.txt",
+          edits: [
+            {
+              anchor_from: anchorFor(rows, "line18"),
+              anchor_to: anchorFor(rows, "line18"),
+              text: "LINE18",
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.isError).toBeFalsy();
+    });
+  });
+
+  it("passes through disjoint multi-range sed (fold-inert) with no leases", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      await writeFile(join(dir, "f.txt"), numberedLines(30), "utf-8");
+      const { pi, handlers, getTool } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const editTool = getTool("edit");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-sed-disjoint" } };
+
+      // WHY: disjoint [1,1],[30,30] cannot survive the sequential stream-relative
+      // WHY: fold — the second range selects inside the first selection, yielding
+      // WHY: empty — so D3 passes through and grants nothing. True sed would print
+      // WHY: line1+line30; serving raw is the safe answer until a union-aware op
+      // WHY: exists. Pass-through either way.
+      expect(
+        await bashResult(handler!, "sed -n -e '1p' -e '30p' f.txt", ctx, "line1\nline30\n"),
+      ).toBeUndefined();
+      const allHashes = await lineHashes(numberedLines(30), join(dir, "f.txt"));
+      await expect(
+        editTool.execute(
+          "e1",
+          {
+            file: "f.txt",
+            edits: [{ anchor_from: allHashes[0]!, anchor_to: allHashes[0]!, text: "LINE1" }],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow("E_UNKNOWN_ANCHOR");
+    });
+  });
+
+  it("passes through mixed valid+garbage, reversed, and ;-joined sed spells", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      await writeFile(join(dir, "f.txt"), numberedLines(5), "utf-8");
+      const { pi, handlers } = makeFakePi();
+      register(pi);
+      const handler = handlers.get("tool_result");
+      const ctx = { cwd: dir, sessionManager: { getSessionId: () => "bash-view-sed-deny" } };
+
+      for (const command of [
+        "sed -n -e '2p' -e 's/a/b/p' f.txt",
+        "sed -n -e '2p' -e '/re/p' f.txt",
+        "sed -n -e '4,2p' f.txt",
+        "sed -n '4,2p' f.txt",
+        "sed -n -e '1p;2p' f.txt",
+        "sed -n '1p;2p' f.txt",
+        "sed -n '2p' -e '3p' f.txt",
+        "sed -n -e '2p' f.txt extra.txt",
+      ]) {
+        expect(await bashResult(handler!, command, ctx, "<<raw stdout>>")).toBeUndefined();
+      }
+    });
+  });
+});

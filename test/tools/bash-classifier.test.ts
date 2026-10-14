@@ -785,3 +785,98 @@ describe("bash-classifier search -e matrix (Tier-2 item 6)", () => {
     expect(withSearchLineNumbers("grep -e a b f")).toBe("grep -e a b f");
   });
 });
+
+describe("bash-classifier sed multi-range -e matrix (Tier-2 item 7)", () => {
+  it("admits -n -e RANGEp [-e RANGEp …] and merges at parse", () => {
+    // WHY: disjoint ranges survive parse sorted and separate; the D3/D9
+    // WHY: serve-time gates (not the classifier) decide their fate.
+    expect(viewOf("sed -n -e '1p' -e '10p' f")).toEqual({
+      filePath: "f",
+      ops: [
+        { kind: "range", from: 1, to: 1 },
+        { kind: "range", from: 10, to: 10 },
+      ],
+    });
+    // WHY: overlap merges to the union — no gap, nothing unprinted is added.
+    expect(viewOf("sed -n -e '1,5p' -e '3,7p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 1, to: 7 }],
+    });
+    // WHY: adjacency merges ([1,3]+[4,5] prints exactly 1..5, contiguous).
+    expect(viewOf("sed -n -e '1,3p' -e '4,5p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 1, to: 5 }],
+    });
+    // WHY: unsorted input is sorted at parse; containment collapses inward.
+    expect(viewOf("sed -n -e '10,12p' -e '1,2p' f")).toEqual({
+      filePath: "f",
+      ops: [
+        { kind: "range", from: 1, to: 2 },
+        { kind: "range", from: 10, to: 12 },
+      ],
+    });
+    expect(viewOf("sed -n -e '2p' -e '2p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 2, to: 2 }],
+    });
+    expect(viewOf("sed -n -e '1,10p' -e '3,4p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 1, to: 10 }],
+    });
+    // WHY: a three-spec chain bridges through the middle spec.
+    expect(viewOf("sed -n -e '1,2p' -e '5,6p' -e '3,4p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 1, to: 6 }],
+    });
+    // WHY: a single -e pair is the degenerate multi-range shape.
+    expect(viewOf("sed -n -e '5p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 5, to: 5 }],
+    });
+    // WHY: the legacy spelling keeps working byte-identically (contract).
+    expect(viewOf("sed -n '20,128p' f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 20, to: 128 }],
+    });
+    expect(viewOf("sed -n 5p f")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 5, to: 5 }],
+    });
+    // WHY: no-file multi-range is the pipeline filter position (parseFilterStage).
+    expect(viewOf("cat f | sed -n -e '3,7p' -e '5,9p'")).toEqual({
+      filePath: "f",
+      ops: [{ kind: "range", from: 3, to: 9 }],
+    });
+  });
+
+  it("fails the whole stage closed on any unparseable spec (never partial)", () => {
+    // WHY: mixed valid+garbage denies the stage even though '1p' alone is fine.
+    expect(reasonOf("sed -n -e '1p' -e 's/a/b/p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -e '/re/p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -e '1,5w out' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -e '1,5d' f")).toBe("unsupported-command:sed");
+    // WHY: reversed ranges fail closed in BOTH spellings (strict-print spirit;
+    // WHY: legacy `10,1p` was previously admitted by the parser and died at
+    // WHY: serve time — now it is denied at parse; recorded choice).
+    expect(reasonOf("sed -n -e '10,1p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n '10,1p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '5p' -e '10,1p' f")).toBe("unsupported-command:sed");
+    // WHY: `;`-joined multi-range stays raw — `;` is not in the strict regex,
+    // WHY: so the single PROG is unparseable and the stage is denied whole.
+    expect(reasonOf("sed -n -e '1p;2p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n '1p;2p' f")).toBe("unsupported-command:sed");
+    // WHY: shape hazards — dangling -e, mixed legacy+-e, file-not-last,
+    // WHY: two files, -e without -n, -n without pairs.
+    expect(reasonOf("sed -n -e '1p' -e f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n '5p' -e '6p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' f -e '2p'")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -e '2p' f g")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -e '1p' -e '2p' f")).toBe("unsupported-command:sed");
+    expect(reasonOf("sed -n -e '1p' -- f")).toBe("unsupported-command:sed");
+    // WHY: pipeline position denies with the pipeline reason, not the command one.
+    expect(reasonOf("cat f | sed -n -e '1p' -e 'oops'")).toBe("unsupported-pipeline");
+    expect(reasonOf("cat f | sed -n -e '9,2p'")).toBe("unsupported-pipeline");
+  });
+});

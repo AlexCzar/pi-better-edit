@@ -451,16 +451,62 @@ function parseFilterStage(shape: StageShape): SliceOp[] | undefined {
   return undefined;
 }
 
-/** Exactly `-n PROG [FILE]` with `PROG` numeric print (R4 strict regex). */
+/**
+ * Sort + merge 1-indexed inclusive print ranges into sorted non-overlapping
+ * `SliceOp[]`. Overlap (`[1,5]+[3,7]`→`[1,7]`) and adjacency (`[1,3]+[4,5]`→`[1,5]`,
+ * no gap between them so nothing unprinted is added) collapse; disjoint ranges
+ * keep their order after sorting. Pure — no I/O, total over its input.
+ */
+function mergeRangeOps(ranges: ReadonlyArray<{ from: number; to: number }>): SliceOp[] {
+  const sorted = [...ranges].sort((a, b) => a.from - b.from || a.to - b.to);
+  const ops: SliceOp[] = [];
+  for (const range of sorted) {
+    const last = ops[ops.length - 1];
+    if (last !== undefined && last.kind === "range" && range.from <= last.to + 1) {
+      if (range.to > last.to) last.to = range.to;
+    } else {
+      ops.push({ kind: "range", from: range.from, to: range.to });
+    }
+  }
+  return ops;
+}
+
+/** `-n PROG [FILE]` or `-n -e PROG [-e PROG …] [FILE]`; every PROG numeric print (R4 strict regex, reused). */
 function parseSedArgs(args: string[]): { ops: SliceOp[]; file?: string } | undefined {
-  if (args.length !== 2 && args.length !== 3) return undefined;
-  if (args[0] !== "-n") return undefined;
-  const printed = SED_NUMERIC_PRINT.exec(args[1]);
-  if (!printed) return undefined;
-  const from = Number(printed[1]);
-  const to = printed[3] === undefined ? from : Number(printed[3]);
-  const ops: SliceOp[] = [{ kind: "range", from, to }];
-  return args.length === 3 ? { ops, file: args[2] } : { ops };
+  if (args.length < 2 || args[0] !== "-n") return undefined;
+  if (args[1] !== "-e") {
+    // Legacy shape: exactly `-n PROG [FILE]`, unchanged.
+    if (args.length !== 2 && args.length !== 3) return undefined;
+    const printed = SED_NUMERIC_PRINT.exec(args[1]);
+    if (!printed) return undefined;
+    const from = Number(printed[1]);
+    const to = printed[3] === undefined ? from : Number(printed[3]);
+    if (to < from) return undefined; // reversed `10,1p` fails closed (strict-print spirit)
+    const ops: SliceOp[] = [{ kind: "range", from, to }];
+    return args.length === 3 ? { ops, file: args[2] } : { ops };
+  }
+  // Multi-range shape: `-n (-e PROG)+ [FILE]`. The loop consumes `-e PROG`
+  // pairs; the first non-`-e` token (if any) is the optional trailing FILE,
+  // which must also be the LAST token.
+  const ranges: Array<{ from: number; to: number }> = [];
+  let index = 1;
+  while (index < args.length) {
+    if (args[index] !== "-e") break;
+    const prog = args[index + 1];
+    if (prog === undefined) return undefined; // dangling `-e`
+    const printed = SED_NUMERIC_PRINT.exec(prog);
+    if (!printed) return undefined; // ANY unparseable spec fails the WHOLE stage — never partial
+    const from = Number(printed[1]);
+    const to = printed[3] === undefined ? from : Number(printed[3]);
+    if (to < from) return undefined; // reversed `10,1p` fails closed (strict-print spirit)
+    ranges.push({ from, to });
+    index += 2;
+  }
+  if (ranges.length === 0) return undefined;
+  const rest = args.length - index;
+  if (rest !== 0 && rest !== 1) return undefined; // zero or one trailing token: the optional FILE
+  const ops = mergeRangeOps(ranges);
+  return rest === 1 ? { ops, file: args[index] } : { ops };
 }
 
 interface SilentSeg {
