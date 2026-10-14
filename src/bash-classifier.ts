@@ -295,7 +295,7 @@ function parseSourceStage(shape: StageShape): SourceStage | undefined {
   const stage = unwrapViewWrapper(shape);
   if (!stage) return undefined;
     if (stage.name === "cat") {
-      // WHY (item 8): the numbered spelling is exactly `cat -n FILE`. A second flag,
+      // WHY: (item 8) the numbered spelling is exactly `cat -n FILE`. A second flag,
       // WHY: a long `--number`, an attached `-nFILE`, or a `-`-leading file all fail closed.
       if (stage.args.length === 2 && stage.args[0] === "-n" && !stage.args[1].startsWith("-")) {
         return { filePath: stage.args[1], ops: [], lineNumbered: true };
@@ -303,7 +303,7 @@ function parseSourceStage(shape: StageShape): SourceStage | undefined {
       if (stage.args.length !== 1 || stage.args[0].startsWith("-")) return undefined;
       return { filePath: stage.args[0], ops: [] };
     }
-    // WHY (item 8): the only admitted `nl` spelling is exactly `nl -ba FILE` (number all
+    // WHY: (item 8) the only admitted `nl` spelling is exactly `nl -ba FILE` (number all
     // WHY: lines, the `cat -n` geometry). `-ba` attached differently (`-b a`,
     // WHY: `--body-numbering=a`, `-bn`, `-bp`, `-bt`, `-v`, `-i`, `-s`, `-w`, `-n*`) and any
     // WHY: extra operand all fail closed.
@@ -493,36 +493,36 @@ function mergeRangeOps(ranges: ReadonlyArray<{ from: number; to: number }>): Sli
 function parseSedArgs(args: string[]): { ops: SliceOp[]; file?: string } | undefined {
   if (args.length < 2 || args[0] !== "-n") return undefined;
   if (args[1] !== "-e") {
-    // Legacy shape: exactly `-n PROG [FILE]`, unchanged.
+    // WHY: legacy spelling keeps working byte-identically — contract.
     if (args.length !== 2 && args.length !== 3) return undefined;
     const printed = SED_NUMERIC_PRINT.exec(args[1]);
     if (!printed) return undefined;
     const from = Number(printed[1]);
     const to = printed[3] === undefined ? from : Number(printed[3]);
-    if (to < from) return undefined; // reversed `10,1p` fails closed (strict-print spirit)
+    if (to < from) return undefined; // WHY: reversed `10,1p` fails closed (strict-print spirit)
     const ops: SliceOp[] = [{ kind: "range", from, to }];
     return args.length === 3 ? { ops, file: args[2] } : { ops };
   }
-  // Multi-range shape: `-n (-e PROG)+ [FILE]`. The loop consumes `-e PROG`
-  // pairs; the first non-`-e` token (if any) is the optional trailing FILE,
-  // which must also be the LAST token.
+  // WHY: multi-range shape `-n (-e PROG)+ [FILE]` — the loop consumes `-e PROG`
+  // WHY: pairs; the first non-`-e` token (if any) is the optional trailing FILE,
+  // WHY: which must also be the LAST token.
   const ranges: Array<{ from: number; to: number }> = [];
   let index = 1;
   while (index < args.length) {
     if (args[index] !== "-e") break;
     const prog = args[index + 1];
-    if (prog === undefined) return undefined; // dangling `-e`
+    if (prog === undefined) return undefined; // WHY: dangling `-e`
     const printed = SED_NUMERIC_PRINT.exec(prog);
-    if (!printed) return undefined; // ANY unparseable spec fails the WHOLE stage — never partial
+    if (!printed) return undefined; // WHY: ANY unparseable spec fails the WHOLE stage — never partial
     const from = Number(printed[1]);
     const to = printed[3] === undefined ? from : Number(printed[3]);
-    if (to < from) return undefined; // reversed `10,1p` fails closed (strict-print spirit)
+    if (to < from) return undefined; // WHY: reversed `10,1p` fails closed (strict-print spirit)
     ranges.push({ from, to });
     index += 2;
   }
   if (ranges.length === 0) return undefined;
   const rest = args.length - index;
-  if (rest !== 0 && rest !== 1) return undefined; // zero or one trailing token: the optional FILE
+  if (rest !== 0 && rest !== 1) return undefined; // WHY: zero or one trailing token: the optional FILE
   const ops = mergeRangeOps(ranges);
   return rest === 1 ? { ops, file: args[index] } : { ops };
 }
@@ -620,7 +620,7 @@ function parseViewSegment(node: Command | Pipeline): ViewSeg | undefined {
     if (index === 0) {
       const source = parseSourceStage(stage);
       if (!source) return undefined;
-      // WHY (item 8): the numbered geometry is full-file display only; any downstream
+      // WHY: (item 8) the numbered geometry is full-file display only; any downstream
       // WHY: filter would silently drop numbered rows while claiming full-file leases.
       if (source.lineNumbered === true) return undefined;
       filePath = source.filePath;

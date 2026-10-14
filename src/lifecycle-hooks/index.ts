@@ -116,7 +116,7 @@ function parseNumberedStdout(observed: string): string[] | undefined {
   for (let i = 0; i < lines.length; i++) {
     const parsed = NUMBERED_STDOUT_LINE.exec(lines[i]);
     if (!parsed) return undefined;
-    // Strict 1-based sequencing: `cat -n`/`nl -ba` number every line from 1.
+    // WHY: strict 1-based sequencing — `cat -n`/`nl -ba` number every line from 1.
     if (Number(parsed[1]) !== i + 1) return undefined;
     out.push(parsed[2]);
   }
@@ -537,11 +537,11 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
         return undefined;
       }
       const { filePath, baseDir, ops, lineNumbered } = classification.view;
-      // WHY (item 8): numbered and unnumbered are the same view — full-file, leased.
+      // WHY: (item 8) numbered and unnumbered are the same view — full-file, leased.
       // WHY: `lineNumbered` only selects the stdout-verification parser; leases and render
       // WHY: always come from re-read positions, never from parsed stdout numbers.
       const isNumbered = lineNumbered === true;
-      // WHY (item 8): numbered views admit no slice ops — the classifier only emits
+      // WHY: (item 8) numbered views admit no slice ops — the classifier only emits
       // WHY: `ops: []` with the marker, but defense-in-depth fails closed on any drift.
       if (isNumbered && ops.length !== 0) return undefined;
       // WHY: the single pre-view literal `cd` re-bases relative resolution; an absolute
@@ -593,7 +593,7 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
       // WHY: `;`-chain gate lives in the classifier.
       const observedText = toLF(stripBOM(stdoutText).text);
       if (isNumbered) {
-        // WHY (item 8): strip display numbers, then the SAME byte-equality gate as below.
+        // WHY: (item 8) strip display numbers, then the SAME byte-equality gate as below.
         // WHY: the numbers are never trusted as coordinates — positions come from `intervals`
         // WHY: (full-file here), and a row-count or content mismatch fails closed with no lease.
         const deNumbered = parseNumberedStdout(observedText);
