@@ -1,7 +1,7 @@
 // SAFETY: large-class — hasher module owns single wasm instance and helpers as cohesive unit; no split needed.
 import { closeSync, existsSync, fstatSync, openSync, readSync } from "node:fs";
 import { rename, mkdir } from "node:fs/promises";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { errCode } from "./utils.js";
@@ -318,6 +318,14 @@ interface OpenedDb {
 
 let cachedDb: { path: string; db: DatabaseSync } | null = null;
 let opening: { path: string; promise: Promise<HashStore> } | null = null;
+/**
+ * The use-time quarantine (#100) currently armed, or `null` when no statement has recently
+ * proved the cached store corrupt. The trigger sets this SYNCHRONOUSLY — capture, flag-set
+ * and cache check run with no await between them, so the section is atomic — and the runner
+ * clears it when the heal settles. `loadHashStore` joins it, so the access after a loud failure
+ * lands on the rebuilt store instead of the damaged one.
+ */
+let useTimeHeal: { generation: DatabaseSync; promise: Promise<void> } | null = null;
 let exitHandlerRegistered = false;
 
 /**
@@ -1134,8 +1142,10 @@ function shutdownDb(db: DatabaseSync): void {
  * `shutdownHashStore`, then `quarantineStore`, then `openStore` — and every piece of state it drops
  * is re-derivable, because the store is a disposable cache: the served mirror, the snapshots and
  * their lineage are all rebuilt from the files on disk. What it does NOT
- * do is reach a second QUARANTINE implementation: there is ONE (`quarantineStore`), with TWO
- * orchestrations calling it — this heal and the open path's own recovery — and it
+ * do is reach a second QUARANTINE implementation: there is ONE (`quarantineStore`), with THREE
+ * orchestrations calling it — this heal, the open path's own recovery, and the use-time trigger
+ * (`triggerUseTimeHeal`), which skips the health re-check because the failing statement already
+ * proved the damage — and it
  * does NOT touch a store that is currently inside a transaction of its own: the janitor runs at a
  * lifecycle boundary, where no tool call of this session is in flight, and any statement prepared on
  * the closed connection afterwards fails closed on the reopened one's absence rather than silently
@@ -1159,6 +1169,154 @@ export async function healUnhealthyStore(budget?: BusyBudget): Promise<boolean> 
   await quarantineStore(current.path);
   await openStore(current.path, budget);
   return true;
+}
+
+/**
+ * The use-time quarantine's SEAM (#100): the single wrap point for the single cached handle.
+ * `openStore` publishes the proxy into `cachedDb` and returns it, so both statement paths share
+ * it with zero call-site changes — `loadHashStore` hands out `cachedDb.db`, and `withStore`
+ * frames `BEGIN`/`COMMIT`/`ROLLBACK` on `cachedDb.db` directly while `fn`'s statements come from
+ * a closure over a `loadHashStore` handle (`snapshotStmts(store.db)` inside `withStore(...)` in
+ * snapshot-store and served-session). Guarding only `loadHashStore`'s return would leave the
+ * framing statements unguarded; wrapping once here covers both.
+ *
+ * WHY a proxy: the handle must stay ONE object — `openStamp`, the hook phase and the `WeakMap`
+ * statement caches all key on its identity — and `DatabaseSync` is a native class. Members outside
+ * `prepare`/`exec` forward bound to the raw connection, so native-method receivers stay valid and
+ * teardown (`shutdownDb`'s checkpoint, `close`) keeps working through the guard.
+ */
+function guardDatabaseHandle(raw: DatabaseSync, storePath: string): DatabaseSync {
+  const guarded: DatabaseSync = new Proxy(raw, {
+    get(target, property) {
+      if (property === "prepare") {
+        return (sql: string) => {
+          let statement: StatementSync;
+          try {
+            statement = target.prepare(sql);
+          } catch (error) {
+            triggerUseTimeHeal(guarded, storePath, error);
+            throw error;
+          }
+          return guardStatement(statement, guarded, storePath);
+        };
+      }
+      if (property === "exec") {
+        return (sql: string) => {
+          try {
+            target.exec(sql);
+          } catch (error) {
+            triggerUseTimeHeal(guarded, storePath, error);
+            throw error;
+          }
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return guarded;
+}
+
+/** Statement methods whose failure can be the first proof of damage — the rest forward untouched. */
+const GUARDED_STATEMENT_METHODS: ReadonlySet<string> = new Set(["get", "all", "run", "iterate"]);
+
+function guardStatement(
+  statement: StatementSync,
+  generation: DatabaseSync,
+  storePath: string,
+): StatementSync {
+  return new Proxy(statement, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      const bound = (value as (...args: unknown[]) => unknown).bind(target);
+      if (typeof property !== "string" || !GUARDED_STATEMENT_METHODS.has(property)) return bound;
+      return (...args: unknown[]) => {
+        try {
+          const result = bound(...args);
+          return property === "iterate"
+            ? guardIterator(result as IterableIterator<unknown>, generation, storePath)
+            : result;
+        } catch (error) {
+          triggerUseTimeHeal(generation, storePath, error);
+          throw error;
+        }
+      };
+    },
+  });
+}
+
+/**
+ * WHY `next` is guarded too: `iterate` steps lazily, so damage it walks can throw long after the
+ * `iterate` call returned. The proxy keeps the iteration protocol intact and watches only `next`.
+ */
+function guardIterator(
+  iterator: IterableIterator<unknown>,
+  generation: DatabaseSync,
+  storePath: string,
+): IterableIterator<unknown> {
+  return new Proxy(iterator, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      const bound = (value as (...args: unknown[]) => unknown).bind(target);
+      if (property !== "next") return bound;
+      return (...args: unknown[]) => {
+        try {
+          return bound(...args);
+        } catch (error) {
+          triggerUseTimeHeal(generation, storePath, error);
+          throw error;
+        }
+      };
+    },
+  });
+}
+
+/**
+ * The use-time quarantine's TRIGGER (#100): a guarded statement or `exec` calls this with the
+ * error it just threw, and it arms at most one heal — then the caller rethrows the ORIGINAL
+ * error, so the failure stays loud and no success is ever synthesized.
+ *
+ * The section below runs with NO await between its lines, so capturing the generation, setting
+ * the flag and checking the cache is atomic: two interleaved corruptions cannot both arm a heal,
+ * and a handle the cache has already moved past can never arm one.
+ */
+function triggerUseTimeHeal(generation: DatabaseSync, storePath: string, error: unknown): void {
+  if (!isCorruptionError(error)) return;
+  if (useTimeHeal !== null) return;
+  if (cachedDb === null || cachedDb.db !== generation) return;
+  const promise = runUseTimeHeal(storePath, generation);
+  useTimeHeal = { generation, promise };
+}
+
+/**
+ * The THIRD `quarantineStore` orchestration — the thin sibling of `healUnhealthyStore` the
+ * mandate allows: the same tail (`shutdownHashStore`, then `quarantineStore`, then `openStore`)
+ * but no `quick_check`, because the failing statement already proved the damage. Never rejects:
+ * a heal that itself fails is reported, and the next `loadHashStore` opens normally.
+ */
+async function runUseTimeHeal(storePath: string, generation: DatabaseSync): Promise<void> {
+  try {
+    // WHY the heal yields FIRST: the teardown below must not run inside the failing statement's
+    // WHY: own tick. Sibling statements on the same handle — the double-heal race's second
+    // WHY: corruption — still throw the ORIGINAL error against the still-open connection instead
+    // WHY: of a teardown artifact ("not open"), and only then does the generation guard below
+    // WHY: decide whether this generation still owns the cache.
+    await Promise.resolve();
+    // The generation guard: heal ONLY if the cache still holds the generation that failed. A
+    // second trigger never gets here (the flag), and a trigger from a handle the cache has
+    // since replaced — notably a heal that already rebuilt the store — bails here instead of
+    // quarantining the FRESH file.
+    if (cachedDb === null || cachedDb.db !== generation) return;
+    shutdownHashStore();
+    await quarantineStore(storePath);
+    await openStore(storePath);
+  } catch (error) {
+    console.error("[hash-store] use-time quarantine failed:", error);
+  } finally {
+    if (useTimeHeal !== null && useTimeHeal.generation === generation) useTimeHeal = null;
+  }
 }
 
 async function openStore(storePath: string, budget?: BusyBudget): Promise<HashStore> {
@@ -1213,7 +1371,10 @@ async function openStore(storePath: string, budget?: BusyBudget): Promise<HashSt
     // WHY: is merely busy this instant would fail an open that has already done all of its work.
     if (stamp.due) withBusyRetry(() => writeStoreStamp(db), budget);
 
-    cachedDb = { path: storePath, db };
+    // WHY the publish wraps: this is the seam — the guarded handle is what `loadHashStore`
+    // WHY: hands out and what `withStore` frames on, so one wrap covers every consumer.
+    const guarded = guardDatabaseHandle(db, storePath);
+    cachedDb = { path: storePath, db: guarded };
 
     if (!exitHandlerRegistered) {
       exitHandlerRegistered = true;
@@ -1226,7 +1387,7 @@ async function openStore(storePath: string, budget?: BusyBudget): Promise<HashSt
       }
     }
 
-    return { db, engine: "node:sqlite" };
+    return { db: guarded, engine: "node:sqlite" };
   } finally {
     // WHY: NOT housekeeping, and not defensive tidiness: this clear is what keeps the slot to the hook
     // WHY: phase. The slot answers one question — "is an open in its hook phase on THIS connection" —
@@ -1245,6 +1406,12 @@ async function openStore(storePath: string, budget?: BusyBudget): Promise<HashSt
  * callers pass nothing, and a cached open returns immediately without consulting it.
  */
 export function loadHashStore(budget?: BusyBudget): Promise<HashStore> {
+  // WHY the join: a use-time heal armed by a just-thrown statement rebuilds the store beside
+  // WHY: this call. Waiting for it first is what makes the access after a loud failure land on
+  // WHY: the FRESH store: without it the caller would get the still-cached damaged handle back.
+  // WHY: No cycle: the heal reopens through `openStore` directly, never through here.
+  const healing = useTimeHeal;
+  if (healing !== null) return healing.promise.then(() => loadHashStore(budget));
   const storePath = hashStorePath();
   if (cachedDb && cachedDb.path === storePath && cachedDb.db.isOpen) {
     return Promise.resolve({ db: cachedDb.db, engine: "node:sqlite" });
