@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   DomainError,
   ERROR_REGISTRY,
+  UNVERIFIED_HEADLINE,
   type DomainErrorCode,
   type ErrorPayloadMap,
 } from "../../src/domain-errors.js";
@@ -32,7 +33,8 @@ type RemedyFreeCode =
   | "E_UNVERIFIED_RANGE"
   | "E_STALE_RANGE"
   | "E_NOOP_LOOP"
-  | "E_INTERNAL_INVARIANT";
+  | "E_INTERNAL_INVARIANT"
+  | "E_UNDO_STALE";
 
 const REMEDY_FREE: RemedyFreeCode[] = [
   "E_UNKNOWN",
@@ -42,34 +44,99 @@ const REMEDY_FREE: RemedyFreeCode[] = [
   "E_STALE_RANGE",
   "E_NOOP_LOOP",
   "E_INTERNAL_INVARIANT",
+  "E_UNDO_STALE",
 ];
 
-const FREE_EXAMPLES: { [K in RemedyFreeCode]: ErrorPayloadMap[K] } = {
-  E_UNKNOWN: { errorName: "Error", message: "boom" },
-  E_UNKNOWN_ANCHOR: { path: "a.py", anchors: ["ZZZ"] },
-  E_FOREIGN_ANCHOR: { path: "a.py", anchors: ["wUp"], homes: ["b.py"] },
-  E_UNVERIFIED_RANGE: {
-    servedRows: [{ position: 0, hash: "abc" }],
-    servedBlock: "abcc│alpha",
-    cause: "retirement",
-  },
-  E_STALE_RANGE: {
-    headline: "line 1 differs from what was served.",
-    servedRows: [{ position: 0, hash: "abc" }],
-    servedBlock: "abcc│alpha",
-    cause: "served-range staleness",
-  },
-  E_NOOP_LOOP: {
-    ref: "edit[0] (probe.ts)",
-    removeFrom: "abc",
-    removeTo: "def",
-    count: 3,
-    batch: false,
-    servedRows: [{ position: 0, hash: "abc" }],
-    servedBlock: "abcc│alpha",
-  },
-  E_INTERNAL_INVARIANT: { message: "Path contains null byte" },
+// WHY: one payload per code was the #128 gap: a multi-arm `format` left every arm but the
+// WHY: exercised one unpoliced, and `E_UNDO_STALE` — remedy-free because it declares no remedy —
+// WHY: was never rendered at all, because it was missing from the union, the array and this map.
+// WHY: One ordered payload LIST per code instead; `BRANCH_MARKERS` names the arm each entry must
+// WHY: take, and the ticket report carries the mutation table that proves each arm is reached.
+const FREE_BRANCH_EXAMPLES: { [K in RemedyFreeCode]: ErrorPayloadMap[K][] } = {
+  E_UNKNOWN: [{ errorName: "Error", message: "boom" }],
+  E_UNKNOWN_ANCHOR: [
+    { path: "a.py", anchors: ["ZZZ"] },
+    { path: "a.py", anchors: [] },
+    { path: "a.py", anchors: ["ZZZ", "wUp"] },
+  ],
+  E_FOREIGN_ANCHOR: [
+    { path: "a.py", anchors: ["wUp"], homes: ["b.py"] },
+    { path: "a.py", anchors: ["wUp", "ZZZ"], homes: ["b.py", "c.py"] },
+    { path: "a.py", anchors: ["wUp"], homes: [] },
+    { path: "a.py", anchors: ["wUp"], homes: ["b.py", "c.py", "d.py", "e.py"] },
+  ],
+  E_UNVERIFIED_RANGE: [
+    {
+      headline: "bound 1 no longer resolves.",
+      servedRows: [{ position: 0, hash: "abc" }],
+      servedBlock: "abcc\│alpha",
+      cause: "retirement",
+    },
+    { servedRows: [], servedBlock: "", cause: "retirement" },
+  ],
+  E_STALE_RANGE: [
+    {
+      headline: "line 1 differs from what was served.",
+      servedRows: [{ position: 0, hash: "abc" }],
+      servedBlock: "abcc\│alpha",
+      cause: "served-range staleness",
+    },
+    {
+      headline: "no rows are served for this rejection.",
+      servedRows: [],
+      servedBlock: "",
+      cause: "served-range staleness",
+    },
+  ],
+  E_NOOP_LOOP: [
+    {
+      ref: "edit[0] (probe.ts)",
+      removeFrom: "abc",
+      removeTo: "def",
+      count: 3,
+      batch: false,
+      servedRows: [{ position: 0, hash: "abc" }],
+      servedBlock: "abcc\│alpha",
+    },
+    {
+      ref: "edit[0] (probe.ts)",
+      removeFrom: "abc",
+      removeTo: "def",
+      count: 3,
+      batch: true,
+      servedRows: [{ position: 0, hash: "abc" }],
+      servedBlock: "abcc\│alpha",
+    },
+  ],
+  E_UNDO_STALE: [
+    { path: "a.py", reason: "deleted" },
+    { path: "a.py", reason: "modified" },
+  ],
+  E_INTERNAL_INVARIANT: [
+    { message: "Path contains null byte" },
+    { message: "Path contains null byte", subject: "read" },
+  ],
 };
+
+// WHY: the matrix is evidence only if its payloads take DIFFERENT arms, so each arm the #128
+// WHY: inventory names is pinned by a substring only that arm can produce. The companion proof is
+// WHY: the mutation table in the ticket report: plant an imperative in an arm's returned text and
+// WHY: the render check fails, which is how "this payload reaches that arm" is measured.
+const BRANCH_MARKERS: { code: RemedyFreeCode; index: number; marker: string }[] = [
+  { code: "E_INTERNAL_INVARIANT", index: 1, marker: "The read invariant failed:" },
+  { code: "E_UNKNOWN_ANCHOR", index: 1, marker: "has not served an anchor." },
+  { code: "E_UNKNOWN_ANCHOR", index: 2, marker: 'has not served the anchors "ZZZ", "wUp".' },
+  { code: "E_FOREIGN_ANCHOR", index: 1, marker: "the anchors" },
+  { code: "E_FOREIGN_ANCHOR", index: 2, marker: "was not served for a.py." },
+  { code: "E_FOREIGN_ANCHOR", index: 3, marker: "and 1 more" },
+  { code: "E_UNVERIFIED_RANGE", index: 0, marker: "bound 1 no longer resolves." },
+  { code: "E_UNVERIFIED_RANGE", index: 1, marker: UNVERIFIED_HEADLINE },
+  { code: "E_STALE_RANGE", index: 0, marker: "Current range (fresh read):" },
+  { code: "E_STALE_RANGE", index: 1, marker: "no rows are served for this rejection." },
+  { code: "E_NOOP_LOOP", index: 1, marker: "Rejecting the batch." },
+  { code: "E_UNDO_STALE", index: 0, marker: "file no longer exists" },
+  { code: "E_UNDO_STALE", index: 1, marker: "file modified after edit" },
+];
 
 // WHY: an intent-guessing suggestion steers the model's next action, so a
 // WHY: remedy-free payload must state the fact with no imperative clause.
@@ -147,12 +214,69 @@ describe("remedy eligibility oracle: both directions over the registry", () => {
     }
   });
 
-  it("remedy-free codes render no imperative suggestion", () => {
+  it("remedy-free codes render no imperative suggestion in ANY branch", () => {
     for (const code of REMEDY_FREE) {
-      const rendered = new DomainError(code, FREE_EXAMPLES[code]).message;
-      expect(
-        freeViolations({ code, remedy: ERROR_REGISTRY[code].remedy, message: rendered }),
-      ).toEqual([]);
+      const payloads = FREE_BRANCH_EXAMPLES[code];
+      // WHY: an empty list would silently skip a code, which is the gap #128 closes, so it fails.
+      expect(payloads.length).toBeGreaterThan(0);
+      for (const payload of payloads) {
+        const rendered = new DomainError(code, payload).message;
+        expect(
+          freeViolations({ code, remedy: ERROR_REGISTRY[code].remedy, message: rendered }),
+        ).toEqual([]);
+      }
+    }
+  });
+
+  it("every arm the matrix claims is actually taken", () => {
+    for (const { code, index, marker } of BRANCH_MARKERS) {
+      const rendered = new DomainError(code, FREE_BRANCH_EXAMPLES[code][index]).message;
+      expect(rendered).toContain(marker);
+    }
+  });
+
+  it("refuses the both-empty range pair at construction instead of rendering a bare header", () => {
+    // WHY: (04b 12.2) an empty headline over an empty block renders a header with no information,
+    // WHY: so both range codes refuse the pair inside `format`. The refusal is asserted rather than
+    // WHY: skipped: it renders nothing, and silently skipping it is the gap, not the fix.
+    expect(
+      () =>
+        new DomainError("E_STALE_RANGE", {
+          headline: "",
+          servedRows: [],
+          servedBlock: "",
+          cause: "served-range staleness",
+        }),
+    ).toThrow(TypeError);
+    expect(
+      () =>
+        new DomainError("E_UNVERIFIED_RANGE", {
+          headline: "",
+          servedRows: [],
+          servedBlock: "",
+          cause: "retirement",
+        }),
+    ).toThrow(TypeError);
+  });
+
+  it("the hand list cannot drift from the registry-derived remedy-free set", () => {
+    // WHY: `RemedyFreeCode` is a hand-written union, so omitting a member is not a type error:
+    // WHY: `E_UNDO_STALE` sat outside the union, the array and the matrix until #128. Equality in
+    // WHY: BOTH directions is what makes a newly declared remedy-free code fail loudly here instead
+    // WHY: of rendering nothing.
+    expect(new Set(REMEDY_FREE)).toEqual(new Set(REMEDY_FREE_CODES));
+  });
+
+  it("the matrix covers every remedy-free code the registry declares", () => {
+    for (const code of REMEDY_FREE_CODES) {
+      const payloads = FREE_BRANCH_EXAMPLES[code as RemedyFreeCode] as
+        | ErrorPayloadMap[RemedyFreeCode][]
+        | undefined;
+      // WHY: this is the exhaustiveness guard. A code declared remedy-free but absent from the
+      // WHY: matrix fails here by name (`toBeDefined`) instead of rendering nothing, and adding it
+      // WHY: to the union without a matrix entry is a type error at the declaration above.
+      expect(payloads, `${code} is remedy-free but the matrix has no payloads`).toBeDefined();
+      expect(payloads?.length ?? 0).toBeGreaterThan(0);
     }
   });
 
@@ -197,13 +321,13 @@ describe("remedy eligibility oracle: both directions over the registry", () => {
  * Producer half of the oracle (#125). The checks above read the registry as data — each code's
  * declared `remedy` and each remedy-free code's own example payload — so the strings real producers
  * pass are invisible to them: three `E_INTERNAL_INVARIANT` sites kept "Pass a plain file string and
- * retry." through #93 for exactly that reason, and `FREE_EXAMPLES` still carries the trimmed text
- * as its example. This half reads the producers themselves.
+ * retry." through #93 for exactly that reason, and `FREE_BRANCH_EXAMPLES` still carries the trimmed
+ * text as its first payload. This half reads the producers themselves.
  *
  * The scanned set is derived from `ERROR_REGISTRY` entries with no `remedy` field rather than from a
- * literal list, so a code that becomes remedy-free is scanned the moment it is declared: the
- * hand-maintained `REMEDY_FREE` array above already misses one (`E_UNDO_STALE`), and every further
- * remedy-free code would inherit the same drift. The `W_*` codes are deliberately outside it: they
+ * literal list, so a code that becomes remedy-free is scanned the moment it is declared. The
+ * hand-maintained `REMEDY_FREE` array above missed `E_UNDO_STALE` until #128 added it and pinned the
+ * array to this derived set in both directions. The `W_*` codes are deliberately outside it: they
  * carry remedies in the registry and are rendered through `WARNING_REGISTRY` for a user audience,
  * where telling the reader what to do is the point.
  */
