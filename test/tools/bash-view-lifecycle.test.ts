@@ -2367,3 +2367,186 @@ describe("bash Tier-3 hardening (walk bounds and boundary twins)", () => {
     });
   });
 });
+
+describe("bash view — pureView section banners (#134)", () => {
+  // WHY: the read tool's own per-window header. The bash view renders through a one-element window
+  // WHY: array, so it used to inherit this string as its file banner; that is the defect fixed here.
+  const READ_HEADER = /^=== Lines \d+-\d+ of \d+ ===$/;
+  const catNumberedLocal = (text: string): string =>
+    `${text
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l, i) => `${String(i + 1).padStart(6)}\t${l}`)
+      .join("\n")}\n`;
+
+  const drive = async (
+    dir: string,
+    body: Record<string, string>,
+    command: string,
+    stdout: string,
+    session: string,
+  ) => {
+    for (const [name, text] of Object.entries(body)) {
+      const full = join(dir, name);
+      await mkdir(join(full, ".."), { recursive: true });
+      await writeFile(full, text, "utf-8");
+    }
+    const { pi, handlers } = makeFakePi();
+    register(pi);
+    const ctx = { cwd: dir, sessionManager: { getSessionId: () => session } };
+    const result = await bashResult(handlers.get("tool_result")!, command, ctx, stdout);
+    return result?.content[0]?.text;
+  };
+
+  it("A1 — a whole-file `cat` names the file and its line count", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      const body = numberedLines(30);
+      const text = await drive(dir, { "f.txt": body }, "cat f.txt", body, "bv-a1");
+      expect(text).toBeDefined();
+      const lines = text!.split("\n");
+      expect(lines[0]).toBe("--- Bash view (hashline anchors) ---");
+      expect(lines[1]).toBe("[f.txt (30 lines)]");
+      expect(lines[2]).toMatch(/│line1$/);
+      expect(READ_HEADER.test(lines[1]!)).toBe(false);
+      expect(text!.split("\n").some((l) => READ_HEADER.test(l))).toBe(false);
+    });
+  });
+
+  it("A1 / D5 — `cat -n` takes the same full-file banner, with no special case", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      const body = numberedLines(10);
+      const text = await drive(
+        dir,
+        { "f.txt": body },
+        "cat -n f.txt",
+        catNumberedLocal(body),
+        "bv-a1n",
+      );
+      expect(text!.split("\n")[1]).toBe("[f.txt (10 lines)]");
+    });
+  });
+
+  it("A2 — a one-line file reads singular", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      const text = await drive(dir, { "one.txt": "line1\n" }, "cat one.txt", "line1\n", "bv-a2");
+      expect(text!.split("\n")[1]).toBe("[one.txt (1 line)]");
+    });
+  });
+
+  it("A3 — `head -n 2` banners the range it covered", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      const body = numberedLines(30);
+      const head2 = `${body.split("\n").slice(0, 2).join("\n")}\n`;
+      const text = await drive(dir, { "f.txt": body }, "head -n 2 f.txt", head2, "bv-a3");
+      expect(text!.split("\n")[1]).toBe("[f.txt (lines 1-2 of 30)]");
+    });
+  });
+
+  it("A4 — `sed -n '5,10p'` banners its range", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      const body = numberedLines(30);
+      const slice = `${body.split("\n").slice(4, 10).join("\n")}\n`;
+      const text = await drive(dir, { "f.txt": body }, "sed -n '5,10p' f.txt", slice, "bv-a4a");
+      expect(text!.split("\n")[1]).toBe("[f.txt (lines 5-10 of 30)]");
+    });
+  });
+
+  it("A4 — `tail -n 15` banners the tail range", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      const body = numberedLines(30);
+      const tail = `${body.split("\n").slice(15, 30).join("\n")}\n`;
+      const text = await drive(dir, { "f.txt": body }, "tail -n 15 f.txt", tail, "bv-a4b");
+      expect(text!.split("\n")[1]).toBe("[f.txt (lines 16-30 of 30)]");
+    });
+  });
+
+  it("A4 — a single-line `sed -n '5p'` still says `lines 5-5`", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      const body = numberedLines(30);
+      const text = await drive(
+        dir,
+        { "f.txt": body },
+        "sed -n '5p' f.txt",
+        `${body.split("\n")[4]}\n`,
+        "bv-a4c",
+      );
+      expect(text!.split("\n")[1]).toBe("[f.txt (lines 5-5 of 30)]");
+    });
+  });
+
+  it("A5 — a merged multi-range sed banners the union once", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      // WHY: overlapping `-e` ranges merge at parse (Tier-2 item 7) to ONE interval, so the
+      // WHY: union carries a single banner — the policy is per section, but no bash command
+      // WHY: can produce two sections (see the disjoint case below). Asserting the union's own
+      // WHY: range, not an inherited window header.
+      const body = numberedLines(30);
+      const union = `${Array.from({ length: 5 }, (_, i) => `line${i + 16}`).join("\n")}\n`;
+      const text = await drive(
+        dir,
+        { "f.txt": body },
+        "sed -n -e '16,18p' -e '17,20p' f.txt",
+        union,
+        "bv-a5",
+      );
+      expect(text!.split("\n")[1]).toBe("[f.txt (lines 16-20 of 30)]");
+      expect(text!.split("\n").some((l) => READ_HEADER.test(l))).toBe(false);
+    });
+  });
+
+  it("A5 boundary — a DISJOINT multi-range sed fails closed (no two-section view exists)", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      // WHY (§7.9): `applySliceOps` folds `range` ops by intersection, so two disjoint ranges
+      // WHY: yield zero intervals and the gate passes the raw stdout through — there is no
+      // WHY: reachable two-window bash view in this code. This pins that fail-closed boundary
+      // WHY: rather than a two-banner rendering that cannot occur.
+      const body = numberedLines(30);
+      const stdout = "line5\nline6\nline10\nline11\n";
+      const text = await drive(
+        dir,
+        { "f.txt": body },
+        "sed -n -e '5,6p' -e '10,11p' f.txt",
+        stdout,
+        "bv-a5b",
+      );
+      expect(text).toBeUndefined();
+    });
+  });
+
+  it("A6 — an over-budget slice still declines interception", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      // WHY: raw stdout fits the bash byte budget, but the anchors the view would serve do not fit
+      // WHY: the preview budget — the D3 gate must still send it through raw, with zero leases.
+      const big = `${Array.from({ length: 1500 }, (_, i) => `line${i + 1}`.padEnd(40, ".")).join("\n")}\n`;
+      const slice = `${big.split("\n").slice(0, 1200).join("\n")}\n`;
+      const text = await drive(dir, { "big.txt": big }, "head -n 1200 big.txt", slice, "bv-a6");
+      expect(text).toBeUndefined();
+    });
+  });
+
+  it("A7 — the banner names the caller's path, not the resolved one", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      const body = numberedLines(30);
+      const head2 = `${body.split("\n").slice(0, 2).join("\n")}\n`;
+      const pure = await drive(dir, { "sub/f.txt": body }, "head -n 2 sub/f.txt", head2, "bv-a7a");
+      const piped = await drive(
+        dir,
+        { "sub/f.txt": body },
+        "cat sub/f.txt | head -n 2",
+        head2,
+        "bv-a7b",
+      );
+      const pathOf = (t: string) => /^\[([^\]]*?) \(/.exec(t.split("\n")[1]!)?.[1];
+      expect(pathOf(pure!)).toBe("sub/f.txt");
+      expect(pathOf(piped!)).toBe(pathOf(pure!));
+      expect(pure!.split("\n")[1]).not.toContain(dir);
+    });
+  });
+
+  it("A9 — an empty file is not intercepted at all", async () => {
+    await withTempDir("bash-view-", async (dir) => {
+      const text = await drive(dir, { "empty.txt": "" }, "cat empty.txt", "", "bv-a9");
+      expect(text).toBeUndefined();
+    });
+  });
+});

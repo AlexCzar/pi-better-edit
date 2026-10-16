@@ -136,6 +136,24 @@ function viewHeader(filePath: string, ops: readonly ViewOp[], count: number): st
 }
 
 /**
+ * WHY: the bash view's own section banner. The read tool's `=== Lines X-Y of Z ===` header is that
+ * WHY: tool's rendered contract, and this view only ever reached it by rendering through a
+ * WHY: one-element window. A view that names its own pages states them in the shape its sibling
+ * WHY: banners already use: bracketed, a range for a slice, a bare count for a whole file.
+ */
+function pureViewHeader(
+  filePath: string,
+  startLine: number,
+  endLine: number,
+  totalLines: number,
+): string {
+  if (startLine === 1 && endLine === totalLines) {
+    return `[${filePath} (${totalLines} ${totalLines === 1 ? "line" : "lines"})]`;
+  }
+  return `[${filePath} (lines ${startLine}-${endLine} of ${totalLines})]`;
+}
+
+/**
  * WHY: (item 10) the recursive-walk exclusion list, stated rather than inferred: no directory
  * whose name is hidden (leading `.`, which covers `.git`) and none named `node_modules` is ever
  * descended into. Exclusions gate DESCENT only — an explicitly named operand is still honored,
@@ -715,7 +733,11 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
       }
       const preview = await deps.fmtReadPreview(
         normalized,
-        { windows: intervals.map((iv) => ({ offset: iv.lo, limit: iv.hi - iv.lo + 1 })) },
+        {
+          sectionHeader: (startLine, endLine, totalLines) =>
+            pureViewHeader(filePath, startLine, endLine, totalLines),
+          windows: intervals.map((iv) => ({ offset: iv.lo, limit: iv.hi - iv.lo + 1 })),
+        },
         fileHashes,
         absolutePath,
         DEFAULT_MAX_BYTES,
