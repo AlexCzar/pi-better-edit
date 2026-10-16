@@ -69,7 +69,7 @@ const FREE_BRANCH_EXAMPLES: { [K in RemedyFreeCode]: ErrorPayloadMap[K][] } = {
     {
       headline: "bound 1 no longer resolves.",
       servedRows: [{ position: 0, hash: "abc" }],
-      servedBlock: "abcc\│alpha",
+      servedBlock: "abcc│alpha",
       cause: "retirement",
     },
     { servedRows: [], servedBlock: "", cause: "retirement" },
@@ -78,7 +78,7 @@ const FREE_BRANCH_EXAMPLES: { [K in RemedyFreeCode]: ErrorPayloadMap[K][] } = {
     {
       headline: "line 1 differs from what was served.",
       servedRows: [{ position: 0, hash: "abc" }],
-      servedBlock: "abcc\│alpha",
+      servedBlock: "abcc│alpha",
       cause: "served-range staleness",
     },
     {
@@ -96,7 +96,7 @@ const FREE_BRANCH_EXAMPLES: { [K in RemedyFreeCode]: ErrorPayloadMap[K][] } = {
       count: 3,
       batch: false,
       servedRows: [{ position: 0, hash: "abc" }],
-      servedBlock: "abcc\│alpha",
+      servedBlock: "abcc│alpha",
     },
     {
       ref: "edit[0] (probe.ts)",
@@ -105,7 +105,7 @@ const FREE_BRANCH_EXAMPLES: { [K in RemedyFreeCode]: ErrorPayloadMap[K][] } = {
       count: 3,
       batch: true,
       servedRows: [{ position: 0, hash: "abc" }],
-      servedBlock: "abcc\│alpha",
+      servedBlock: "abcc│alpha",
     },
   ],
   E_UNDO_STALE: [
