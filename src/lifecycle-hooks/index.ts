@@ -990,8 +990,9 @@ export function createLifecycleHooks(overrides: Partial<LifecycleDeps> = {}): {
     if (walked === undefined) return undefined;
     // WHY: (review F5) no `valAccess`/`loadFileKindAndText` here on purpose: a path list has
     // WHY: no bytes to witness and grants no anchors, so the walk's membership is the whole
-    // WHY: witness chain. And because nothing is leased, the anchor-budget rationale behind
-    // WHY: `BASH_SEARCH_MAX_FILES` does not apply to this shape — a repository-wide listing
+    // WHY: witness chain. The cap below is the scope bound `constants.ts` states for this
+    // WHY: constant: how many paths one listing may name — the brief's "same count cap",
+    // WHY: not an anchor budget, because nothing here is leased. A listing larger than it
     // WHY: therefore passes through raw, which ADR-0033 D10 records.
     const stdoutText = singleTextBlock(event);
     if (stdoutText === undefined) return undefined;
