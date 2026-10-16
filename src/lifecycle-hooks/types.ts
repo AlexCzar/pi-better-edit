@@ -33,6 +33,7 @@ export type LifecycleDeps = {
     opts: {
       offset?: number;
       limit?: number;
+      sectionHeader?: (startLine: number, endLine: number, totalLines: number) => string;
       windows?: Array<{ offset: number; limit: number }>;
     },
     fileHashes: string[],

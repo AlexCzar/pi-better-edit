@@ -389,9 +389,19 @@ function buildWindowedPreview(params: {
   verbatim: boolean;
   /** The caller's own path, for the footer that names the file a continuation belongs to. */
   displayPath?: string;
+  sectionHeader?: (startLine: number, endLine: number, totalLines: number) => string;
 }): { text: string; truncation?: TruncationResult; served: ServedRow[] } {
-  const { windows, ranges, totalLines, allHashes, maxBytes, maxTruncLines, verbatim, displayPath } =
-    params;
+  const {
+    windows,
+    ranges,
+    totalLines,
+    allHashes,
+    maxBytes,
+    maxTruncLines,
+    verbatim,
+    displayPath,
+    sectionHeader,
+  } = params;
   const sections: string[] = [];
   const hashByPosition = new Map<number, string>();
   let truncation: TruncationResult | undefined;
@@ -406,7 +416,7 @@ function buildWindowedPreview(params: {
       continue;
     }
     const endIdx = Math.min(window.offset - 1 + window.limit, totalLines);
-    const header = windowHeader(window.offset, endIdx, totalLines);
+    const header = (sectionHeader ?? windowHeader)(window.offset, endIdx, totalLines);
     const selected = ranges[index] ?? [];
     const selectedHashes = allHashes.slice(window.offset - 1, endIdx);
     if (remainingBytes <= 0 || remainingLines <= 0) {
@@ -487,6 +497,7 @@ export async function fmtReadPreview(
     render?: "served" | "verbatim";
     /** The caller's own path for the file header/footer; absent for a pathless preview. */
     displayPath?: string;
+    sectionHeader?: (startLine: number, endLine: number, totalLines: number) => string;
   },
   anchors?: RenderAnchors,
   path?: string,
@@ -506,6 +517,7 @@ export async function fmtReadPreview(
   // WHY: the anchor seed path is not the display path — the first is the absolute path a hash is
   // WHY: scoped to, the second is what the caller wrote, which is what a header/footer must name.
   const displayPath = options.displayPath;
+  const sectionHeader = options.sectionHeader;
   // WHY: only a walk plan carries an assignment. Anchors the caller already holds are rendered as
   // WHY: they are; verbatim never reaches for anchors at all.
   const known: string[] | undefined =
@@ -568,6 +580,7 @@ export async function fmtReadPreview(
         maxTruncLines,
         verbatim,
         ...(displayPath !== undefined ? { displayPath } : {}),
+        ...(sectionHeader !== undefined ? { sectionHeader } : {}),
       }),
       hashes: page.hashes,
       lineTotals: totals,
