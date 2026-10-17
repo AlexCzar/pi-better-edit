@@ -129,7 +129,7 @@ describe("the served page never materializes the line array", () => {
         return result.content[0]?.text ?? "";
       };
       await expect(run({ windows: [{ offset: 1, limit: 2 }] })).resolves.toMatch(
-        /^\[plain\.txt \(4 lines total\)\]\n\w{4}│alpha\n\w{4}│beta\n\n\[plain\.txt lines 1-2 of 4\. Use windows: \[\{ offset: 3, limit: 2 \}\] to continue\.\]$/,
+        /^\[plain\.txt \(lines 1-2 of 4\)\]\n\w{4}│alpha\n\w{4}│beta\n\n\[plain\.txt lines 1-2 of 4\. Use windows: \[\{ offset: 3, limit: 2 \}\] to continue\.\]$/,
       );
       await expect(
         run({
@@ -165,6 +165,22 @@ describe("the served page never materializes the line array", () => {
         /^\[empty\.txt \(0 lines total\)\]\n\w{4}│\n\[File is empty\. Use edit to insert content\.\]$/,
       );
       expect(splitCalls.length).toBe(callsFromSnapshotStore().length);
+    });
+  });
+
+  it("keeps the total header for a windowed read of an empty file", async () => {
+    // WHY: the empty marker row carries a phantom position; ranging it would print `lines 1-1 of 0`.
+    // WHY: Nothing was shown, so the header stays the total — the same header the whole-file read gets.
+    await withTempFile("empty.txt", "", async ({ cwd }) => {
+      const { readTool, ctx } = setupReadTest(cwd);
+      const result = await readTool.execute(
+        "s1",
+        { file: "empty.txt", windows: [{ offset: 1, limit: 5 }] },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.content[0]?.text).toMatch(/^\[empty\.txt \(0 lines total\)\]\n/);
     });
   });
 
