@@ -158,6 +158,75 @@ describe("bash-classifier span matrix", () => {
   });
 });
 
+import type { BashClass } from "../../src/bash-classifier";
+
+function compoundOf(command: string): Extract<BashClass, { kind: "pureCompound" }> {
+  const result = classifyBashCommand(command);
+  expect(result.kind).toBe("pureCompound");
+  if (result.kind !== "pureCompound") throw new Error(`not a compound: ${command}`);
+  return result;
+}
+
+describe("bash-classifier compound glue segments", () => {
+  // WHY: (ADR-0039 D6 + F2-as-restated) glue is admitted only inside a compound beside an
+  // WHY: admitted block. A lone print keeps its own decline, and glue-only chains fail closed
+  // WHY: to `no-view` because glue locates blocks and with no block there is nothing to locate.
+  it("still declines lone prints and glue-only chains", () => {
+    expect(reasonOf('printf "hi"')).toBe("unsupported-command:printf");
+    expect(reasonOf("export A=b")).toBe("non-literal-command");
+    expect(reasonOf("set -e")).toBe("unsupported-command:set");
+    expect(reasonOf("printf a; printf b")).toBe("no-view");
+    expect(reasonOf("echo hi; echo bye")).toBe("no-view");
+  });
+  it("admits print and env glue beside a view, with parse-time expected bytes", () => {
+    expect(compoundOf('printf "hi\\n" && cat f')).toEqual({
+      kind: "pureCompound",
+      segments: [
+        { kind: "glue", glue: { program: "printf", expectedText: "hi\n", expectedBytes: 3 } },
+        { kind: "view", filePath: "f", ops: [] },
+      ],
+    });
+    expect(compoundOf("export A=b && cat f")).toEqual({
+      kind: "pureCompound",
+      segments: [
+        { kind: "glue", glue: { program: "export", expectedText: "", expectedBytes: 0 } },
+        { kind: "view", filePath: "f", ops: [] },
+      ],
+    });
+    expect(compoundOf("set -e; cat f")).toEqual({
+      kind: "pureCompound",
+      segments: [
+        { kind: "glue", glue: { program: "set", expectedText: "", expectedBytes: 0 } },
+        { kind: "view", filePath: "f", ops: [] },
+      ],
+    });
+    // WHY: a QUOTED glob is static (the shell never expands it) — only unquoted `*` is dynamic
+    // WHY: and `literalValue` already rejects that before glue is attempted. Predictable admit.
+    expect(compoundOf('echo "a*b" && cat f')).toEqual({
+      kind: "pureCompound",
+      segments: [
+        { kind: "glue", glue: { program: "echo", expectedText: "a*b\n", expectedBytes: 4 } },
+        { kind: "view", filePath: "f", ops: [] },
+      ],
+    });
+  });
+  it("fails closed on dynamic, flagged, or converting print forms", () => {
+    expect(reasonOf('echo "a$b" && cat f')).toBe("non-literal-command");
+    expect(reasonOf('echo -n "hi" && cat f')).toBe("unsupported-command:echo");
+    expect(reasonOf('printf "%s" hi && cat f')).toBe("unsupported-command:printf");
+  });
+  it("numbers an unnumbered search inside a compound, leaving the rest alone", () => {
+    expect(withSearchLineNumbers("echo hi && grep x f")).toBe("echo hi && grep -n x f");
+    expect(withSearchLineNumbers("echo hi; grep x f")).toBe("echo hi; grep -n x f");
+    expect(withSearchLineNumbers("export A=b && rg -F x f")).toBe(
+      "export A=b && rg --line-number -F x f",
+    );
+    expect(withSearchLineNumbers("set -e; grep x f")).toBe("set -e; grep -n x f");
+    expect(withSearchLineNumbers("cat f && echo done")).toBe("cat f && echo done");
+    expect(withSearchLineNumbers("echo hi && grep -n x f")).toBe("echo hi && grep -n x f");
+  });
+});
+
 describe("bash-classifier fail-closed matrix", () => {
   it("passes through commands with no view", () => {
     expect(reasonOf("")).toBe("empty");
@@ -175,9 +244,26 @@ describe("bash-classifier fail-closed matrix", () => {
   });
 
   it("passes through unsafe chain segments", () => {
-    expect(reasonOf("echo hi && cat f")).toBe("unsupported-command:echo");
+    // WHY: (ADR-0039 D6) a literal print beside a view is glue in an admitted compound — the
+    // WHY: envelope (separately) verifies the predicted bytes against observed stdout, and the
+    // WHY: lifecycle still declines this shape until then, so no lease exists yet.
+    expect(compoundOf("echo hi && cat f")).toEqual({
+      kind: "pureCompound",
+      segments: [
+        { kind: "glue", glue: { program: "echo", expectedText: "hi\n", expectedBytes: 3 } },
+        { kind: "view", filePath: "f", ops: [] },
+      ],
+    });
     expect(reasonOf("make && cat f")).toBe("unsupported-command:make");
-    expect(reasonOf("cat f && echo done")).toBe("unsupported-command:echo");
+    // WHY: (ADR-0039 D6) trailing glue is the same admitted shape — position-agnostic, verified
+    // WHY: against observed stdout by the envelope, declined by default until then.
+    expect(compoundOf("cat f && echo done")).toEqual({
+      kind: "pureCompound",
+      segments: [
+        { kind: "view", filePath: "f", ops: [] },
+        { kind: "glue", glue: { program: "echo", expectedText: "done\n", expectedBytes: 5 } },
+      ],
+    });
     expect(reasonOf("cd /x && grep -r foo . && cat f")).toBe("multi-view");
     expect(reasonOf("cd -")).toBe("unsupported-command:cd");
     expect(reasonOf("cd -- && cat f")).toBe("unsupported-command:cd");
@@ -193,7 +279,15 @@ describe("bash-classifier fail-closed matrix", () => {
     // WHY: is not the deterministic shape this decision authorises.
     expect(reasonOf("cat f; cat g")).toBe("multi-statement");
     expect(reasonOf("cat f; cd sub")).toBe("multi-statement");
-    expect(reasonOf("echo hi; cat f")).toBe("unsupported-command:echo");
+    // WHY: (ADR-0039 D6) a `;`-chain print prefix is glue, not an unknown command — the chain
+    // WHY: stays deterministic (static bytes + a terminal view), so it classifies as a compound.
+    expect(compoundOf("echo hi; cat f")).toEqual({
+      kind: "pureCompound",
+      segments: [
+        { kind: "glue", glue: { program: "echo", expectedText: "hi\n", expectedBytes: 3 } },
+        { kind: "view", filePath: "f", ops: [] },
+      ],
+    });
     expect(reasonOf("cd a; cd b; cat f")).toBe("multi-cd");
     expect(reasonOf("cd $D; cat f")).toBe("non-literal-command");
     // WHY: `cd --`/`cd -P` consume the word as an option and cd to `$HOME`,
@@ -1051,11 +1145,41 @@ describe("bash-classifier content filter stages (Tier-3 item 9)", () => {
         { kind: "first", n: 5 },
       ],
     });
-    // WHY: a NUMBERED search source composes with NOTHING downstream, the item-8 rule — its
-    // WHY: `LINE:` column is data a downstream stage inspects, so admitting it would change the
-    // WHY: model's own command's row set. It fails closed, and no command is rewritten to help.
-    expect(reasonOf("grep -n pat f | head -5")).toBe("unsupported-pipeline");
-    expect(reasonOf("rg --line-number pat f | head -5")).toBe("unsupported-pipeline");
+    // WHY: [ADR-0039 D3, superseding the item-8 decline] a NUMBERED single-file search piped
+    // WHY: into `head`/`tail` is a `pureSearch` with the slice ops attached — the slice is a pure
+    // WHY: line-count truncation on resolved rows, so the `LINE:` column is never re-inspected.
+    expect(searchOf("grep -n pat f | head -5")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: true,
+      sliceOps: [{ kind: "first", n: 5 }],
+    });
+    expect(searchOf("rg --line-number pat f | head -5")).toEqual({
+      program: "rg",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: true,
+      sliceOps: [{ kind: "first", n: 5 }],
+    });
+    expect(searchOf("grep -n pat f | tail -5")).toEqual({
+      program: "grep",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: true,
+      sliceOps: [{ kind: "last", n: 5 }],
+    });
+    expect(searchOf("rg --line-number pat f | tail -5")).toEqual({
+      program: "rg",
+      pattern: "pat",
+      filePath: "f",
+      lineNumbered: true,
+      sliceOps: [{ kind: "last", n: 5 }],
+    });
+    // WHY: F4 — a slice that leaves zero survivors declines: `head -0`/`tail -0` admit no
+    // WHY: slice (positive counts only), so the pipeline fails closed before any lease exists.
+    expect(reasonOf("grep -n pat f | head -0")).toBe("unsupported-pipeline");
+    expect(reasonOf("grep -n pat f | tail -0")).toBe("unsupported-pipeline");
     expect(reasonOf("rtk grep pat f | head -3")).toBe("unsupported-pipeline");
     // WHY: `-v`/`-N` stay denied at SOURCE position — the Tier-1 source pins hold, so item 9
     // WHY: flips no source-flag denial (only cat/head/sed-led pipelines gain filters).
@@ -1438,5 +1562,77 @@ describe("bash-classifier line-set consumers (Tier-3 item 11)", () => {
     ]) {
       expect(withSearchLineNumbers(command)).toBe(command);
     }
+  });
+});
+describe("bash-classifier redundant cd (D7/D8)", () => {
+  // WHY: (ADR-0039 D7) a redundant `cd` is inert like `:`/`true`: dot-forms resolve to the base
+  // WHY: for every base, and an absolute repeat matches tracked exact knowledge — so neither is
+  // WHY: counted toward the single-`cd` limit nor trips multi/post-view guards. Anything else
+  // WHY: (including `..`, which can escape a symbolic root) counts normally.
+  it("skips dot-form cds without counting them", () => {
+    expect(viewOf("cd . && cat f")).toEqual({ filePath: "f", ops: [] });
+    expect(viewOf("cd sub && cd . && cat f")).toEqual({ filePath: "f", baseDir: "sub", ops: [] });
+    expect(viewOf("cd . && cd . && cat f")).toEqual({ filePath: "f", ops: [] });
+    expect(viewOf("cat f && cd .")).toEqual({ filePath: "f", ops: [] });
+  });
+  it("skips an exact absolute repeat against tracked knowledge", () => {
+    expect(viewOf("cd /x && cd /x && cat f")).toEqual({ filePath: "f", baseDir: "/x", ops: [] });
+  });
+  it("still counts non-redundant seconds (relative repeat, parent, absolute change)", () => {
+    expect(reasonOf("cd sub && cd sub && cat f")).toBe("multi-cd");
+    expect(reasonOf("cd /x && cd /y && cat f")).toBe("multi-cd");
+    expect(reasonOf("cd sub && cd .. && cat f")).toBe("multi-cd");
+  });
+  it("carries the base through glue to the view", () => {
+    expect(compoundOf("cd sub && echo hi && cat f")).toEqual({
+      kind: "pureCompound",
+      segments: [
+        { kind: "glue", glue: { program: "echo", expectedText: "hi\n", expectedBytes: 3 } },
+        { kind: "view", filePath: "f", ops: [] },
+      ],
+      baseDir: "sub",
+    });
+  });
+});
+describe("bash-classifier compound multi-block (C4)", () => {
+  // WHY: (commit 4) multiple view/search blocks admit only with glue present (hasGlue-gated
+  // WHY: relaxation); glue-less multis keep their exact current reasons. A non-redundant `cd`
+  // WHY: after a block fails closed (post-block-cd) so no block misresolves.
+  it("admits multiple blocks when glue is present anywhere", () => {
+    expect(compoundOf("grep -n A f && grep -n B g && echo hi")).toEqual({
+      kind: "pureCompound",
+      segments: [
+        {
+          kind: "search",
+          family: {
+            kind: "pureSearch",
+            search: { program: "grep", pattern: "A", filePath: "f", lineNumbered: true },
+          },
+        },
+        {
+          kind: "search",
+          family: {
+            kind: "pureSearch",
+            search: { program: "grep", pattern: "B", filePath: "g", lineNumbered: true },
+          },
+        },
+        { kind: "glue", glue: { program: "echo", expectedText: "hi\n", expectedBytes: 3 } },
+      ],
+    });
+    expect(compoundOf("cat f; echo hi")).toEqual({
+      kind: "pureCompound",
+      segments: [
+        { kind: "view", filePath: "f", ops: [] },
+        { kind: "glue", glue: { program: "echo", expectedText: "hi\n", expectedBytes: 3 } },
+      ],
+    });
+  });
+  it("declines a non-redundant cd after a block in a glue chain", () => {
+    expect(reasonOf("grep A f; cd sub; echo hi")).toBe("post-block-cd");
+  });
+  it("numbers every unnumbered search in a compound in one pass", () => {
+    expect(withSearchLineNumbers("echo hi && grep x f && grep y g")).toBe(
+      "echo hi && grep -n x f && grep -n y g",
+    );
   });
 });

@@ -126,6 +126,8 @@ export interface BashSearch {
   filePath: string;
   /** True when the model already asked for line numbers (`-n` / `--line-number`). */
   lineNumbered: boolean;
+  /** Slice ops from a trailing `head`/`tail` pipeline (ADR-0039 D3); absent for a bare search. */
+  sliceOps?: SliceOp[];
   /** Resolution base for a single pre-view literal `cd` — the view rule verbatim (ADR-0033 D1). */
   baseDir?: string;
 }
@@ -177,12 +179,30 @@ type SearchFamily =
   | { kind: "pureRecursiveSearch"; search: BashRecursiveSearch }
   | { kind: "pureFilesList"; search: BashFilesList };
 
+/** A static glue segment: a literal print or silent env command with parse-time expected bytes. */
+interface GlueSegment {
+  /** Program exactly as written (`"echo"`, `"printf"`, `"export"`, `"set"`). */
+  program: "echo" | "printf" | "export" | "set";
+  /** Exact stdout contribution, computed at parse time and verified during peeling. */
+  expectedText: string;
+  /** UTF-8 byte length of `expectedText`. */
+  expectedBytes: number;
+}
+/** One admitted segment of a compound, in encounter order (`:`/`true` drop out, `cd` to base). */
+export type CompoundSegment = ViewSeg | SearchSeg | { kind: "glue"; glue: GlueSegment };
 export type BashClass =
   | { kind: "pureView"; view: BashView }
   | { kind: "pureSearch"; search: BashSearch }
   | { kind: "pureMultiSearch"; search: BashMultiSearch }
   | { kind: "pureRecursiveSearch"; search: BashRecursiveSearch }
   | { kind: "pureFilesList"; search: BashFilesList }
+  | {
+      kind: "pureCompound";
+      /** Ordered admitted segments; silent prefixes are absorbed (`cd` into `baseDir`). */
+      segments: CompoundSegment[];
+      /** Chain-level resolution base (single pre-block literal `cd`), if any. */
+      baseDir?: string;
+    }
   | { kind: "passThrough"; reason: string };
 
 /** `sed -n` numeric print only — locks out `w`/`e`/`r`/`s`/`;`/`{}`/`/` (R4). */
@@ -797,7 +817,95 @@ function unwrapViewWrapper(stage: StageShape): StageShape | undefined {
   return { name: inner, args: rest };
 }
 
-function parseViewSegment(node: Command | Pipeline): ViewSeg | undefined {
+/** Programs admitted as static glue (exact standalone quoted literals; see the synonym gate). */
+const LITERAL_PRINT_PROGRAMS = new Set(["echo", "printf"]);
+/**
+ * WHY: (ADR-0039 D6) static glue for compounds: literal prints without dynamic expansions, plus
+ * WHY: silent env commands. Expected content and byte length are computed at parse time and
+ * WHY: verified during peeling; any form whose bytes cannot be predicted with certainty fails
+ * WHY: closed here, because a wrong prediction must never produce a lease.
+ */
+function parseGlueSegment(node: Command | Pipeline): GlueSegment | undefined {
+  if (node.type !== "Command") return undefined;
+  if (node.prefix.length > 0 || node.redirects.length > 0) return undefined;
+  if (!isWord(node.name)) return undefined;
+  const name = literalValue(node.name);
+  if (name === undefined) return undefined;
+  if (name === "export") return parseExportGlue(node);
+  const stage = stageShape(node);
+  if (!stage) return undefined;
+  if (LITERAL_PRINT_PROGRAMS.has(stage.name)) return parsePrintGlue(stage);
+  if (stage.name === "set") return parseSetGlue(stage);
+  return undefined;
+}
+function parsePrintGlue(stage: { name: string; args: string[] }): GlueSegment | undefined {
+  if (stage.args.length !== 1) return undefined;
+  const arg = stage.args[0];
+  if (arg === undefined || arg.startsWith("-")) return undefined;
+  if (stage.name === "echo") {
+    // WHY: the print builtin's backslash handling varies by shell; only backslash-free literals
+    // WHY: have certain bytes. Escaped content belongs to `printf` (below), which owns escapes.
+    if (arg.includes("\\")) return undefined;
+    return makeGlue("echo", `${arg}\n`);
+  }
+  if (stage.name !== "printf") return undefined;
+  if (arg.includes("%")) return undefined;
+  const text = parsePrintfEscapes(arg);
+  if (text === undefined) return undefined;
+  return makeGlue("printf", text);
+}
+function parsePrintfEscapes(format: string): string | undefined {
+  let out = "";
+  for (let i = 0; i < format.length; i++) {
+    const ch = format[i];
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const esc = format[i + 1];
+    if (esc === "n") {
+      out += "\n";
+      i++;
+    } else if (esc === "t") {
+      out += "\t";
+      i++;
+    } else if (esc === "\\") {
+      out += "\\";
+      i++;
+    } else {
+      return undefined;
+    }
+  }
+  return out;
+}
+function parseExportGlue(node: Command): GlueSegment | undefined {
+  if (node.suffix.length !== 1) return undefined;
+  const only = node.suffix[0];
+  if (only === undefined) return undefined;
+  if (isWord(only)) {
+    const name = literalValue(only);
+    if (name === undefined || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return undefined;
+    return makeGlue("export", "");
+  }
+  if (only.type !== "Assignment") return undefined;
+  if (only.append === true || only.index !== undefined) return undefined;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(only.name)) return undefined;
+  if (!isWord(only.value) || literalValue(only.value) === undefined) return undefined;
+  return makeGlue("export", "");
+}
+function parseSetGlue(stage: { name: string; args: string[] }): GlueSegment | undefined {
+  if (stage.args.length !== 1) return undefined;
+  const flag = stage.args[0];
+  if (flag !== "-e" && flag !== "+e") return undefined;
+  return makeGlue("set", "");
+}
+function makeGlue(
+  program: "echo" | "printf" | "export" | "set",
+  expectedText: string,
+): GlueSegment {
+  return { program, expectedText, expectedBytes: Buffer.byteLength(expectedText, "utf-8") };
+}
+function parseViewSegment(node: Command | Pipeline): ViewSeg | SearchSeg | undefined {
   if (node.type === "Command") {
     const stage = stageShape(node);
     if (!stage) return undefined;
@@ -838,17 +946,43 @@ function parseViewSegment(node: Command | Pipeline): ViewSeg | undefined {
       // WHY: (item 9) stage 0 may be a search (`grep pat f | head -5`). An UNNUMBERED
       // WHY: search proves exactly what a `keep` filter proves — the file's lines matching
       // WHY: the pattern — so it is translated into one and the content seam byte-gates the
-      // WHY: fold against the observed stdout. A NUMBERED search (`grep -n pat f | head -5`)
-      // WHY: must not be admitted: its injected `LINE:` column is DATA the downstream stage
-      // WHY: inspects, so composing it would change the model's own command's row set (and
-      // WHY: inventing a coordinate the model never asked for). It fails closed here, exactly
-      // WHY: like the item-8 numbered-view guard, and NO command is ever rewritten.
+      // WHY: fold against the observed stdout.
+      // WHY: [ADR-0039 D3, superseding the numbered-search decline] A NUMBERED single-file search
+      // WHY: piped into `head`/`tail` is admitted as `pureSearch` with the slice ops attached.
+      // WHY: Admission is safe because the slice is a pure line-count truncation evaluated on
+      // WHY: already-resolved rows: original file line numbers are preserved as identifiers, and
+      // WHY: leases cover only the survivors shown. Any other downstream stage (sort, uniq,
+      // WHY: count, keep, sed ranges) still fails closed here, like the item-8 numbered-view guard.
       const searchSource = parseSearchStage(stage);
       // WHY: (item 10) only the SINGLE-file, unnumbered shape has bare-content stdout that one
       // WHY: `keep` over ONE file can model; multi-file and recursive stdout carry `FILE:LINE:`
       // WHY: prefixes and `rg --files` carries paths, so those compose with nothing downstream.
-      if (searchSource?.kind !== "pureSearch" || searchSource.search.lineNumbered) {
+      if (searchSource?.kind !== "pureSearch") {
         return undefined;
+      }
+      if (searchSource.search.lineNumbered) {
+        // WHY: [ADR-0039 D3] collect the trailing head/tail slices; anything else fails closed.
+        const sliceOps: SliceOp[] = [];
+        for (let s = 1; s < node.commands.length; s++) {
+          const downstream = node.commands[s];
+          if (downstream === undefined || downstream.type !== "Command") return undefined;
+          const downstreamStage = stageShape(downstream);
+          if (!downstreamStage) return undefined;
+          const filter = parseFilterStage(downstreamStage);
+          if (!filter) return undefined;
+          for (const op of filter) {
+            if (op.kind !== "first" && op.kind !== "last") return undefined;
+            sliceOps.push(op);
+          }
+        }
+        if (sliceOps.length === 0) return undefined;
+        return {
+          kind: "search",
+          family: {
+            kind: "pureSearch",
+            search: { ...searchSource.search, sliceOps },
+          },
+        };
       }
       filePath = searchSource.search.filePath;
       ops.push({ kind: "keep", pattern: searchSource.search.pattern });
@@ -922,6 +1056,22 @@ function isSemicolonStatementChain(command: string, statements: readonly Stateme
  * prefix, so the view is the last statement and the sequencing before it is
  * deterministic (see `isSemicolonStatementChain`).
  */
+/**
+ * WHY: (ADR-0039 D7/D9) redundancy without a known cwd. Dot-forms (relative, no `..`,
+ * WHY: normalizing to self) resolve to the base for EVERY base, so they need no tracked state.
+ * WHY: An absolute target matches only a known-absolute tracked dir exactly (D9 lexical; the
+ * WHY: `realpath` fallback belongs to the lifecycle, which has fs access). Everything else counts
+ * WHY: normally — sound because an unproven `cd` is treated as a real change, never a no-op.
+ */
+function isRedundantCd(target: string, effCwd: string | undefined): boolean {
+  if (!target.startsWith("/") && target.split("/").every((part) => part === "" || part === ".")) {
+    return true;
+  }
+  if (effCwd !== undefined && effCwd.startsWith("/") && target === effCwd) {
+    return true;
+  }
+  return false;
+}
 export function classifyBashCommand(command: string): BashClass {
   return classifyBash(command, {});
 }
@@ -932,7 +1082,12 @@ export function classifyBashCommand(command: string): BashClass {
  * Classifying here and locating again in the rewriter would duplicate the whole `;`/`&&`/silent
  * chain gate, so the terminal search records its offset in the caller's box instead.
  */
-function classifyBash(command: string, located: { searchNameEnd?: number }): BashClass {
+function classifyBash(
+  command: string,
+  located: {
+    searchNameEnds?: Array<{ end: number; program: SearchProgram; lineNumbered: boolean }>;
+  },
+): BashClass {
   if (command.trim() === "") return { kind: "passThrough", reason: "empty" };
   let script;
   try {
@@ -984,25 +1139,54 @@ function classifyBash(command: string, located: { searchNameEnd?: number }): Bas
   let view: ViewSeg | undefined;
   let searchSeg: SearchFamily | undefined;
   let baseDir: string | undefined;
+  let effCwd: string | undefined;
+  const compoundSegs: CompoundSegment[] = [];
+  let sawGlue = false;
+  // WHY: (commit 4) compound-aware relaxations below (multi-block, non-terminal blocks,
+  // WHY: post-block `cd`) apply only when glue is present anywhere in the chain; with no glue
+  // WHY: every rule behaves exactly as before (F1 by construction — the added conditions differ).
+  const hasGlue = segments.some(
+    (segment) => segment.node.type === "Command" && parseGlueSegment(segment.node) !== undefined,
+  );
   for (const { node, prefixPosition } of segments) {
     if (node.type !== "Command" && node.type !== "Pipeline") {
       return { kind: "passThrough", reason: "compound-segment" };
     }
     const classified = classifySegment(node, prefixPosition);
     if (classified.kind === "unsafe") {
-      return { kind: "passThrough", reason: classified.reason };
+      // WHY: (ADR-0039 D6) static glue parses here so a compound can carry it — but only inside a
+      // WHY: multi-segment chain (below) and only beside an admitted block. A lone print keeps its
+      // WHY: own decline (F2: glue locates blocks; with no block there is nothing to locate).
+      const glue =
+        segments.length > 1 && node.type === "Command" ? parseGlueSegment(node) : undefined;
+      if (!glue) return { kind: "passThrough", reason: classified.reason };
+      sawGlue = true;
+      compoundSegs.push({ kind: "glue", glue });
+      continue;
     }
     if (classified.kind === "silent") {
       if (classified.cdDir !== undefined) {
+        // WHY: (ADR-0039 D7) a redundant `cd` is inert, identical to `:`/`true`: it resolves to
+        // WHY: the directory already in effect, so it is skipped — not counted toward the single
+        // WHY: `cd` limit and never tripping multi/post-view guards. Only base-independent dot
+        // WHY: forms and exact known-absolute repeats qualify; anything else counts normally.
+        if (isRedundantCd(classified.cdDir, effCwd)) continue;
         // WHY: bash resolves each `cd` against the directory in effect at that
         // WHY: point, so only a single pre-view `cd` applied to `ctx.cwd` is sound.
         // WHY: A `cd` after the view ran too late to affect it (`cat f && cd sub`
         // WHY: viewed `./f`, not `sub/f`), and chained `cd`s compose (`cd a && cd b`
         // WHY: lands in `a/b`, not `b`) — both fail closed to pass-through rather
         // WHY: than lease a path the model never saw (ADR-0033 D1).
+        // WHY: (commit 4) a non-redundant `cd` after an admitted block would misresolve that block
+        // WHY: (`baseDir` attaches to later blocks only) — fail closed. Gated on glue presence so
+        // WHY: single-block chains keep their exact current reasons.
+        if (hasGlue && (view !== undefined || searchSeg !== undefined)) {
+          return { kind: "passThrough", reason: "post-block-cd" };
+        }
         if (view !== undefined) return { kind: "passThrough", reason: "post-view-cd" };
         if (baseDir !== undefined) return { kind: "passThrough", reason: "multi-cd" };
         baseDir = classified.cdDir;
+        if (classified.cdDir.startsWith("/")) effCwd = classified.cdDir;
       }
       continue;
     }
@@ -1010,24 +1194,48 @@ function classifyBash(command: string, located: { searchNameEnd?: number }): Bas
       // WHY: the search obeys the view's chain rule verbatim (ADR-0033 D1 as amended): only the
       // WHY: terminal statement may carry it, and one view-or-search per command — a prefix
       // WHY: `grep` would be a compound chain the model did not ask about, so it fails closed.
-      if (prefixPosition) return { kind: "passThrough", reason: "multi-statement" };
-      if (view !== undefined || searchSeg !== undefined) {
+      if (prefixPosition && !hasGlue) return { kind: "passThrough", reason: "multi-statement" };
+      if ((view !== undefined || searchSeg !== undefined) && !hasGlue) {
         return { kind: "passThrough", reason: "multi-view" };
       }
       searchSeg = classified.family;
+      compoundSegs.push(classified);
       if (node.type === "Command" && node.name?.end !== undefined) {
-        located.searchNameEnd = node.name.end;
+        const fam = classified.family;
+        if (
+          fam.kind === "pureSearch" ||
+          fam.kind === "pureMultiSearch" ||
+          fam.kind === "pureRecursiveSearch"
+        ) {
+          if (located.searchNameEnds === undefined) located.searchNameEnds = [];
+          located.searchNameEnds.push({
+            end: node.name.end,
+            program: fam.search.program,
+            lineNumbered: fam.search.lineNumbered,
+          });
+        }
       }
       continue;
     }
     // WHY: only the terminal statement may carry the view (ADR-0033 D1 as
     // WHY: amended) — a view in a prefix statement means the script is a
     // WHY: compound chain the model did not ask about, so it fails closed.
-    if (prefixPosition) return { kind: "passThrough", reason: "multi-statement" };
-    if (view !== undefined || searchSeg !== undefined) {
+    if (prefixPosition && !hasGlue) return { kind: "passThrough", reason: "multi-statement" };
+    if ((view !== undefined || searchSeg !== undefined) && !hasGlue) {
       return { kind: "passThrough", reason: "multi-view" };
     }
     view = classified;
+    compoundSegs.push(classified);
+  }
+  // WHY: F2-as-restated (ADR-0039): glue alone admits nothing — zero admitted BLOCKS (view/search)
+  // WHY: means the compound declines even if glue parsed, because glue only locates blocks inside
+  // WHY: combined stdout and with no block there is nothing to locate. Falls through to `no-view`.
+  if (sawGlue && (view !== undefined || searchSeg !== undefined)) {
+    return {
+      kind: "pureCompound",
+      segments: compoundSegs,
+      ...(baseDir === undefined ? {} : { baseDir }),
+    };
   }
   if (searchSeg) return applyBaseDir(searchSeg, baseDir);
   if (!view) return { kind: "passThrough", reason: "no-view" };
@@ -1252,20 +1460,28 @@ function collapseAdjacentRuns(stream: ContentLine[]): ContentLine[] {
  * the `tool_result` side re-parses the mutated command instead of sharing state with this hook.
  */
 export function withSearchLineNumbers(command: string): string {
-  const located: { searchNameEnd?: number } = {};
+  const located: {
+    searchNameEnds?: Array<{ end: number; program: SearchProgram; lineNumbered: boolean }>;
+  } = {};
   const classification = classifyBash(command, located);
-  // WHY: (item 10) multi-file and recursive searches take the same stage-0 splice: their serve
-  // WHY: seams parse `FILE:LINE:content` triples, and with no downstream stage the injected
-  // WHY: column is inert (nothing consumes it), exactly as for a single-file search.
-  const search =
-    classification.kind === "pureSearch" ||
-    classification.kind === "pureMultiSearch" ||
-    classification.kind === "pureRecursiveSearch"
-      ? classification.search
-      : undefined;
-  if (search === undefined || search.lineNumbered) return command;
-  const nameEnd = located.searchNameEnd;
-  if (nameEnd === undefined) return command;
-  const flag = search.program === "rg" ? "--line-number" : "-n";
-  return `${command.slice(0, nameEnd)} ${flag}${command.slice(nameEnd)}`;
+  // WHY: (item 10 + ADR-0039 D5) only search families (bare or compound segments) take the splice;
+  // WHY: views, file lists, and declined commands return unchanged. Unnumbered offsets splice
+  // WHY: right-to-left so earlier offsets stay valid; already-numbered need nothing.
+  if (
+    classification.kind !== "pureSearch" &&
+    classification.kind !== "pureMultiSearch" &&
+    classification.kind !== "pureRecursiveSearch" &&
+    classification.kind !== "pureCompound"
+  ) {
+    return command;
+  }
+  let rewritten = command;
+  const injections = [...(located.searchNameEnds ?? [])]
+    .filter((injection) => !injection.lineNumbered)
+    .sort((a, b) => b.end - a.end);
+  for (const { end, program } of injections) {
+    const flag = program === "rg" ? "--line-number" : "-n";
+    rewritten = `${rewritten.slice(0, end)} ${flag}${rewritten.slice(end)}`;
+  }
+  return rewritten;
 }
