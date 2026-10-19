@@ -1,4 +1,4 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import register from "../../index";
 import { makeFakePiRegistry } from "../support/fixtures";
@@ -286,7 +286,7 @@ describe("read tool — multi-window component contract (#157)", () => {
       expanded: false,
       lastComponent: next,
     });
-    expect(single.render(80).join("\n")).toContain("single.txt:3-7");
+    expect(stripTerminalSequences(single.render(80).join("\n"))).toContain("single.txt:3-7");
     expect(single.render(80).join("\n")).not.toContain("windows)");
 
     const again = tool.renderCall(args, theme, {
